@@ -1,0 +1,20 @@
+[project]
+name = "cli-provider-runner"
+version = "0.1.0"
+description = "Standalone runner: allowlisted driver loading over a private Unix-socket NDJSON RPC."
+requires-python = ">=3.11"
+dependencies = ["cli-provider-sdk", "cli-provider-transports"]
+
+[project.scripts]
+cli-provider-runner = "cli_provider_runner.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv.sources]
+cli-provider-sdk = { workspace = true }
+cli-provider-transports = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cli_provider_runner"]

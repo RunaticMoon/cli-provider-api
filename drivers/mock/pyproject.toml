@@ -1,0 +1,19 @@
+[project]
+name = "cli-driver-mock"
+version = "0.1.0"
+description = "Synthetic mock ProviderDriver: local async fixtures only, no real inference."
+requires-python = ">=3.11"
+dependencies = ["cli-provider-sdk"]
+
+[project.entry-points."cli_provider.drivers"]
+mock = "cli_driver_mock:MockDriver"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv.sources]
+cli-provider-sdk = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cli_driver_mock"]

@@ -1,0 +1,71 @@
+# cli-provider-api operator configuration (example)
+#
+# Strict YAML. Nothing here can be selected by an HTTP request. Copy to
+# config.yaml and replace key_hash with the hash of a locally generated key.
+# The raw key is never passed as a command-line argument; it is read from stdin
+# or a key file:
+#   uv run python -m cli_provider_api new-key --out ./runtime/local.key
+#   uv run python -m cli_provider_api hash-key < ./runtime/local.key
+#
+# The hashes below are placeholders (all-zero digests), NOT real keys or a
+# default secret. A request only authenticates if its key hashes to a principal.
+
+schema_version: 1
+data_dir: ./runtime/data
+
+api:
+  host: 127.0.0.1
+  port: 8080
+  default_run_deadline_seconds: 60
+  max_run_deadline_seconds: 120
+  cancel_deadline_seconds: 5
+  keepalive_seconds: 10
+  request_body_timeout_seconds: 10
+  limits:
+    max_body_bytes: 262144
+    max_events_per_run: 10000
+    max_events_returned: 1000
+    max_output_bytes: 1048576
+    max_artifact_bytes: 1048576
+    max_headers_bytes: 16384
+  concurrency:
+    # The Runner executes one driver run at a time with its own bounded queue, so
+    # the example keeps per_runner at 1 rather than dispatching work the Runner
+    # cannot run concurrently.
+    per_runner: 1
+    per_principal: 2
+    queue_timeout_seconds: 15
+    max_queued_per_runner: 4
+    max_queued_per_principal: 4
+
+runners:
+  - instance_id: runner-local-1
+    driver_id: mock
+    driver_version: 0.1.0
+    distribution: cli-driver-mock
+    socket_path: ./runtime/runner.sock
+    enabled: true
+    connect_timeout_seconds: 5
+
+presets:
+  - alias: mock/text
+    runner_ref: runner-local-1
+    model_id: mock-model        # exact discovered model/backend binding
+    task_policy: text           # operator-owned; never selectable by a request
+    enabled: true
+    stateless: true
+    # The synthetic mock driver reports model verification "unknown" and must
+    # NEVER be treated as real verification. This explicit operator development
+    # opt-in only allows serving that synthetic model in local development.
+    allow_synthetic_unverified: true
+
+workspaces:
+  - workspace_id: ws-alpha
+    description: Example workspace identity (opaque ID; no path is bound here)
+
+principals:
+  - name: alpha
+    key_hash: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    allowed_presets: [mock/text]
+    allowed_workspaces: [ws-alpha]
+    max_concurrency: 2
