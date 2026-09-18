@@ -44,6 +44,12 @@ def decode_frame(line: bytes, max_bytes: int = DEFAULT_MAX_FRAME_BYTES) -> Any:
         value = json.loads(text)
     except json.JSONDecodeError as exc:
         raise MalformedFrame(f"frame is not valid JSON: {exc.msg}") from exc
+    except RecursionError as exc:
+        # A syntactically valid but pathologically nested frame is still a
+        # bounded protocol error, never an unhandled RecursionError.
+        raise MalformedFrame("frame nests too deeply to decode") from exc
+    except ValueError as exc:
+        raise MalformedFrame(f"frame could not be decoded: {type(exc).__name__}") from exc
     if not isinstance(value, dict):
         raise MalformedFrame("frame must be a JSON object")
     return value

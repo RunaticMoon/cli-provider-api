@@ -54,6 +54,7 @@ from cli_provider_sdk import (
 )
 
 BEHAVIOR_ENV = "CLI_DRIVER_MOCK_BEHAVIOR"
+CANCEL_DETAIL_ENV = "CLI_DRIVER_MOCK_CANCEL_DETAIL"
 MALFORMED_ENV = "CLI_DRIVER_MOCK_MALFORMED_MODE"
 
 SYNTHETIC_SOURCE = "mock-fixture"
@@ -110,6 +111,9 @@ class MockDriver(BaseDriver):
             else os.environ.get(MALFORMED_ENV),
             MockMalformedMode.DUPLICATE_SEQUENCE,
         )
+        # Test-only knob: a long driver detail lets the Runner's truncation of
+        # the driver-supplied deadline detail be exercised.
+        self._cancel_detail = os.environ.get(CANCEL_DETAIL_ENV) or None
         self._cancelled = asyncio.Event()
         self._closed = False
 
@@ -181,7 +185,8 @@ class MockDriver(BaseDriver):
             confirmed=confirmed,
             confirmed_at=now if confirmed else None,
             deadline_seconds=1.0,
-            detail=(
+            detail=self._cancel_detail
+            or (
                 "mock driver acknowledged cancellation request"
                 if confirmed
                 else "mock driver ignores cancellation (operator-selected)"

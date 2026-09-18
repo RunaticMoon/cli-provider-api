@@ -3,17 +3,21 @@
 A common runtime for official CLI agents: a typed Driver SDK, a standalone
 Runner, a SQLite run controller and an authenticated OpenAI-compatible HTTP API.
 
-**This is a mock-only executable alpha** (milestone M1b). Only the synthetic
-`mock` driver exists; no real CLI/account is called anywhere in the code or the
-tests. Real Antigravity/Devin drivers, real OS isolation, remote mTLS,
-Fusion/resume and PTY support are later milestones and are disabled.
+**This is a fixture-only executable alpha.** The `mock` driver is synthetic and
+the Antigravity driver is exercised only against synthetic fixtures: no real
+CLI/account is called anywhere in the code or the tests, and no Antigravity
+preset is enabled. Real OS isolation, remote mTLS, sessions/Fusion/resume, the
+Devin (ACP) driver and PTY support are later milestones and are disabled. See
+`M1B.md` (runtime/API) and `M2A.md` (transport + Antigravity driver) for what is
+actually verified.
 
 ## Components
 
 ```
 packages/driver-sdk   cli-provider-sdk        typed ProviderDriver SDK (cli_provider_sdk)
-packages/transports   cli-provider-transports bounded NDJSON codec + stdio transport
+packages/transports   cli-provider-transports bounded NDJSON codec, stdio + process transports
 drivers/mock          cli-driver-mock         synthetic driver (entry point cli_provider.drivers)
+drivers/antigravity   cli-driver-antigravity  Antigravity (agy) NDJSON driver (entry point)
 apps/runner           cli-provider-runner     standalone Runner over a private Unix socket
 packages/core         cli-provider-core       operator config, SQLite store, registry, controller
 apps/api              cli-provider-api        authenticated HTTP API
@@ -177,13 +181,13 @@ NINEROUTER_APP=/path/to/9router-0.5.75/package/app \
   uv run --all-packages pytest tests/integration_9router -v
 ```
 
-Latest local verification: **275 default tests + 2 opt-in gateway tests passed**
+Latest local verification: **315 default tests + 2 opt-in gateway tests passed**
 on Linux/aarch64, Python 3.11 and 3.12. The latter exercise pre-execution
 fallback, task identity, artifacts/cache, and early streaming run
 identification.
 
 ```bash
-uv run pytest                     # 275 passed (mock-only, no real CLI)
+uv run pytest                     # 315 passed (fixture-only, no real CLI)
 uv run pytest apps/api            # real API subprocess + real Runner subprocess
 ```
 
@@ -193,10 +197,13 @@ subprocess over a Unix socket and an HTTP port) with a generated local key.
 
 ## Known limitations (honest)
 
-- Mock-only alpha: the only driver is the synthetic `mock` driver; all run
-  evidence is labelled `synthetic` and is not proof of native compatibility.
-- No real Antigravity/Devin drivers, no ACP/PTY transports, no Fusion, no
-  session resume, no remote/mTLS Runners, no OS sandbox claims.
+- The `mock` driver is synthetic and every run it produces is labelled
+  `synthetic`; that is not proof of native compatibility. The Antigravity driver
+  exists but is fixture-tested only, no Antigravity preset is enabled, and the
+  Runner does not yet inject a process executor, so it currently fails closed
+  through the Runner rather than executing the real CLI.
+- No Devin (ACP) driver, no ACP/PTY transports, no sessions/Fusion/resume, no
+  remote/mTLS Runners, no OS sandbox claims.
 - No provider/model fallback or retry: one enabled preset per request, and only
   pre-execution errors could ever be eligible for upstream fallback.
 - Single API instance over SQLite; no Redis/Celery/Kubernetes.

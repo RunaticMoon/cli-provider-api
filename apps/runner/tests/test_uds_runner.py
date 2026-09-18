@@ -395,6 +395,36 @@ async def test_hang_deadline_is_enforced_mid_stream(runner_factory):
         await client.aclose()
 
 
+async def test_deadline_cancelled_detail_carries_the_driver_detail(runner_factory):
+    runner = runner_factory("hang")
+    client = await RunnerClient.connect(runner.socket_path)
+    try:
+        await drive(client, run_params(deadline_seconds=0.5))
+        result = client.last_run_response.result
+        assert result["status"] == "cancelled"
+        # The driver's own bounded detail must survive: it is where a descendant
+        # that was deliberately not chased is reported to the operator.
+        assert result["detail"] == "mock driver acknowledged cancellation request"
+    finally:
+        await client.aclose()
+
+
+async def test_deadline_cancelled_detail_is_truncated_when_the_driver_detail_is_long(
+    runner_factory,
+):
+    long_detail = "d" * 500
+    runner = runner_factory("hang", cancel_detail=long_detail)
+    client = await RunnerClient.connect(runner.socket_path)
+    try:
+        await drive(client, run_params(deadline_seconds=0.5))
+        result = client.last_run_response.result
+        assert result["status"] == "cancelled"
+        assert result["detail"] == long_detail[:200]
+        assert len(result["detail"]) == 200
+    finally:
+        await client.aclose()
+
+
 async def test_streaming_events_cannot_renew_the_deadline(runner_factory):
     runner = runner_factory("slow")
     client = await RunnerClient.connect(runner.socket_path)

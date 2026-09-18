@@ -424,7 +424,7 @@ class RunnerServer:
         # ask the driver to stop within a bounded budget, then abandon.
         active.deadline_exceeded = True
         active.cancellation.request()
-        confirmed, _detail = await self._bounded_driver_cancel(active.run_id)
+        confirmed, detail = await self._bounded_driver_cancel(active.run_id)
         consumer.cancel()
         stopped, _ = await asyncio.wait({consumer}, timeout=self.cancel_deadline_seconds)
         if consumer not in stopped:
@@ -433,7 +433,7 @@ class RunnerServer:
                 reason="execution deadline exceeded; driver did not stop within cancel deadline",
             )
         if confirmed:
-            return self._deadline_cancelled_result(active)
+            return self._deadline_cancelled_result(active, detail=detail)
         return self._unknown_result(
             active,
             reason="execution deadline exceeded; cancellation was not confirmed",
@@ -562,7 +562,9 @@ class RunnerServer:
             detail="cancelled before driver start",
         )
 
-    def _deadline_cancelled_result(self, active: ActiveRun) -> RunResult:
+    def _deadline_cancelled_result(
+        self, active: ActiveRun, *, detail: str | None = None
+    ) -> RunResult:
         return RunResult(
             run_id=active.run_id,
             status=CompletionStatus.CANCELLED,
@@ -577,7 +579,9 @@ class RunnerServer:
             terminal_sequence=None,
             events_seen=active.events_seen,
             synthetic=self.driver.manifest.synthetic,
-            detail="execution deadline exceeded",
+            # Keep the driver's own bounded detail when it has one: it is where a
+            # deliberately-unstopped descendant is reported.
+            detail=(detail[:200] if detail else "execution deadline exceeded"),
         )
 
     # ---------------------------------------------------------------- cancel

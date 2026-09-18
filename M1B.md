@@ -107,7 +107,7 @@ the validated UDS client session; only the Runner loads allowlisted drivers
 ## Verification
 
 ```bash
-uv run pytest                 # 275 passed (mock-only; no real CLI/account)
+uv run pytest                 # 315 passed (fixture-only; no real CLI/account)
 uv run pytest packages/core   # config/store/controller/registry/runner session
 uv run pytest apps/runner     # real Runner subprocess + real Unix socket
 uv run pytest apps/api        # real API subprocess + real Runner subprocess
@@ -138,7 +138,7 @@ first/final/cached SSE run metadata.
 
 - **Implemented**: SDK, transports, mock driver, Runner, core, API, SSE, store,
   registry, operator CLI.
-- **Fixture-tested**: the 275-test suite above, including real subprocess +
+- **Fixture-tested**: the 315-test suite above, including real subprocess +
   UDS + HTTP boundaries. No native CLI or account is used.
 - **Native-tested**: none. The mock reports `verification=not_run` and
   `usage=unknown`; a terminal event proves the driver finished, not that any work

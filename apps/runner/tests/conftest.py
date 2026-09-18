@@ -88,6 +88,7 @@ def runner_factory(sock_dir):
         max_frame_bytes: int | None = None,
         max_queue: int | None = None,
         cancel_deadline: float | None = None,
+        cancel_detail: str | None = None,
         umask: int | None = None,
         wait: bool = True,
     ) -> RunnerProcess:
@@ -97,6 +98,8 @@ def runner_factory(sock_dir):
         env["CLI_DRIVER_MOCK_BEHAVIOR"] = behavior
         if malformed_mode is not None:
             env["CLI_DRIVER_MOCK_MALFORMED_MODE"] = malformed_mode
+        if cancel_detail is not None:
+            env["CLI_DRIVER_MOCK_CANCEL_DETAIL"] = cancel_detail
         cmd = [
             sys.executable,
             "-m",
