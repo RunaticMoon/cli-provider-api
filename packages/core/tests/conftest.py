@@ -109,6 +109,12 @@ class FakeControl:
     delay_seconds: float = 0.0
     event_count: int = 300
     run_timeouts: list[float] = field(default_factory=list)
+    # The fake Runner does not serialise, so it explicitly declares a capacity
+    # that matches the fixture's configured (multi-runner) concurrency.
+    max_parallel_runs: int = 8
+    max_queue: int = 8
+    # Runner-owned cancellation cleanup budget, declared over the runtime RPC.
+    cancel_cleanup_seconds: float = 2.0
 
 
 class FakeSession:
@@ -118,6 +124,9 @@ class FakeSession:
         self.config = config
         self.control = control
         self.last_result: RunResult | None = None
+        # Mirror UdsRunnerSession: the operator override is an attribute the
+        # controller reads and bounds.
+        self.run_timeout_seconds = config.run_frame_timeout_seconds
 
     async def manifest(self) -> dict[str, Any]:
         return {
@@ -163,6 +172,13 @@ class FakeSession:
                 },
             }
         ]
+
+    async def runtime(self) -> dict[str, Any]:
+        return {
+            "max_parallel_runs": self.control.max_parallel_runs,
+            "max_queue": self.control.max_queue,
+            "cancel_cleanup_seconds": self.control.cancel_cleanup_seconds,
+        }
 
     def _event(self, run_id: str, sequence: int, kind: str, payload: dict) -> dict:
         return {

@@ -203,6 +203,25 @@ async def test_manifest_probe_and_discover_over_uds(runner_factory):
         assert models.ok
         assert models.result["models"][0]["model_id"] == "mock-model"
         assert models.result["models"][0]["verification"]["status"] != "passed"
+
+        runtime = await client.call("runtime")
+        assert runtime.ok
+        assert runtime.result["max_parallel_runs"] == 1
+        assert runtime.result["max_queue"] >= 1
+        assert runtime.result["cancel_cleanup_seconds"] > 0
+    finally:
+        await client.aclose()
+
+
+async def test_runtime_declares_the_bounded_cancel_cleanup_budget(runner_factory):
+    # Worst case the Runner can spend unwinding after a run deadline is two
+    # bounded cancel waits; the API derives its outer budget from this value.
+    runner = runner_factory("success", cancel_deadline=6.0)
+    client = await RunnerClient.connect(runner.socket_path)
+    try:
+        runtime = await client.call("runtime")
+        assert runtime.ok
+        assert runtime.result["cancel_cleanup_seconds"] == 12.0
     finally:
         await client.aclose()
 

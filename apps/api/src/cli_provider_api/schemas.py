@@ -62,6 +62,23 @@ UNSUPPORTED_CHAT_FIELDS = frozenset(
 ALLOWED_METADATA_FIELDS = frozenset({"task_id", "workspace_id"})
 ROLES = frozenset({"system", "user", "assistant"})
 
+# A message is exactly {role, content} in this MVP. Execution-selecting keys
+# (tools/functions/name) are reported as unsupported capability; any other key
+# is an invalid request. Neither is ever silently dropped.
+ALLOWED_MESSAGE_FIELDS = frozenset({"role", "content"})
+UNSUPPORTED_MESSAGE_FIELDS = frozenset(
+    {
+        "tool_calls",
+        "tool_call_id",
+        "function_call",
+        "functions",
+        "name",
+        "audio",
+        "image_url",
+        "refusal",
+    }
+)
+
 
 @dataclass(frozen=True)
 class ChatRequest:
@@ -146,10 +163,15 @@ def parse_chat_request(data: Mapping[str, Any]) -> ChatRequest:
             )
         if not isinstance(content, str):
             raise InvalidRequest(f"messages[{index}].content must be a string")
-        if role == "tool" or message.get("tool_calls") or message.get("name"):
-            raise UnsupportedCapability(
-                f"messages[{index}] uses unsupported tool/name fields"
-            )
+        for key in message:
+            if key in ALLOWED_MESSAGE_FIELDS:
+                continue
+            if key in UNSUPPORTED_MESSAGE_FIELDS:
+                raise UnsupportedCapability(
+                    f"messages[{index}].{key} is not supported; text messages "
+                    "with role/content only"
+                )
+            raise InvalidRequest(f"unknown message field messages[{index}].{key!r}")
         messages.append({"role": str(role), "content": content})
 
     stream = data.get("stream", False)
@@ -201,13 +223,20 @@ def chat_completion(
         ],
         "run": run,
     }
-    # Unknown usage is omitted/null, never zero.
+    # Unknown usage is omitted/null, never zero. Reported/estimated usage keeps
+    # its provenance; a count the driver did not supply stays null rather than
+    # being invented as 0.
     if usage is not None and usage.get("provenance") != "unknown":
+        input_tokens = usage.get("input_tokens")
+        output_tokens = usage.get("output_tokens")
         body["usage"] = {
-            "prompt_tokens": usage.get("input_tokens") or 0,
-            "completion_tokens": usage.get("output_tokens") or 0,
-            "total_tokens": (usage.get("input_tokens") or 0)
-            + (usage.get("output_tokens") or 0),
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": (
+                input_tokens + output_tokens
+                if input_tokens is not None and output_tokens is not None
+                else None
+            ),
         }
     else:
         body["usage"] = None

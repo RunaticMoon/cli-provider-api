@@ -61,6 +61,7 @@ from .protocol import (
     RunnerEventEnvelope,
     RunnerRequest,
     RunnerResponse,
+    RunnerRuntime,
 )
 from .registry import DriverAllowlistEntry, DriverLoadError, load_driver, validate_manifest
 
@@ -289,6 +290,18 @@ class RunnerServer:
                 writer,
                 request.id,
                 {"models": [model.model_dump(mode="json") for model in models]},
+            )
+            return True
+
+        if method is Method.RUNTIME:
+            # Runner-owned capacity: one execution slot plus a bounded queue.
+            runtime = RunnerRuntime(
+                max_parallel_runs=1,
+                max_queue=self.max_queue,
+                cancel_cleanup_seconds=2.0 * self.cancel_deadline_seconds,
+            )
+            await self._send_response(
+                writer, request.id, runtime.model_dump(mode="json")
             )
             return True
 

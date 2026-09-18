@@ -24,6 +24,7 @@ Methods
 manifest         -> DriverManifest
 probe            -> ProbeReport
 discover_models  -> {"models": [ModelDescriptor, ...]}
+runtime          -> RunnerRuntime (Runner-owned capacity + cancel cleanup bound)
 run              -> params RunParams; streamed events + RunResult
 cancel           -> params CancelParams; CancelResult
 shutdown         -> {"instance_id": ..., "stopping": true}
@@ -64,6 +65,7 @@ class Method(str, Enum):
     MANIFEST = "manifest"
     PROBE = "probe"
     DISCOVER_MODELS = "discover_models"
+    RUNTIME = "runtime"
     RUN = "run"
     CANCEL = "cancel"
     SHUTDOWN = "shutdown"
@@ -118,6 +120,26 @@ class RunnerEventEnvelope(BaseModel):
     type: Literal["event"] = "event"
     request_id: str
     event: RunEvent
+
+
+class RunnerRuntime(BaseModel):
+    """Runner-owned runtime capacity, independent of the driver's manifest.
+
+    The Runner is authoritative about how many runs it can execute at once and
+    how many it will queue. The API/core clamp their per-runner concurrency to
+    this so it never dispatches work the Runner would only serialise, which is
+    what could otherwise turn a healthy queued run into a false ``unknown``.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    max_parallel_runs: int = Field(ge=1)
+    max_queue: int = Field(ge=1)
+    # Total bounded time the Runner may spend cancelling/unwinding a run after
+    # its execution deadline (worst case: two bounded cancel waits). The API
+    # derives its finite outer run budget from this validated value so a
+    # mismatched operator config can never cut the Runner's unwind short.
+    cancel_cleanup_seconds: float = Field(gt=0)
 
 
 class RunParams(BaseModel):

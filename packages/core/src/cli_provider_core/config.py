@@ -34,7 +34,9 @@ class Limits(_Strict):
 
 
 class Concurrency(_Strict):
-    per_runner: int = Field(default=2, ge=1)
+    per_runner: int = Field(default=1, ge=1)
+    # Global per-principal cap, enforced as min(this, principal.max_concurrency)
+    # for both admission accounting and the in-flight semaphore.
     per_principal: int = Field(default=2, ge=1)
     queue_timeout_seconds: float = Field(default=15.0, gt=0)
     # Bounded admission: outstanding (active + queued) runs beyond the active

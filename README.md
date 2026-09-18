@@ -94,7 +94,8 @@ caller identity comes from the API key only.
 
 - the `X-Run-Id` response header,
 - a normalized `run` extension with task/attempt/preset/runner, `status`,
-  `outcome`, `verification`, `usage` provenance and `artifact` ids, and
+  `outcome`, `verification`, `usage` provenance, derived `synthetic` provenance
+  and `artifact` ids, and
 - a standard completion `id` deterministically bound to the run as
   `chatcmpl-{run_id}` (live, cached and every SSE chunk). This lets a client
   identify and cancel the in-flight run even when a gateway drops the initial
@@ -119,7 +120,9 @@ policy is operator-owned and is **rejected** if a request tries to set it
 MVP is text messages only: `tools`, `tool_choice`, images/multimodal content,
 sampling parameters and unknown/execution-selecting fields are rejected with a
 structured `unsupported_capability` / `invalid_request_error` **before** any
-Runner effect.
+Runner effect. A message object is exactly `{role, content}`: execution-shaped
+keys (`function_call`, `tool_calls`, `name`, …) are reported as unsupported and
+any other key is an invalid request — never silently dropped.
 
 ## Operator configuration
 
@@ -138,15 +141,26 @@ A driver's manifest/probe/model payloads are validated with
 `DriverManifest`/`ProbeReport`/`ModelDescriptor`; a schema failure refuses the
 runner. A preset is available only when its discovered model's verification
 status is `passed`, or — for a `synthetic` driver only — the preset explicitly
-sets `allow_synthetic_unverified: true`. That development opt-in serves the
-synthetic model **without** claiming real verification (`real_verification:
-false` in `/v1/models` and the authenticated health detail). Effective
-capabilities (declared + probed + policy) are exposed per model; `streaming:
-none` or `roles: unsupported` presets are refused rather than served.
+sets `allow_synthetic_unverified: true`. The opt-in covers **only**
+`unknown`/`not_run`; an explicit `failed` verification is refused
+unconditionally, even for a synthetic driver. The opt-in serves the synthetic
+model **without** claiming real verification (`real_verification: false` in
+`/v1/models` and the authenticated health detail). Effective capabilities
+(declared + probed + policy) are exposed per model; `streaming: none` or `roles:
+unsupported` presets are refused rather than served.
 
 Admission is bounded per runner and per principal (`per_runner` +
-`max_queued_per_runner`, `max_concurrency` + `max_queued_per_principal`).
-Excess work is refused **before** any task/attempt is allocated with a
+`max_queued_per_runner`, `per_principal`/`max_concurrency` +
+`max_queued_per_principal`). The effective per-principal concurrency is
+`min(api.concurrency.per_principal, principal.max_concurrency)`, applied to both
+admission accounting and the in-flight semaphore, so the global setting is never
+dead.
+Effective per-runner concurrency is clamped to the capacity the Runner verifies
+over its `runtime` RPC (one serial slot for the standalone Runner), so a run is
+never dispatched into the Runner's opaque queue: excess work waits in the core's
+bounded, observable queue under `queue_timeout_seconds` and fails finite
+(`queue_timeout`) rather than being misread as `unknown`. Excess work beyond the
+admission bound is refused **before** any task/attempt is allocated with a
 structured `429 queue_full` and has no Runner effect. Request-body reads are
 bounded by one fixed `request_body_timeout_seconds` deadline (byte caps do not
 bound a slow drip feed), and total request headers are bounded by
@@ -163,12 +177,12 @@ NINEROUTER_APP=/path/to/9router-0.5.75/package/app \
   uv run --all-packages pytest tests/integration_9router -v
 ```
 
-Latest local verification: **227 default tests + 2 opt-in gateway tests passed**
+Latest local verification: **274 default tests + 2 opt-in gateway tests passed**
 on Linux/aarch64, Python 3.11. The latter exercise pre-execution fallback,
 task identity, artifacts/cache, and early streaming run identification.
 
 ```bash
-uv run pytest                     # 227 passed (mock-only, no real CLI)
+uv run pytest                     # 274 passed (mock-only, no real CLI)
 uv run pytest apps/api            # real API subprocess + real Runner subprocess
 ```
 
@@ -185,9 +199,15 @@ subprocess over a Unix socket and an HTTP port) with a generated local key.
 - No provider/model fallback or retry: one enabled preset per request, and only
   pre-execution errors could ever be eligible for upstream fallback.
 - Single API instance over SQLite; no Redis/Celery/Kubernetes.
-- A Runner is quarantined after an unconfirmed/unknown execution and is **not**
-  auto-cleared by a successful probe or an API restart; reconciliation and
-  process supervision remain explicit operator work.
+- Result-artifact persistence is best-effort: a storage failure after a
+  validated terminal is recorded as a bounded, path-free detail (and the
+  artifact is then unavailable), but it never downgrades the terminal to
+  `unknown` nor quarantines the Runner.
+- A Runner is quarantined after an unconfirmed/unknown execution. It is **not**
+  auto-cleared by a successful probe or an API restart, but a later validated
+  terminal event for the *same* run reconciles the matching quarantine;
+  reconciliation of any other unknown work and process supervision remain
+  explicit operator work.
 - Code/review/search workspace isolation and patch collection are later
   milestones; the registered workspace is touched only as an opaque ID here.
 

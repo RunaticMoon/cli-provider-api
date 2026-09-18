@@ -27,10 +27,15 @@ the validated UDS client session; only the Runner loads allowlisted drivers
   against the SDK schemas; the expected driver id/version and SDK version must
   match; a preset is available only when its discovered model verification
   status is `passed`, or — for a `synthetic` driver only — the preset sets
-  `allow_synthetic_unverified: true`. That opt-in never claims real verification
-  (`real_verification: false`). Effective capabilities (declared + probed +
-  policy) are exposed per model; `streaming: none` and `roles: unsupported` are
-  refused rather than served as native.
+  `allow_synthetic_unverified: true`. The opt-in covers only `unknown`/`not_run`
+  (an explicit `failed` is refused even for a synthetic driver) and never claims
+  real verification (`real_verification: false`). Effective capabilities
+  (declared + probed + policy) are exposed per model; `streaming: none` and
+  `roles: unsupported` are refused rather than served as native.
+- Truthful per-attempt provenance: the verified Runner manifest's `synthetic`
+  value is persisted on the attempt at reservation (with an additive migration
+  for an existing M1 DB) and surfaced as `synthetic` in the run view on the
+  status, non-stream and SSE surfaces — never a hard-coded default.
 - SQLite store: atomic reserve, one active/unknown attempt per caller+task,
   ordered durable events, artifacts, quarantine, restart reconciliation.
 - RunController lifecycle: `queued → starting → running →
@@ -42,10 +47,11 @@ the validated UDS client session; only the Runner loads allowlisted drivers
   or absent subscriber can never stall a run and a late subscriber still gets the
   full ordered stream. End detection uses the durable terminal
   status/completed task, not a droppable sentinel.
-- Streaming frame timeout follows the run's actual deadline + cancel budget
-  (operator-overridable per runner); control RPCs keep a short timeout. A run
-  waiting in the serial Runner queue or silent for >15 s inside a larger
-  authorized deadline is not turned into `unknown`.
+- Streaming frame timeout follows the run's actual deadline + cancel budget. An
+  explicit operator `run_frame_timeout_seconds` may tighten that per-frame
+  timeout but never exceed the finite deadline contract; control RPCs keep a
+  short timeout. A run silent for >15 s inside a larger authorized deadline, or
+  waiting behind another run, is not turned into `unknown`.
 - Cancellation: `requested` and `confirmed` are separate facts; confirmation
   comes from a validated terminal, not a request ACK. A genuine
   completed/failed/cancelled terminal is never downgraded by a late cancel, and
@@ -54,7 +60,23 @@ the validated UDS client session; only the Runner loads allowlisted drivers
 - Bounded admission per runner and per principal (`per_runner` +
   `max_queued_per_runner`, `max_concurrency` + `max_queued_per_principal`):
   excess work is refused **before** any task/attempt is allocated with a
-  structured `429 queue_full` and no Runner effect.
+  structured `429 queue_full` and no Runner effect. Effective per-runner
+  concurrency is clamped to the capacity the Runner verifies over its `runtime`
+  RPC (one serial slot), so excess work waits in the core's bounded queue under
+  `queue_timeout_seconds` instead of the Runner's opaque one. Effective
+  per-principal concurrency is `min(api.concurrency.per_principal,
+  principal.max_concurrency)`, applied to both admission accounting and the
+  in-flight semaphore (the global setting is never dead).
+- Result-artifact persistence is non-fatal: a filesystem/store failure after a
+  validated completed/partial terminal records a bounded, path-free detail and
+  leaves the status/outcome intact (no `unknown` downgrade, no quarantine, and
+  no artifact claim in the response).
+- Runner `run`-RPC errors preserve their code/retryable/stage. A proven
+  pre-execution rejection (`QUEUE_FULL`/`INVALID_PARAMS`/`RUN_ALREADY_ACTIVE`)
+  is a `failed`/`rejected` run with no quarantine; only a failure after events
+  may have had an effect becomes `unknown` + quarantine. Status is monotonic: a
+  cancel is never regressed to `running`, and a later validated terminal for the
+  same run reconciles its quarantine.
 - Bounded request reading: one fixed whole-body deadline
   (`request_body_timeout_seconds`, never renewed per chunk) on top of the byte
   cap, and a total request-header bound (`max_headers_bytes` → `431`).
@@ -81,17 +103,27 @@ the validated UDS client session; only the Runner loads allowlisted drivers
 ## Verification
 
 ```bash
-uv run pytest                 # 227 passed (mock-only; no real CLI/account)
+uv run pytest                 # 274 passed (mock-only; no real CLI/account)
 uv run pytest packages/core   # config/store/controller/registry/runner session
 uv run pytest apps/runner     # real Runner subprocess + real Unix socket
 uv run pytest apps/api        # real API subprocess + real Runner subprocess
 uv run pytest drivers/mock    # mock driver behaviours (incl. many_events)
 ```
 
-Focused regressions include: a 300-event non-stream run with no subscriber, a
+Focused regressions include: injected ENOSPC/EACCES/store artifact-persistence
+failures retaining a validated completed/partial terminal with no quarantine,
+the global `per_principal` cap enforced as `min(global, principal.max)` with
+independent principals, a synthetic `failed` verification refused even under the
+opt-in, persisted per-attempt `synthetic` provenance plus an old-M1-DB
+migration, a 300-event non-stream run with no subscriber, a
 late SSE subscriber receiving the full ordered stream, both cancel races,
-a run silent beyond 15 s inside a larger valid deadline, task-policy override
-rejection, malformed manifest/probe/model payloads, synthetic opt-in without real
+a run silent beyond 15 s inside a larger valid deadline, a second run queued
+behind >5 s of real UDS work completing without a false `unknown`/quarantine,
+per-runner dispatch clamped to the verified Runner `runtime` capacity, task-policy
+override rejection, message-level execution fields rejected before execution
+(and missing usage counts kept `null`, never `0`), typed pre-execution Runner
+rejections not quarantining while post-event failures do, monotonic status after
+cancel, malformed manifest/probe/model payloads, synthetic opt-in without real
 verification, `streaming=none` refusal, restrictive socket creation, header/body
 bounds, admission floods with capacity recovery and independent principals, and
 first/final/cached SSE run metadata.
@@ -100,7 +132,7 @@ first/final/cached SSE run metadata.
 
 - **Implemented**: SDK, transports, mock driver, Runner, core, API, SSE, store,
   registry, operator CLI.
-- **Fixture-tested**: the 227-test suite above, including real subprocess +
+- **Fixture-tested**: the 274-test suite above, including real subprocess +
   UDS + HTTP boundaries. No native CLI or account is used.
 - **Native-tested**: none. The mock reports `verification=not_run` and
   `usage=unknown`; a terminal event proves the driver finished, not that any work
@@ -113,8 +145,9 @@ first/final/cached SSE run metadata.
 
 ## Limitations
 
-- A Runner is quarantined after an unconfirmed/unknown execution and is not
-  auto-cleared by a probe or an API restart.
+- A Runner is quarantined after an unconfirmed/unknown execution. A later
+  validated terminal for the *same* run reconciles the matching quarantine, but
+  a probe or an API restart does not clear it.
 - Single API instance over SQLite; no Redis/Celery/Kubernetes.
 - No provider/model fallback or retry; the logical request hash is independent
   of the model so a future pre-execution fallback can reuse it.

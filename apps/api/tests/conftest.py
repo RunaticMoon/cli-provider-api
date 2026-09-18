@@ -73,7 +73,7 @@ class MockSystem:
                 "keepalive_seconds": 0.3,
                 "limits": {"max_body_bytes": 8192},
                 "concurrency": {
-                    "per_runner": 2,
+                    "per_runner": 1,
                     "per_principal": 2,
                     "queue_timeout_seconds": 2.0,
                 },

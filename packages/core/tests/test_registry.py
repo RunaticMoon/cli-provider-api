@@ -198,6 +198,29 @@ async def test_native_driver_requires_passed_verification(tmp_path):
     assert passed.preset_health("mock/text").real_verification is True
 
 
+async def test_synthetic_self_reported_passed_is_never_real_verification(tmp_path):
+    """Finding 1: a synthetic driver's self-reported `passed` is never real."""
+    registry = make_registry(tmp_path, {"models": [_model("passed")]})
+    await registry.refresh()
+    health = registry.preset_health("mock/text")
+    assert health.verified is True
+    assert health.real_verification is False
+    assert health.capabilities["real_verification"] is False
+    assert registry.runner_health("runner-1").synthetic is True
+    assert "synthetic" in health.detail
+
+
+async def test_runtime_fallback_is_schema_valid_and_conservative(tmp_path):
+    """Finding 3: a session with no `runtime()` still yields a valid value."""
+    registry = make_registry(tmp_path, {})  # PayloadSession declares no runtime()
+    await registry.refresh()
+    health = registry.runner_health("runner-1")
+    assert health.ok is True
+    assert health.max_parallel_runs == 1
+    assert health.max_queue >= 1
+    assert registry.runner_cleanup_seconds("runner-1") > 0
+
+
 async def test_synthetic_unknown_without_opt_in_is_refused(tmp_path):
     registry = make_registry(
         tmp_path,

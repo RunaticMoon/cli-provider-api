@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS attempts (
     detail TEXT,
     verification TEXT,
     usage TEXT,
+    synthetic INTEGER NOT NULL DEFAULT 1,
     cached INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -122,9 +123,25 @@ class Store:
     def initialize(self, *, reconcile: bool = True) -> dict[str, Any]:
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            self._migrate()
             if reconcile:
                 return self._reconcile_restart()
         return {"reconciled": 0}
+
+    def _migrate(self) -> None:
+        """Additive migrations compatible with an existing M1 database.
+
+        A pre-existing M1 DB has no ``attempts.synthetic`` column. Adding it with
+        a default of 1 backfills those rows truthfully (M1 is mock-only) instead
+        of either failing to open or silently claiming non-synthetic provenance.
+        """
+        columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(attempts)")
+        }
+        if "synthetic" not in columns:
+            self._conn.execute(
+                "ALTER TABLE attempts ADD COLUMN synthetic INTEGER NOT NULL DEFAULT 1"
+            )
 
     def _reconcile_restart(self) -> dict[str, Any]:
         """Formerly active attempts become unknown; never re-queued for replay."""
@@ -189,6 +206,7 @@ class Store:
         detail: str | None = None,
         summary: str | None = None,
         cached: bool = False,
+        synthetic: bool = True,
         finished_at: str | None = None,
     ) -> AttemptRecord:
         """Atomically reserve a task+attempt before any run dispatch.
@@ -229,12 +247,12 @@ class Store:
                 self._conn.execute(
                     "INSERT INTO attempts(run_id, principal, task_id, attempt_id, preset, "
                     "driver_id, runner_instance, workspace_id, request_hash, status, outcome, "
-                    "detail, summary, cached, created_at, updated_at, finished_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "detail, summary, synthetic, cached, created_at, updated_at, finished_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         run_id, principal, task_id, attempt_id, preset, driver_id,
                         runner_instance, workspace_id, request_hash, status, outcome,
-                        detail, summary, int(cached), now, now, finished_at,
+                        detail, summary, int(synthetic), int(cached), now, now, finished_at,
                     ),
                 )
                 self._conn.execute("COMMIT")
@@ -462,6 +480,7 @@ def _attempt(row: sqlite3.Row) -> AttemptRecord:
         detail=row["detail"],
         verification=json.loads(row["verification"]) if row["verification"] else None,
         usage=json.loads(row["usage"]) if row["usage"] else None,
+        synthetic=bool(row["synthetic"]),
         cached=bool(row["cached"]),
         created_at=row["created_at"],
         updated_at=row["updated_at"],

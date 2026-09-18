@@ -24,8 +24,16 @@ from cli_provider_sdk import (
 )
 from pydantic import ValidationError
 
+from cli_provider_runner.protocol import RunnerRuntime
+
 from .config import OperatorConfig, PresetConfig, RunnerConfig
 from .runner import RunnerSession, UdsRunnerSession
+
+# Conservative fallback for a Runner that does not declare its own cancel
+# cleanup budget. It matches the Runner server's default cancel deadline (5 s)
+# worst case (two bounded cancel waits), so an undeclared budget never
+# under-bounds the outer run budget.
+_FALLBACK_CANCEL_CLEANUP_SECONDS = 10.0
 
 
 @dataclass
@@ -42,6 +50,13 @@ class RunnerHealth:
     synthetic: bool = False
     probe: dict[str, Any] | None = None
     manifest: dict[str, Any] | None = None
+    # Runner-owned runtime capacity (verified over the `runtime` RPC). A runner
+    # that does not declare it is treated conservatively as serial (1).
+    max_parallel_runs: int = 1
+    max_queue: int = 1
+    # Runner-owned bounded cancellation cleanup budget, also verified over the
+    # `runtime` RPC. The controller derives its finite outer run budget from it.
+    cancel_cleanup_seconds: float = _FALLBACK_CANCEL_CLEANUP_SECONDS
 
 
 @dataclass
@@ -117,6 +132,35 @@ class RunnerRegistry:
     def runner_available(self, instance_id: str) -> bool:
         health = self._runners.get(instance_id)
         return bool(health and health.enabled and health.ok)
+
+    def runner_capacity(self, instance_id: str) -> int:
+        """Verified max concurrent runs for a runner (conservatively 1)."""
+        health = self._runners.get(instance_id)
+        if health is None or not health.ok:
+            return 1
+        return max(1, health.max_parallel_runs)
+
+    def runner_cleanup_seconds(self, instance_id: str) -> float:
+        """Verified Runner cancel/cleanup budget for the outer run bound.
+
+        A runner that did not report or verify it falls back to a conservative,
+        finite value instead of the API guessing an unbounded budget.
+        """
+        health = self._runners.get(instance_id)
+        if health is None or not health.ok:
+            return _FALLBACK_CANCEL_CLEANUP_SECONDS
+        return health.cancel_cleanup_seconds
+
+    def runner_synthetic(self, instance_id: str) -> bool:
+        """Verified Runner manifest provenance, for persisting on an attempt.
+
+        An unverified/unknown runner is treated as synthetic so a run is never
+        mislabelled as real (native) evidence it cannot substantiate.
+        """
+        health = self._runners.get(instance_id)
+        if health is None or not health.ok:
+            return True
+        return health.synthetic
 
     def preset_available(self, alias: str) -> bool:
         preset = self._presets.get(alias)
@@ -201,6 +245,10 @@ class RunnerRegistry:
                     return
                 descriptors[descriptor.model_id] = descriptor.model_dump(mode="json")
 
+            runtime = await self._runtime_capacity(session, health)
+            if runtime is None:
+                return
+
             health.driver_id = manifest.driver_id
             health.driver_version = manifest.version
             health.manifest = manifest.model_dump(mode="json")
@@ -209,6 +257,9 @@ class RunnerRegistry:
             health.synthetic = bool(manifest.synthetic)
             health.model_descriptors = descriptors
             health.models = sorted(descriptors)
+            health.max_parallel_runs = runtime["max_parallel_runs"]
+            health.max_queue = runtime["max_queue"]
+            health.cancel_cleanup_seconds = runtime["cancel_cleanup_seconds"]
             health.ok = True
             health.detail = "manifest/probe/discover verified against the SDK schemas"
         except Exception as exc:  # noqa: BLE001 - classified for health output
@@ -216,6 +267,38 @@ class RunnerRegistry:
             health.detail = f"verification failed: {type(exc).__name__}"
         finally:
             await session.aclose()
+
+    async def _runtime_capacity(
+        self, session: RunnerSession, health: RunnerHealth
+    ) -> dict[str, int] | None:
+        """Query the Runner's own runtime capacity (verified, never guessed).
+
+        A session that cannot report it is treated conservatively as serial. A
+        session that reports an invalid payload fails verification rather than
+        letting the API dispatch work the Runner cannot run.
+        """
+        method = getattr(session, "runtime", None)
+        if not callable(method):
+            # Validate the conservative fallback through the same schema as the
+            # reported path so both agree (max_queue >= 1, bounded cleanup).
+            fallback = RunnerRuntime(
+                max_parallel_runs=1,
+                max_queue=1,
+                cancel_cleanup_seconds=_FALLBACK_CANCEL_CLEANUP_SECONDS,
+            )
+            return fallback.model_dump(mode="json")
+        try:
+            raw = await method()
+        except Exception:  # noqa: BLE001 - classified for health output
+            health.ok = False
+            health.detail = "runner runtime capability query failed"
+            return None
+        try:
+            return RunnerRuntime.model_validate(raw).model_dump(mode="json")
+        except ValidationError:
+            health.ok = False
+            health.detail = "runner runtime capability failed SDK schema validation"
+            return None
 
     async def _validated(
         self,
@@ -259,13 +342,21 @@ class RunnerRegistry:
         status = verification.get("status")
         health.verification = verification
         health.synthetic = runner.synthetic
-        if status == VerificationStatus.PASSED.value:
-            health.real_verification = True
-        elif runner.synthetic and preset.allow_synthetic_unverified:
-            # Explicit operator development opt-in: the synthetic driver's model
-            # may be served without claiming real verification.
-            health.real_verification = False
-        else:
+        passed = status == VerificationStatus.PASSED.value
+        failed = status == VerificationStatus.FAILED.value
+        # A synthetic driver can never claim real verification: its self-reported
+        # status is only ever trusted as a development opt-in, and that opt-in
+        # covers only unknown/not_run. An explicit `failed` probe is refused
+        # unconditionally.
+        health.real_verification = bool(passed and not runner.synthetic)
+        if failed:
+            health.verified = False
+            health.detail = (
+                f"model {preset.model_id!r} verification failed (source "
+                f"{verification.get('source')!r}); failed status is never overridden"
+            )
+            return
+        if not passed and not (runner.synthetic and preset.allow_synthetic_unverified):
             health.verified = False
             health.detail = (
                 f"model {preset.model_id!r} verification status {status!r} is not "
@@ -309,6 +400,9 @@ class RunnerRegistry:
                 "detail": health.detail,
                 "synthetic": health.synthetic,
                 "capabilities": health.capabilities,
+                "max_parallel_runs": health.max_parallel_runs,
+                "max_queue": health.max_queue,
+                "cancel_cleanup_seconds": health.cancel_cleanup_seconds,
             }
             if health.enabled and not health.ok:
                 ready = False

@@ -52,6 +52,8 @@ class AttemptRecord:
     detail: str | None
     verification: dict[str, Any] | None
     usage: dict[str, Any] | None
+    # Derived from the verified Runner manifest at reservation, never assumed.
+    synthetic: bool
     cached: bool
     created_at: str
     updated_at: str
@@ -98,7 +100,8 @@ class RunResultView(BaseModel):
     status: str
     outcome: str | None = None
     cached: bool = False
-    synthetic: bool = True
+    # Truthful provenance: supplied from the persisted attempt, never defaulted.
+    synthetic: bool
     summary: str | None = None
     verification: dict[str, Any] = Field(default_factory=dict)
     usage: dict[str, Any] = Field(default_factory=dict)

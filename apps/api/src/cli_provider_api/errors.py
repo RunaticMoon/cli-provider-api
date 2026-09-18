@@ -11,11 +11,19 @@ from cli_provider_core import CoreError
 
 
 class ApiRunError(CoreError):
-    def __init__(self, message: str, *, code: str, http_status: int, run: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        http_status: int,
+        run: dict[str, Any],
+        error_type: str = "run_error",
+    ) -> None:
         super().__init__(message, code=code)
         self.run = run
         self.http_status = http_status
-        self.error_type = "run_error"
+        self.error_type = error_type
 
 
 def error_payload(error: CoreError, *, run: dict[str, Any] | None = None) -> dict[str, Any]:

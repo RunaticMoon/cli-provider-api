@@ -17,7 +17,14 @@ from cli_provider_core import (
     Store,
     chat_id_for_run,
 )
-from cli_provider_core.models import CANCELLED, COMPLETED, FAILED, UNKNOWN
+from cli_provider_core.models import (
+    CANCELLED,
+    COMPLETED,
+    FAILED,
+    OUTCOME_QUEUE_TIMEOUT,
+    OUTCOME_REJECTED,
+    UNKNOWN,
+)
 
 from .auth import authenticate, check_workspace, resolve_preset
 from .errors import ApiRunError
@@ -27,11 +34,37 @@ from .views import run_view
 
 router = APIRouter()
 
-_ERROR_CODES = {
-    FAILED: ("provider_failed", 502, "the run failed at the provider"),
-    UNKNOWN: ("run_unknown", 502, "the run outcome is unknown"),
-    CANCELLED: ("run_cancelled", 409, "the run was cancelled"),
+# HTTP classification is outcome-specific: a failed run where the provider never
+# executed must not be reported as a provider failure. The body's run view stays
+# authoritative; only the code/status/message are normalized.
+_STATUS_FAILURES = {
+    FAILED: ("provider_failed", 502, "run_error", "the run failed at the provider"),
+    UNKNOWN: ("run_unknown", 502, "run_error", "the run outcome is unknown"),
+    CANCELLED: ("run_cancelled", 409, "run_error", "the run was cancelled"),
 }
+_OUTCOME_FAILURES = {
+    OUTCOME_QUEUE_TIMEOUT: (
+        "queue_timeout",
+        429,
+        "rate_limit_error",
+        "the run timed out waiting for runner capacity",
+    ),
+    OUTCOME_REJECTED: (
+        "run_rejected",
+        502,
+        "run_error",
+        "the runner rejected the run before it executed",
+    ),
+}
+
+
+def run_error_classification(status: str, outcome: str | None) -> tuple[str, int, str, str]:
+    """Return ``(code, http_status, error_type, message)`` for a failed run."""
+    if outcome in _OUTCOME_FAILURES:
+        return _OUTCOME_FAILURES[outcome]
+    return _STATUS_FAILURES.get(
+        status, ("run_error", 502, "run_error", "the run did not complete successfully")
+    )
 
 
 def _effective_deadline(config: OperatorConfig) -> float:
@@ -148,10 +181,16 @@ async def _handle(request: Request, driver_id: str | None) -> Any:
             ),
             headers={"X-Run-Id": run_id},
         )
-    code, status, message = _ERROR_CODES.get(
-        record.status, ("run_error", 502, "the run did not complete successfully")
+    code, http_status, error_type, message = run_error_classification(
+        record.status, record.outcome
     )
-    raise ApiRunError(message, code=code, http_status=status, run=view)
+    raise ApiRunError(
+        message,
+        code=code,
+        http_status=http_status,
+        run=view,
+        error_type=error_type,
+    )
 
 
 @router.post("/v1/chat/completions")

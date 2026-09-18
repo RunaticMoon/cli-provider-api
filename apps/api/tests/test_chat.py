@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import time
 
 import httpx
 import pytest
 
 from conftest import MockSystem
+from test_lifecycle import _StreamThread
 
 CHAT = "/v1/chat/completions"
 
@@ -129,6 +131,37 @@ def test_unknown_extra_field_is_invalid_request(system: MockSystem):
         response = client.post(CHAT, json=body(executable="/bin/sh"))
     assert response.status_code == 400
     assert response.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_message_level_execution_fields_are_rejected_before_execution(system: MockSystem):
+    # Execution-selecting keys on a message are unsupported, never silently
+    # dropped, and the task id is never reserved.
+    with system.client() as client:
+        for message in (
+            {"role": "user", "content": "hi", "function_call": {"name": "x"}},
+            {"role": "assistant", "content": "hi", "tool_calls": [], "name": "spoof"},
+        ):
+            payload = body(task="task-msg")
+            payload["messages"] = [message]
+            response = client.post(CHAT, json=payload)
+            assert response.status_code == 422
+            assert response.json()["error"]["type"] == "unsupported_capability"
+            assert "X-Run-Id" not in response.headers
+        followup = client.post(CHAT, json=body(task="task-msg", content="clean"))
+    assert followup.status_code == 200
+
+
+def test_unknown_message_field_is_invalid_request(system: MockSystem):
+    payload = body(task="task-msg-unknown")
+    payload["messages"] = [{"role": "user", "content": "hi", "extra_key": 1}]
+    with system.client() as client:
+        response = client.post(CHAT, json=payload)
+        assert response.status_code == 400
+        assert response.json()["error"]["type"] == "invalid_request_error"
+        assert "X-Run-Id" not in response.headers
+        followup = client.post(CHAT, json=body(task="task-msg-unknown", content="clean"))
+    assert followup.status_code == 200
+
 
 
 def test_image_content_is_rejected(system: MockSystem):
@@ -372,3 +405,47 @@ def test_unknown_run_maps_to_safe_error(unknown_system: MockSystem):
     assert response.status_code == 502
     assert response.json()["error"]["code"] == "run_unknown"
     assert response.json()["run"]["status"] == "unknown"
+
+
+def test_queue_timeout_outcome_maps_to_429(system_factory):
+    # One Runner slot held by a real hanging run; a second admitted request runs
+    # out of queue_timeout and must be a 429 rate-limit, not a 502 provider error.
+    system = system_factory(
+        "hang",
+        config_overrides={
+            "api": {
+                "default_run_deadline_seconds": 30.0,
+                "max_run_deadline_seconds": 60.0,
+                "cancel_deadline_seconds": 2.0,
+                "concurrency": {
+                    "per_runner": 1,
+                    "per_principal": 2,
+                    "queue_timeout_seconds": 0.3,
+                },
+            }
+        },
+    )
+    first = _StreamThread(system, body(task="qt-1")).start()
+    try:
+        with system.client() as client:
+            deadline = time.time() + 10
+            status = None
+            while time.time() < deadline:
+                status = client.get(f"/api/v1/runs/{first.run_id}").json()["status"]
+                if status in {"starting", "running"}:
+                    break
+                time.sleep(0.05)
+            assert status in {"starting", "running"}
+
+            second = client.post(CHAT, json=body(task="qt-2", content="queued"))
+            assert second.status_code == 429, second.text
+            payload = second.json()
+            assert payload["error"]["code"] == "queue_timeout"
+            assert payload["error"]["type"] == "rate_limit_error"
+            assert payload["run"]["status"] == "failed"
+            assert payload["run"]["outcome"] == "queue_timeout"
+
+            client.post(f"/api/v1/runs/{first.run_id}/cancel")
+    finally:
+        first.join()
+    assert first.error is None

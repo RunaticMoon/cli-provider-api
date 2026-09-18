@@ -143,12 +143,12 @@ async def test_a_different_preset_task_policy_is_a_content_conflict(tmp_path):
 
 
 async def test_run_frame_timeout_follows_the_deadline_budget(tmp_path):
-    # The streaming frame timeout is derived from the run's deadline + cancel
-    # budget, never a fixed 15 s.
+    # The streaming frame timeout is derived from the run's deadline + the
+    # Runner's declared cleanup budget, never a fixed 15 s.
     config, store, registry, controller, control = await prepared(tmp_path)
     sub = await submit(controller, registry)
     await sub.active.task
-    expected = 5.0 + config.api.cancel_deadline_seconds + 5.0
+    expected = controller.run_budget("runner-1", 5.0)
     assert control.run_timeouts == [expected]
     store.close()
 

@@ -33,6 +33,8 @@ api:
     # the example keeps per_runner at 1 rather than dispatching work the Runner
     # cannot run concurrently.
     per_runner: 1
+    # Global per-principal cap. The effective bound is the smaller of this and
+    # the principal's own max_concurrency, so it is never silently ignored.
     per_principal: 2
     queue_timeout_seconds: 15
     max_queued_per_runner: 4

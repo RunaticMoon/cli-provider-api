@@ -11,7 +11,11 @@ import asyncio
 from typing import Any, AsyncIterator, Mapping, Protocol, runtime_checkable
 
 from cli_provider_runner.client import RunnerClient
-from cli_provider_runner.protocol import RunnerEventEnvelope, RunnerResponse
+from cli_provider_runner.protocol import (
+    RunnerEventEnvelope,
+    RunnerResponse,
+    RunnerRuntime,
+)
 from cli_provider_sdk import (
     CancelResult,
     DriverManifest,
@@ -21,7 +25,7 @@ from cli_provider_sdk import (
 )
 from pydantic import ValidationError
 
-from .errors import UpstreamProtocolError
+from .errors import RunnerRunRejected, UpstreamProtocolError
 
 PROTOCOL_VERSION = 1
 
@@ -34,6 +38,7 @@ class RunnerSession(Protocol):
     async def manifest(self) -> dict[str, Any]: ...
     async def probe(self) -> dict[str, Any]: ...
     async def discover_models(self) -> list[dict[str, Any]]: ...
+    async def runtime(self) -> dict[str, Any]: ...
     def run(self, params: Mapping[str, Any]) -> AsyncIterator[dict[str, Any]]: ...
     async def cancel(self, run_id: str) -> CancelResult: ...
     async def aclose(self) -> None: ...
@@ -148,6 +153,15 @@ class UdsRunnerSession:
                 ) from exc
         return validated
 
+    async def runtime(self) -> dict[str, Any]:
+        result = await self._request("runtime")
+        try:
+            return RunnerRuntime.model_validate(result).model_dump(mode="json")
+        except ValidationError as exc:
+            raise UpstreamProtocolError(
+                "runner runtime failed schema validation"
+            ) from exc
+
     async def run(self, params: Mapping[str, Any]) -> AsyncIterator[dict[str, Any]]:
         self.last_result = None
         run_id = str(params["run_id"])
@@ -155,6 +169,7 @@ class UdsRunnerSession:
         client = await self._connect()
         rid = await client.send_request("run", params)
         expected_sequence = 1
+        saw_event = False
         while True:
             try:
                 frame = await asyncio.wait_for(
@@ -178,6 +193,7 @@ class UdsRunnerSession:
                 if envelope.event.sequence != expected_sequence:
                     raise UpstreamProtocolError("event sequence is not contiguous")
                 expected_sequence += 1
+                saw_event = True
                 yield envelope.event.model_dump(mode="json")
                 continue
             if frame_type == "response":
@@ -189,7 +205,16 @@ class UdsRunnerSession:
                     raise UpstreamProtocolError("run response ID does not match request")
                 if not response.ok:
                     code = response.error.code if response.error else "unknown"
-                    raise UpstreamProtocolError(f"runner run error {code}")
+                    retryable = bool(response.error.retryable) if response.error else False
+                    # Preserve the Runner's typed code/retryable/stage. An error
+                    # before any event is a proven pre-execution rejection; after
+                    # events it may have had an execution effect.
+                    raise RunnerRunRejected(
+                        f"runner run error {code}",
+                        runner_code=code,
+                        retryable=retryable,
+                        stage="execution" if saw_event else "pre_execution",
+                    )
                 self.last_result = RunResult.model_validate(response.result)
                 return
             raise UpstreamProtocolError("runner sent an unexpected frame")

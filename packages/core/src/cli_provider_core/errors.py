@@ -107,3 +107,41 @@ class UpstreamProtocolError(CoreError):
     code = "runner_protocol_error"
     error_type = "server_error"
     http_status = 502
+
+
+# Runner run-RPC error codes that are proven to happen before the driver starts:
+# nothing executed, so the Runner must not be quarantined for them.
+PRE_EXECUTION_RUN_REJECTIONS = frozenset(
+    {"QUEUE_FULL", "INVALID_PARAMS", "RUN_ALREADY_ACTIVE"}
+)
+
+
+class RunnerRunRejected(UpstreamProtocolError):
+    """A Runner ``run`` RPC failed with a typed, preserved error.
+
+    ``stage`` is ``pre_execution`` when no event was observed before the error
+    (the driver provably never ran) and ``execution`` when the stream had already
+    produced events, so an execution effect cannot be ruled out.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        runner_code: str,
+        retryable: bool = False,
+        stage: str = "pre_execution",
+    ) -> None:
+        super().__init__(message)
+        self.runner_code = runner_code
+        self.retryable = retryable
+        self.stage = stage
+
+    @property
+    def pre_execution(self) -> bool:
+        return self.stage == "pre_execution"
+
+    @property
+    def no_effect(self) -> bool:
+        """A pre-execution rejection code proven to have no Runner effect."""
+        return self.pre_execution and self.runner_code in PRE_EXECUTION_RUN_REJECTIONS

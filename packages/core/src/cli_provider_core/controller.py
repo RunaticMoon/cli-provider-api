@@ -21,6 +21,7 @@ from .errors import (
     QueueFull,
     QueueTimeout,
     RunnerQuarantined,
+    RunnerRunRejected,
     RunnerUnavailable,
     UpstreamProtocolError,
 )
@@ -53,6 +54,14 @@ from .registry import RunnerRegistry
 from .store import Store, utcnow
 
 _ACTIVE = sorted(ACTIVE_STATUSES)
+# Terminals that are a validated driver outcome (unlike `unknown`, which is a
+# placeholder for unresolved execution and never reconciles a quarantine).
+_VALIDATED_TERMINALS = frozenset({COMPLETED, FAILED, CANCELLED})
+
+# Finite local scheduling/framing margin added on top of the Runner's declared
+# cleanup budget. It is a fixed bound (never derived from request input and
+# never unbounded); the substantive bound comes from the validated Runner value.
+_SCHEDULING_MARGIN_SECONDS = 1.0
 
 
 @dataclass
@@ -112,9 +121,30 @@ class RunController:
     def _runner_sem(self, instance_id: str) -> asyncio.Semaphore:
         sem = self._runner_sems.get(instance_id)
         if sem is None:
-            sem = asyncio.Semaphore(self._config.api.concurrency.per_runner)
+            # Never dispatch more concurrent runs than the Runner has verified it
+            # can execute. The Runner serialises at one slot, so configured
+            # per_runner > capacity would otherwise push the excess into the
+            # Runner's opaque queue (unbounded from the API's perspective) and a
+            # healthy queued run could be misread as `unknown`.
+            configured = self._config.api.concurrency.per_runner
+            capacity = self._registry.runner_capacity(instance_id)
+            sem = asyncio.Semaphore(max(1, min(configured, capacity)))
             self._runner_sems[instance_id] = sem
         return sem
+
+    def run_budget(self, instance_id: str, deadline_seconds: float) -> float:
+        """Finite outer stream budget for the whole run RPC.
+
+        Derived from the Runner's *validated* cancellation cleanup budget rather
+        than this API's own ``cancel_deadline_seconds``: a mismatched operator
+        config must never cut the Runner's unwind short and turn a healthy run
+        into a false ``unknown``.
+        """
+        return (
+            deadline_seconds
+            + self._registry.runner_cleanup_seconds(instance_id)
+            + _SCHEDULING_MARGIN_SECONDS
+        )
 
     def _principal_sem(self, principal: str, limit: int) -> asyncio.Semaphore:
         sem = self._principal_sems.get(principal)
@@ -188,9 +218,12 @@ class RunController:
         # and has no Runner effect at all.
         concurrency = self._config.api.concurrency
         runner_limit = concurrency.per_runner + concurrency.max_queued_per_runner
-        principal_limit = (
-            principal_concurrency + concurrency.max_queued_per_principal
-        )
+        # The global per-principal cap is a real bound: the effective concurrency
+        # is the smaller of it and the principal's own max_concurrency. Both the
+        # admission accounting and the semaphore use the same clamped value so
+        # the global setting is never dead.
+        effective_principal = min(concurrency.per_principal, principal_concurrency)
+        principal_limit = effective_principal + concurrency.max_queued_per_principal
         if self._runner_outstanding.get(instance_id, 0) >= runner_limit:
             raise QueueFull(
                 f"runner {instance_id!r} is at its outstanding-run bound "
@@ -219,6 +252,7 @@ class RunController:
             request_hash=digest,
             task_policy=task_policy,
             status=QUEUED,
+            synthetic=self._registry.runner_synthetic(instance_id),
         )
         self._runner_outstanding[instance_id] = (
             self._runner_outstanding.get(instance_id, 0) + 1
@@ -228,7 +262,7 @@ class RunController:
         )
         active = ActiveRun(record=record, messages=normalised_messages)
         active.task = asyncio.create_task(
-            self._execute(active, principal_concurrency, deadline_seconds, preset)
+            self._execute(active, effective_principal, deadline_seconds, preset)
         )
         self._active[run_id] = active
         return Submission(cached=False, record=record, active=active)
@@ -323,18 +357,23 @@ class RunController:
                 )
                 return self._require(run_id)
 
-            store.set_attempt(run_id, status=STARTING, started_at=utcnow())
+            self._mark_starting(run_id)
             session = self._registry.session(instance_id)
-            budget = (
-                deadline_seconds + self._config.api.cancel_deadline_seconds + 5.0
-            )
+            # The outer wait_for is the hard, finite bound for the whole stream,
+            # derived from the Runner's declared cleanup budget.
+            budget = self.run_budget(instance_id, deadline_seconds)
             # The streaming frame timeout follows the run's actual deadline
-            # budget (never a fixed 15 s), so a run waiting in a serial Runner
-            # queue is not turned into `unknown`. The outer wait_for is the hard
-            # bound; control RPCs keep their own short timeout.
+            # budget (never a fixed 15 s). An explicit operator override is
+            # honored, but only up to that finite bound: it may tighten the
+            # per-frame wait, never make it unbounded or exceed the deadline
+            # contract. Control RPCs keep their own short timeout.
+            override = getattr(session, "run_timeout_seconds", None)
+            effective_timeout = (
+                budget if override is None else min(float(override), budget)
+            )
             set_run_timeout = getattr(session, "set_run_timeout", None)
             if callable(set_run_timeout):
-                set_run_timeout(budget)
+                set_run_timeout(effective_timeout)
             try:
                 result = await asyncio.wait_for(
                     self._stream(active, session, deadline_seconds, preset),
@@ -356,6 +395,29 @@ class RunController:
             )
             self._quarantine(instance_id, run_id, "run task cancelled")
             raise
+        except RunnerRunRejected as exc:
+            if exc.no_effect:
+                # The Runner provably rejected this run before starting the
+                # driver (e.g. QUEUE_FULL / INVALID_PARAMS): nothing executed,
+                # so it is a rejection, never an unknown execution, and the
+                # Runner stays healthy.
+                self._finish(
+                    run_id,
+                    status=FAILED,
+                    outcome=OUTCOME_REJECTED,
+                    detail=f"runner rejected the run before execution: {exc.runner_code}",
+                )
+            else:
+                # The error surfaced after execution may have begun, so the
+                # effect is not provably absent: fail closed.
+                self._finish(
+                    run_id,
+                    status=UNKNOWN,
+                    outcome=OUTCOME_UNKNOWN,
+                    detail=f"run failed after execution began: {exc.runner_code}",
+                )
+                self._quarantine(instance_id, run_id, f"runner {exc.runner_code}")
+            return self._require(run_id)
         except Exception as exc:  # noqa: BLE001 - converted to safe classification
             self._finish(
                 run_id,
@@ -413,7 +475,12 @@ class RunController:
                 event.get("sequence", active.last_event_sequence)
             )
             if first:
-                self._store.set_attempt(run_id, status=RUNNING)
+                # Monotonic status: a cancel may already have moved this run to
+                # CANCELLING, and the first event must never regress it back to
+                # RUNNING. Only a pre-execution state may advance to RUNNING.
+                current = self._require(run_id).status
+                if current in (STARTING, RUNNING):
+                    self._store.set_attempt(run_id, status=RUNNING)
                 first = False
             if event.get("kind") == "message.delta":
                 text = str(event.get("payload", {}).get("text", ""))
@@ -458,7 +525,7 @@ class RunController:
             summary=summary,
         )
         if status == COMPLETED and summary:
-            self._write_artifact(record, summary)
+            self._persist_artifact(record, summary)
         return self._require(run_id)
 
     def _finish(
@@ -486,6 +553,19 @@ class RunController:
         if active is not None:
             active.terminal_status = status
             active.wakeup.set()
+        if status in _VALIDATED_TERMINALS:
+            # A later validated terminal proves the outcome of the run that
+            # caused an uncertain-cancel quarantine, so reconcile it instead of
+            # leaving a completed run paired with a quarantined Runner.
+            self._reconcile_quarantine(run_id)
+
+    def _reconcile_quarantine(self, run_id: str) -> None:
+        record = self._store.get_attempt(run_id)
+        if record is None:
+            return
+        quarantine = self._store.get_quarantine(record.runner_instance)
+        if quarantine is not None and quarantine.get("run_id") == run_id:
+            self._store.clear_quarantine(record.runner_instance)
 
     def _quarantine(self, instance_id: str, run_id: str, reason: str) -> None:
         self._store.quarantine_instance(instance_id, reason, run_id)
@@ -495,7 +575,41 @@ class RunController:
         assert record is not None
         return record
 
+    def _mark_starting(self, run_id: str) -> None:
+        """Advance to STARTING only from a pre-start state.
+
+        A cancel that lands in the queued→starting window sets CANCELLING; this
+        dispatch must never regress that back to STARTING (and then RUNNING).
+        """
+        current = self._require(run_id).status
+        if current in (QUEUED, RESERVED, STARTING):
+            self._store.set_attempt(run_id, status=STARTING, started_at=utcnow())
+        else:
+            self._store.set_attempt(run_id, started_at=utcnow())
+
     # ------------------------------------------------------------- artifacts
+
+    def _persist_artifact(self, record: AttemptRecord, text: str) -> None:
+        """Persist the result artifact without risking the validated terminal.
+
+        Artifact bytes are best-effort output, not the run outcome. The terminal
+        status/outcome is already durably stored and must never be overwritten to
+        `unknown` (nor the Runner quarantined) by a storage failure here. The
+        failure is recorded as a bounded, path-free limitation on the attempt so
+        the response cannot claim an artifact that does not exist.
+        """
+        try:
+            self._write_artifact(record, text)
+        except Exception as exc:  # noqa: BLE001 - non-fatal, recorded safely
+            current = self._require(record.run_id)
+            note = (
+                "run completed but the result artifact was not persisted "
+                f"({type(exc).__name__})"
+            )
+            self._store.set_attempt(
+                record.run_id,
+                detail=f"{current.detail}; {note}" if current.detail else note,
+            )
 
     def _write_artifact(self, record: AttemptRecord, text: str) -> ArtifactRecord | None:
         data = text.encode("utf-8")
@@ -507,22 +621,30 @@ class RunController:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
             return None
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-        artifact = ArtifactRecord(
-            artifact_id=artifact_id,
-            run_id=record.run_id,
-            principal=record.principal,
-            preset=record.preset,
-            workspace_id=record.workspace_id,
-            kind="text",
-            content_type="text/plain; charset=utf-8",
-            size=len(data),
-            sha256=hashlib.sha256(data).hexdigest(),
-            path=path,
-            created_at=utcnow(),
-        )
-        self._store.add_artifact(artifact)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+            artifact = ArtifactRecord(
+                artifact_id=artifact_id,
+                run_id=record.run_id,
+                principal=record.principal,
+                preset=record.preset,
+                workspace_id=record.workspace_id,
+                kind="text",
+                content_type="text/plain; charset=utf-8",
+                size=len(data),
+                sha256=hashlib.sha256(data).hexdigest(),
+                path=path,
+                created_at=utcnow(),
+            )
+            self._store.add_artifact(artifact)
+        except BaseException:
+            # Never leave an untracked (possibly partial) file for a failed write.
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
         return artifact
 
     # ---------------------------------------------------------------- cancel
