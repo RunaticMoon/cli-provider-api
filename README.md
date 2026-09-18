@@ -177,12 +177,13 @@ NINEROUTER_APP=/path/to/9router-0.5.75/package/app \
   uv run --all-packages pytest tests/integration_9router -v
 ```
 
-Latest local verification: **274 default tests + 2 opt-in gateway tests passed**
-on Linux/aarch64, Python 3.11. The latter exercise pre-execution fallback,
-task identity, artifacts/cache, and early streaming run identification.
+Latest local verification: **275 default tests + 2 opt-in gateway tests passed**
+on Linux/aarch64, Python 3.11 and 3.12. The latter exercise pre-execution
+fallback, task identity, artifacts/cache, and early streaming run
+identification.
 
 ```bash
-uv run pytest                     # 274 passed (mock-only, no real CLI)
+uv run pytest                     # 275 passed (mock-only, no real CLI)
 uv run pytest apps/api            # real API subprocess + real Runner subprocess
 ```
 

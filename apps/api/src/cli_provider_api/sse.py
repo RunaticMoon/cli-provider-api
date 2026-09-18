@@ -71,10 +71,8 @@ async def stream_chat(
     while True:
         # Clear before draining so a wakeup raised during the drain is not lost.
         active.wakeup.clear()
-        drained = 0
         for record in store.list_events(run_id, after=last_sequence, limit=_EVENT_PAGE):
             last_sequence = record.sequence
-            drained += 1
             event = record.event
             if event.get("kind") == "message.delta":
                 text = str(event.get("payload", {}).get("text", ""))
@@ -82,16 +80,18 @@ async def stream_chat(
                     yield _delta_chunk(
                         chat_id=chat_id, model=model, created=created, text=text
                     )
-        fully_drained = drained < _EVENT_PAGE
+        # A page shorter than the read limit does NOT mean the run has no further
+        # events: the run can persist more (and even reach its terminal state)
+        # while this generator yields the previous page. Re-check the durable
+        # backlog before ending, otherwise a fast run is delivered only partially.
+        if store.list_events(run_id, after=last_sequence, limit=1):
+            continue
         # End detection uses the durable terminal state, not a droppable signal,
         # and only once every persisted event has actually been replayed.
-        if active.terminal_status is not None and fully_drained:
+        if active.terminal_status is not None:
             break
         if await request.is_disconnected():
             break
-        if not fully_drained:
-            # A larger backlog remains; keep draining without waiting.
-            continue
         try:
             await asyncio.wait_for(active.wakeup.wait(), timeout=keepalive_seconds)
         except asyncio.TimeoutError:

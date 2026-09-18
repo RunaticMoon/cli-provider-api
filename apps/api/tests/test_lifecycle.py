@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 
@@ -70,21 +69,35 @@ def test_different_configured_task_policy_is_a_content_conflict(system: MockSyst
     assert conflict.json()["error"]["code"] == "task_content_conflict"
 
 
-def test_concurrent_identical_calls_execute_once(system: MockSystem):
+def test_concurrent_identical_calls_execute_once(system_factory):
+    # The identical second call must arrive while the first is still ACTIVE.
+    # With a fast fixture that is a timing race (CI observed [200, 200] because
+    # the first run had already completed and replayed cached), so hold the run
+    # open with the slow fixture and attach deterministically via its SSE headers.
+    system = system_factory(
+        "slow",
+        config_overrides={
+            "api": {
+                "default_run_deadline_seconds": 30.0,
+                "max_run_deadline_seconds": 60.0,
+            }
+        },
+    )
     payload = body(task="task-dup", content="duplicate")
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [
-            pool.submit(_post, system.client(), payload),
-            pool.submit(_post, system.client(), payload),
-        ]
-        responses = [f.result() for f in futures]
-    codes = sorted(r.status_code for r in responses)
-    assert codes == [200, 409]
-    ok = next(r for r in responses if r.status_code == 200)
-    conflict = next(r for r in responses if r.status_code == 409)
+    streamer = _StreamThread(system, payload).start()
+    with system.client() as client:
+        conflict = _post(client, payload)
+    assert conflict.status_code == 409
     assert conflict.json()["error"]["code"] == "run_active"
-    # Same run id proves a single execution.
-    assert conflict.json()["error"]["run_id"] == ok.headers["X-Run-Id"]
+    # Same run id proves the second call never executed anything of its own.
+    assert conflict.json()["error"]["run_id"] == streamer.run_id
+    streamer.join()
+    # Exactly one execution: the finished run replays cached under the same id.
+    with system.client() as client:
+        replay = _post(client, payload)
+    assert replay.status_code == 200
+    assert replay.headers.get("X-Run-Cached") == "true"
+    assert replay.headers["X-Run-Id"] == streamer.run_id
 
 
 class _StreamThread:

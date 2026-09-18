@@ -45,8 +45,12 @@ the validated UDS client session; only the Runner loads allowlisted drivers
 - Non-blocking event fan-out: every accepted event is stored durably first, then
   a wakeup is signalled. Reads (SSE, events API) replay from the store, so a slow
   or absent subscriber can never stall a run and a late subscriber still gets the
-  full ordered stream. End detection uses the durable terminal
-  status/completed task, not a droppable sentinel.
+  full ordered stream. A page shorter than the read limit is not treated as
+  "nothing left": the reader re-checks the durable backlog before ending, so a
+  run that persists its final events (and reaches its terminal state) while the
+  reader is yielding an earlier page is still delivered completely. End
+  detection uses the durable terminal status/completed task, not a droppable
+  sentinel.
 - Streaming frame timeout follows the run's actual deadline + cancel budget. An
   explicit operator `run_frame_timeout_seconds` may tighten that per-frame
   timeout but never exceed the finite deadline contract; control RPCs keep a
@@ -103,7 +107,7 @@ the validated UDS client session; only the Runner loads allowlisted drivers
 ## Verification
 
 ```bash
-uv run pytest                 # 274 passed (mock-only; no real CLI/account)
+uv run pytest                 # 275 passed (mock-only; no real CLI/account)
 uv run pytest packages/core   # config/store/controller/registry/runner session
 uv run pytest apps/runner     # real Runner subprocess + real Unix socket
 uv run pytest apps/api        # real API subprocess + real Runner subprocess
@@ -116,7 +120,9 @@ the global `per_principal` cap enforced as `min(global, principal.max)` with
 independent principals, a synthetic `failed` verification refused even under the
 opt-in, persisted per-attempt `synthetic` provenance plus an old-M1-DB
 migration, a 300-event non-stream run with no subscriber, a
-late SSE subscriber receiving the full ordered stream, both cancel races,
+late SSE subscriber receiving the full ordered stream, a partial first page
+with events appended while the reader yields (deterministic replay regression),
+both cancel races,
 a run silent beyond 15 s inside a larger valid deadline, a second run queued
 behind >5 s of real UDS work completing without a false `unknown`/quarantine,
 per-runner dispatch clamped to the verified Runner `runtime` capacity, task-policy
@@ -132,7 +138,7 @@ first/final/cached SSE run metadata.
 
 - **Implemented**: SDK, transports, mock driver, Runner, core, API, SSE, store,
   registry, operator CLI.
-- **Fixture-tested**: the 274-test suite above, including real subprocess +
+- **Fixture-tested**: the 275-test suite above, including real subprocess +
   UDS + HTTP boundaries. No native CLI or account is used.
 - **Native-tested**: none. The mock reports `verification=not_run` and
   `usage=unknown`; a terminal event proves the driver finished, not that any work
