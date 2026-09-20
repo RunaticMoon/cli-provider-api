@@ -159,14 +159,33 @@ routes:
     candidates: [devin-opus-review]
 
 workspaces:
-  # Trusted workspace ids. `repo` is the approved git repository, `worktree_root`
-  # holds per-card worktrees, `wrapper_workspace_id` is the pre-registered
-  # wrapper workspace the run binds to (request-path workspace selection is
-  # never permitted).
+  # Trusted workspace ids. `repo` is the approved git repository and
+  # `wrapper_workspace_id` the pre-registered wrapper workspace the run binds
+  # to (request-path workspace selection is never permitted).
+  #
+  # Real dispatch requires a PREPARED binding, supplied as a pair:
+  #   prepared_worktree        — operator-created git worktree of `repo`,
+  #                              HEAD pinned at the card's base_revision,
+  #                              clean, on a pinned jev/* branch.
+  #   runner_execution_config  — protected Runner binding file (0600, private
+  #                              0700 parent, canonical path) whose
+  #                              workspaces.<wrapper_workspace_id>.root equals
+  #                              the prepared path; allowed_presets must list
+  #                              the submitted model. The Runner must be
+  #                              (re)started with --execution-config on the
+  #                              same verified bytes.
+  # `runner_effort_pin` attests the effort the pinned Runner actually carries
+  # when a card's effort_hint resolves non-null. `allow_ephemeral_worktree`
+  # is the explicit development-only opt-out for mock testing — it creates a
+  # per-card worktree under `worktree_root` and labels the result synthetic.
   ws-main:
     repo: /home/ubuntu/development/cli-provider-api-jev
     worktree_root: /home/ubuntu/development/cli-provider-api-jev/.worktrees
     wrapper_workspace_id: ws-main
+    prepared_worktree: null            # set to the operator-prepared path
+    runner_execution_config: null      # set to the protected binding file
+    runner_effort_pin: null            # low|high|max when effort is pinned
+    allow_ephemeral_worktree: false    # development-only; keep false
 
 # How the dispatcher reaches the installed Hermes kernel. Defaults:
 # HERMES_PYTHON / <repo>/venv/bin/python and HERMES_AGENT_DIR / ~/.hermes/hermes-agent.
@@ -184,13 +203,18 @@ dispatch:
 
 # Where the dispatcher submits the single model request. `direct` posts to the
 # existing wrapper /v1/chat/completions with a fixed preset alias; `gateway`
-# posts to a 9Router base URL with model = compiled combo name (ordering lives
-# in the gateway). credential_file is read at call time — never argv.
+# posts to a 9Router base URL with model = the compiled combo jev.<route> —
+# `model` is forbidden there (a static name would bypass classification).
+# Run control (get_run/cancel) uses `control_base_url` — direct defaults it
+# to base_url; gateway REQUIRES it explicitly. Credential files are read at
+# call time — never argv, never logged.
 execution:
   mode: direct
   base_url: http://127.0.0.1:8080
   model: devin/swe-2-max
   credential_file: null
+  control_base_url: null          # same-plane run truth; required in gateway
+  control_credential_file: null
 
 # 9Router compile targets. `disposable` loopback targets only in this slice;
 # `production` is refused. assume_core_guard attests the shared
@@ -202,16 +226,26 @@ gateway:
   targets: []
   assume_core_guard: false
 
-# MVP local operator identities allowed to run control operations. This is NOT
-# Telegram auth — a bare --actor string grants nothing by itself.
+# Local operator identities allowed to run control operations. The actor must
+# be listed here AND equal the invoking OS user (pwd.getpwuid(os.geteuid())) —
+# a bare --actor string grants nothing by itself. `operator_uids` (name -> uid)
+# is an optional explicit override map; when set it is authoritative.
+# This is NOT Telegram auth.
 control:
   operators: []
+  operator_uids: null
 
 verification:
-  # basename -> absolute executable path; spec argv[0] must be listed here.
+  # basename -> absolute executable path; argv[0] must resolve here.
   executables:
     uv: /home/ubuntu/.local/bin/uv
     pytest: /home/ubuntu/development/cli-provider-api-jev/.venv/bin/pytest
+  # Trusted FULL-argv allowlist: each entry matches argv exactly, and `*` is
+  # allowed only as the final argument (any trailing args). A card's
+  # verification.argv not matching any entry fails closed — card data is never
+  # command permission.
+  commands:
+    - [uv, run, pytest, "*"]
   timeout_seconds: 600
   max_output_bytes: 65536
   max_diff_bytes: 262144

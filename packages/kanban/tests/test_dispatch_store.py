@@ -118,6 +118,8 @@ def _approval(store, ttl=3600, actors=("op-test",)):
     return store.create_approval(
         task_id="t_1",
         task_revision="1",
+        spec_hash="sha256:x",
+        policy_fingerprint="sha256:p",
         operation="dispatch",
         run_id=None,
         allowed_actors=list(actors),

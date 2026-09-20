@@ -211,6 +211,7 @@ class TestVerification:
         repo, wt = self._wt(git_repo, tmp_path)
         res = run_verification(
             wt, ["true"], executables={"true": "/usr/bin/true"},
+            commands=[["true"]],
             timeout_seconds=10, max_output_bytes=1024,
         )
         assert res.ok and res.exit_code == 0
@@ -220,6 +221,7 @@ class TestVerification:
         repo, wt = self._wt(git_repo, tmp_path)
         res = run_verification(
             wt, ["false"], executables={"false": "/usr/bin/false"},
+            commands=[["false"]],
             timeout_seconds=10, max_output_bytes=1024,
         )
         assert not res.ok and res.exit_code == 1
@@ -229,6 +231,7 @@ class TestVerification:
         repo, wt = self._wt(git_repo, tmp_path)
         res = run_verification(
             wt, ["rm", "-rf", "."], executables={},
+            commands=[["true"]],
             timeout_seconds=10, max_output_bytes=1024,
         )
         assert not res.ok and res.exit_code is None
@@ -240,6 +243,7 @@ class TestVerification:
         # A shell metachar arg must be passed literally — echo prints it.
         res = run_verification(
             wt, ["echo", "a;b"], executables={"echo": "/usr/bin/echo"},
+            commands=[["echo", "*"]],
             timeout_seconds=10, max_output_bytes=1024,
         )
         assert res.ok and "a;b" in res.output

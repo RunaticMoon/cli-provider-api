@@ -207,33 +207,75 @@ class DispatchConfig(_Strict):
     # metadata keys) can still be exercised end-to-end.
     send_execution_metadata: bool = True
 
+    @model_validator(mode="after")
+    def _heartbeat_shorter_than_ttl(self) -> "DispatchConfig":
+        # The dispatcher renews the claim for real during HTTP+verification;
+        # a heartbeat interval that cannot fit inside the TTL is a lie.
+        if self.heartbeat_seconds >= self.claim_ttl_seconds:
+            raise ValueError(
+                "dispatch.heartbeat_seconds must be smaller than "
+                "claim_ttl_seconds — the renewal must be able to land"
+            )
+        return self
+
 
 class ExecutionTarget(_Strict):
     """Where the dispatcher submits the single model request.
 
     ``direct`` posts to the wrapper's ``/v1/chat/completions`` with ``model``
     = a fixed operator-declared preset alias (the mock/dev lane). ``gateway``
-    posts to a 9Router base URL with ``model`` = the compiled combo name —
-    candidate ordering lives in the gateway, never here.
+    posts to a 9Router base URL with ``model`` = the compiled combo name
+    ``jev.<route>`` — candidate ordering lives in the gateway, never here,
+    and a static model is rejected so classification cannot be bypassed.
+
+    Control operations (run view / cancel / artifacts) use
+    ``control_base_url`` — the same-plane endpoint for run truth, separate
+    from the data POST URL. Direct mode defaults it to ``base_url``; gateway
+    mode requires it explicitly.
     """
 
     mode: Literal["direct", "gateway"] = "direct"
     base_url: str = Field(min_length=1)
-    # Direct mode: wrapper preset alias. Gateway mode: combo name override
-    # (default ``jev.<route>``); the combo's model order is compiled policy.
+    # Direct mode only: wrapper preset alias. Gateway mode must leave it
+    # unset — the combo name is always ``jev.<route>``.
     model: str | None = None
     # Path to a file holding the bearer credential — read at call time, never
     # an argv value, never logged.
     credential_file: str | None = None
+    control_base_url: str | None = None
+    control_credential_file: str | None = None
 
-    @field_validator("base_url")
+    @field_validator("base_url", "control_base_url")
     @classmethod
-    def _no_userinfo_or_query(cls, value: str) -> str:
+    def _no_userinfo_or_query(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         if not value.startswith("http://") and not value.startswith("https://"):
             raise ValueError("execution base_url must be http(s)")
         if any(ch in value for ch in ("@", "?", "#")):
             raise ValueError("execution base_url must not carry credentials/query")
         return value.rstrip("/")
+
+    @model_validator(mode="after")
+    def _mode_contract(self) -> "ExecutionTarget":
+        if self.mode == "gateway":
+            if not self.control_base_url:
+                raise ValueError(
+                    "gateway execution requires control_base_url — run "
+                    "control must not depend on the data-plane combo path"
+                )
+            if self.model is not None:
+                raise ValueError(
+                    "gateway execution must not pin a static model — the "
+                    "submitted name is always the route-derived combo "
+                    "'jev.<route>'"
+                )
+        elif self.model is None:
+            raise ValueError(
+                "direct execution requires model — the operator-declared "
+                "preset alias submitted to the wrapper"
+            )
+        return self
 
 
 class GatewayTarget(_Strict):
@@ -257,20 +299,45 @@ class GatewayConfig(_Strict):
 class ControlConfig(_Strict):
     """Configured operator identities allowed to run control operations.
 
-    This is MVP local-operator auth: the CLI entrypoint plus a configured
-    identity list. It is NOT Telegram auth and a ``--actor`` string alone
-    never grants anything.
+    A bare ``--actor`` string is never authentication: the actor must also
+    be the current OS user (``pwd.getpwuid(os.geteuid())``), or — when
+    ``operator_uids`` is configured — map to the current euid explicitly.
+    This is LOCAL CLI auth only; it is NOT Telegram auth.
     """
 
     operators: list[str] = Field(default_factory=list)
+    # Optional explicit name -> uid map. When present it is authoritative:
+    # the actor must appear in ``operators`` AND map to os.geteuid().
+    operator_uids: dict[str, int] | None = None
+
+    @model_validator(mode="after")
+    def _uid_map_covers_only_operators(self) -> "ControlConfig":
+        if self.operator_uids:
+            unknown = set(self.operator_uids) - set(self.operators)
+            if unknown:
+                raise ValueError(
+                    f"control.operator_uids names {sorted(unknown)} not in "
+                    "control.operators — the map may only pin configured "
+                    "operators"
+                )
+        return self
 
 
 class VerificationPolicy(_Strict):
-    """Trusted verification executables and capture bounds."""
+    """Trusted verification commands and capture bounds.
 
-    # basename -> absolute executable path; a spec argv[0] not listed here is
-    # rejected before the run. argv is always a list — never a shell string.
+    ``commands`` is the operator-trusted full-argv allowlist: a card's
+    ``verification.argv`` must equal one entry element-for-element after
+    argv[0] resolution (basename -> ``executables`` path, or absolute
+    as-is). A trailing ``"*"`` element matches any remaining tail. Card
+    data never grants command permission — an argv not on this list is
+    refused before any process spawns.
+    """
+
+    # basename -> absolute executable path used to resolve argv[0] entries.
     executables: dict[str, str] = Field(default_factory=dict)
+    # Full trusted argv entries; a trailing "*" matches any tail.
+    commands: list[list[str]] = Field(default_factory=list)
     timeout_seconds: float = Field(default=60.0, gt=0)
     max_output_bytes: int = Field(default=65_536, ge=1)
     max_diff_bytes: int = Field(default=262_144, ge=1)
@@ -285,26 +352,84 @@ class VerificationPolicy(_Strict):
                 )
         return value
 
+    @model_validator(mode="after")
+    def _commands_well_formed(self) -> "VerificationPolicy":
+        for entry in self.commands:
+            if not entry or any(not isinstance(a, str) or not a
+                                for a in entry):
+                raise ValueError(
+                    "verification commands entries must be non-empty argv "
+                    "lists of non-empty strings"
+                )
+            if "*" in entry[:-1]:
+                raise ValueError(
+                    "verification commands wildcard '*' is only allowed as "
+                    "the final element"
+                )
+            head = entry[0]
+            if not os.path.isabs(head) and head not in self.executables:
+                raise ValueError(
+                    f"verification command {head!r} is neither an absolute "
+                    "path nor a basename in executables — it could never "
+                    "resolve"
+                )
+        return self
+
 
 class WorkspaceEntry(_Strict):
     """Trusted workspace: referenced by id, never a card-chosen path.
 
-    ``repo`` is the approved git repository; ``worktree_root`` is where
-    per-card worktrees are created; ``wrapper_workspace_id`` is the
-    pre-registered wrapper workspace the run binds to (the wrapper only
-    accepts configured ids — a dynamic path is never selectable by request).
+    ``repo`` is the approved git repository. For real HTTP dispatch the
+    workspace must carry BOTH ``prepared_worktree`` (an operator-created
+    worktree pinned at the card's base revision) and
+    ``runner_execution_config`` (the protected Runner binding file whose
+    ``wrapper_workspace_id`` entry roots at exactly that prepared path). A
+    workspace without the pair refuses dispatch before any HTTP — an
+    autogenerated worktree is only possible under the explicit
+    ``allow_ephemeral_worktree`` development flag.
     """
 
     repo: str
-    worktree_root: str
+    worktree_root: str | None = None
     wrapper_workspace_id: str | None = Field(default=None, pattern=ID_PATTERN)
+    prepared_worktree: str | None = None
+    runner_execution_config: str | None = None
+    # Operator attestation: the pinned Runner serving this workspace maps
+    # effort 'auto' to this api wire value (HERMES_API_REASONING). Required
+    # before a route whose resolved effort is a non-null wire value may run.
+    runner_effort_pin: Literal["low", "high", "max"] | None = None
+    # Explicit development-only opt-in for an autogenerated per-card
+    # worktree; never acceptable for real HTTP dispatch.
+    allow_ephemeral_worktree: bool = False
 
-    @field_validator("repo", "worktree_root")
+    @field_validator("repo", "worktree_root", "prepared_worktree",
+                     "runner_execution_config")
     @classmethod
-    def _absolute(cls, value: str) -> str:
-        if not os.path.isabs(value):
+    def _absolute(cls, value: str | None) -> str | None:
+        if value is not None and not os.path.isabs(value):
             raise ValueError("workspace paths must be absolute")
         return value
+
+    @model_validator(mode="after")
+    def _binding_pair_complete(self) -> "WorkspaceEntry":
+        if (self.prepared_worktree is None) != (
+            self.runner_execution_config is None
+        ):
+            raise ValueError(
+                "prepared_worktree and runner_execution_config must be set "
+                "together — the worktree is only dispatchable when the "
+                "Runner binding proves it"
+            )
+        if self.prepared_worktree is not None and self.allow_ephemeral_worktree:
+            raise ValueError(
+                "allow_ephemeral_worktree conflicts with a prepared binding "
+                "— pick one admission mode"
+            )
+        if self.allow_ephemeral_worktree and not self.worktree_root:
+            raise ValueError(
+                "allow_ephemeral_worktree requires worktree_root"
+            )
+        return self
 
 
 class Backend(_Strict):

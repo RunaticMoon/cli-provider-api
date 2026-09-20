@@ -4,8 +4,9 @@
 Hermes Kanban → Jev → 9Router integration:
 
 > real Hermes `ready` card → Jev classifier (route only) → thin one-shot
-> dispatcher → wrapper `/v1/chat/completions` (direct preset or compiled
-> 9Router combo) → existing wrapper run → verification → Kanban **review**
+> dispatcher → operator-bound workspace admission → wrapper
+> `/v1/chat/completions` (direct preset or compiled 9Router combo) →
+> existing wrapper run → trusted verification → Kanban **review**
 > (never `done`).
 
 There is no second runtime, scheduler, agent framework, or UI. The board is
@@ -18,22 +19,31 @@ tick**, **control operations**, and a **policy compiler** for 9Router.
 
 ```
 kanban.db (Hermes kernel, canonical task state)
-   │  list ready / claim / heartbeat / review / block / complete
+   │  list ready / claim / heartbeat / review / block / reopen_review
    ▼  via hermes_bridge.py — a JSON-lines subprocess run under the
 cli-provider-kanban     installed Hermes interpreter (no in-process import,
    │                    no raw status writes)
-   ├─ dispatch.db (sidecar receipts + approvals; SQLite, ours)
-   ├─ git worktree per card (trusted repo + worktree_root from policy)
+   ├─ dispatch.db (sidecar receipts + approvals + evidence; SQLite, ours)
+   ├─ operator-prepared worktree (pinned branch at base_revision) +
+   │  protected Runner execution config binding the submitted workspace id
+   │  to exactly that path
    └─ WrapperClient → existing wrapper endpoints only:
-        POST /v1/chat/completions   (stream:false; metadata.task_id,
-                                     workspace_id, execution)
-        GET  /api/v1/runs/{id}
+        POST /v1/chat/completions   (data plane; stream:false;
+                                     metadata.task_id, workspace_id,
+                                     execution)
+        GET  /api/v1/runs/{id}      (control plane — control_base_url)
         POST /api/v1/runs/{id}/cancel
         GET  /api/v1/artifacts/{id}
 ```
 
 Canonicality: Kanban owns task state, the wrapper owns run state, the
-sidecar owns only dispatch receipts — it never re-decides card status.
+sidecar owns only dispatch receipts/approvals/evidence — it never
+re-decides card status. Execution mode is `direct` (a fixed
+operator-declared preset alias) or `gateway` (the compiled combo
+`jev.<route>`; a static `execution.model` is rejected there so
+classification can never be bypassed). Gateway mode requires
+`execution.control_base_url` — run truth and cancel never ride the
+data-plane combo path.
 
 ## Card contract (`TaskSpec`)
 
@@ -76,57 +86,104 @@ One bounded tick, serialized by the kernel's `_dispatch_tick_lock` (a second
 concurrent dispatcher gets `held=false` and exits). Per card:
 
 1. Classify → `hold`/`replan`/`needs_approval` handled before any side
-   effect; `needs_approval` writes a durable approval record, blocks the
-   card `needs_input`, and optionally registers a Hermes notify sub.
+   effect; `needs_approval` writes a durable approval record bound to the
+   exact scope (task revision + spec hash + policy fingerprint +
+   operation + expiry), blocks the card `needs_input`, and optionally
+   registers a Hermes notify sub. An **applied** grant for the identical
+   scope is consumed atomically with the reservation — once, never a loop.
 2. Effort mapping resolved per-backend (`auto`→null on devin; api backends
-   need an explicit `effort_map` entry to low/high/max) — unsupported →
-   block `needs_input` *before* claim.
+   need an explicit `effort_map` entry) — unsupported → block `needs_input`
+   *before* claim. A non-null resolved effort additionally requires the
+   workspace's `runner_effort_pin` to match — the pinned Runner cannot be
+   proven to carry an effort it wasn't configured for, so dispatch refuses
+   rather than silently running the wrong effort.
 3. **Reserve** the receipt in `dispatch.db` BEFORE any HTTP/worktree
    effect — one active-or-unknown reservation per card across restarts.
 4. Dependency proof: every parent must be `done` **and** carry an
-   `integrated_revision` (in its closing run's metadata) that is
-   `git merge-base --is-ancestor` of the pinned `base_revision`. Undone
-   parents → skip (stays ready); missing/non-ancestor revision → block
-   `dependency`.
-5. `max_retries` forced to 1 (stock reclaim must never replay an external
-   write), then `claim_task` (atomic ready→running, dep-gated).
-6. Fresh worktree at `jev/<dispatch_id>` from `base_revision`; submit
-   **exactly one** `POST /v1/chat/completions` (`stream:false`,
+   `integrated_revision` that is `git merge-base --is-ancestor` of the
+   pinned `base_revision`. Undone parents → skip; missing/non-ancestor →
+   block `dependency`.
+5. **Workspace admission** — before claim and before any HTTP:
+   `workspace.prepared_worktree` must be a real git worktree of the
+   configured repo, `HEAD` exactly `base_revision`, clean, on its pinned
+   branch; and `workspace.runner_execution_config` must be a trusted file
+   (canonical path, owned, 0600/0640, private 0700 parent — the same bar
+   the Runner's own loader enforces) whose `workspaces.<submitted id>.root`
+   equals the prepared path and whose `allowed_presets` permits the
+   submitted model. No binding → fail closed; no wire. The autogenerated
+   `jev/<dispatch_id>` worktree lane survives only behind the explicit
+   development-only `allow_ephemeral_worktree` flag (results are labeled
+   `ephemeral`/`synthetic`).
+6. `max_retries` forced to 1 (stock reclaim must never replay an external
+   write), then `claim_task` (atomic ready→running, dep-gated). A cancel
+   intent already persisted wins here — before any submit.
+7. Submit **exactly one** `POST /v1/chat/completions` (`stream:false`,
    `metadata.task_id`/`workspace_id`, and `metadata.execution =
    {task_revision, base_revision, route, policy_version}` when
-   `dispatch.send_execution_metadata` — the agreed core contract shape).
-   Duplicate `task_id` → the cached run view is reconciled, never a second
-   execution. Transport failure after submit → receipt `unknown`, card
-   blocked — **never retried**.
-7. Completed run → real verification (bounded `git diff`, declared artifact
-   paths confined to the worktree, trusted-argv-only test run) →
-   `request_review` with `expected_run_id` fence. Missing artifact or test
-   failure → block `needs_input` with a `quality_failed:` reason (Hermes's
-   typed kinds are dependency/needs_input/capability/transient) — **never a
-   fallback**. Failed/cancelled run → block; the worktree is preserved.
-8. Heartbeats renew the claim while the synchronous request is in flight.
+   `dispatch.send_execution_metadata`). Transport failure after submit →
+   receipt `unknown`, card blocked — **never retried**.
+8. The claim is renewed for real for the whole HTTP+verification critical
+   section — a daemon heartbeat thread calls the kernel `heartbeat` op on
+   `dispatch.heartbeat_seconds` (validated `< claim_ttl_seconds`).
+9. Canonical run view handling — only `status == "completed"` **and**
+   `outcome == "succeeded"` **and** the echoed `task_id`/`workspace_id`/
+   `execution` equal to the reserved context may enter verification. A
+   foreign-context run is `unknown` (anomalous, never verified). A live or
+   unrecognized status holds `in_flight` — receipt stays `submitted`, card
+   parked `needs_input`, no review, no blind replay. `cancelled`/`failed`/
+   non-`succeeded` → the matching typed terminal, never review.
+10. A persisted cancel intent is re-checked atomically before verification
+    work (`completing` under `require_no_cancel`) and again at the review
+    transition — a late cancel wins over the handoff; the card is pulled
+    back (`reopen_review` → blocked `needs_input`) rather than left
+    promotable.
+11. Verification is real: the card's `verification.argv` must match the
+    operator's `verification.commands` full-argv allowlist (exact args; a
+    trailing `*` is the only wildcard; the executable head must be in
+    `verification.executables`). Runs in the prepared worktree with no
+    shell, a process-group kill on timeout, and bounded output capture.
+    Post-run evidence covers committed **and** dirty/untracked changes; any
+    changed path outside `allowed_scope` is `quality_failed`. Artifacts are
+    hashed (sha256, bounded); the diff and sanitized verification output
+    are stored durably on the receipt (`evidence/`, known credential values
+    redacted) — a `blocked`/`unknown` receipt keeps its evidence too.
+12. `request_review` with `expected_run_id` fence; the receipt→`review`
+    transition is the same atomic cancel-guarded write. Refused → `unknown`
+    — never guessed, never replayed.
 
-Crash recovery happens at the top of every tick: a `reserved` receipt never
-reached the kernel → `aborted` (safe to re-dispatch); anything later is
-`unknown` → card blocked `needs_input`, manual `resolve` required.
+Crash recovery at the top of every tick: a `reserved` receipt never reached
+the kernel → `aborted`; anything later → `unknown`, card blocked
+`needs_input`, manual `resolve` required.
 
 ## Control (`control <op>`)
 
-`--actor` must be in `policy.control.operators` — MVP local identity only,
-**not** Telegram auth.
+`--actor` is **not** authentication by itself: the actor must be in
+`policy.control.operators` **and** equal `pwd.getpwuid(os.geteuid())`
+(the invoking OS user), or map to the current euid via the optional
+`control.operator_uids` table. Local CLI auth only — not Telegram.
 
 - `cancel --dispatch-id` — persists `cancel_requested` on the receipt
-  *first*, then cancels the wrapper run; a late completion can never be
-  upgraded to review/done afterwards.
+  *first*, then cancels the wrapper run through the control target. The
+  wrapper result is reported truthfully (`confirmed` only when the wrapper
+  confirms; `not_found`/`unreachable`/`error` are never claimed as
+  success). A card in `review` is reopened and blocked — a cancelled
+  execution must not stay promotable or silently re-dispatch.
 - `approve`/`deny --approval-id` — atomic consume-once; expiry marks the
-  record `expired`; wrong actor or replay is refused.
-- `accept --task-id --integrated-revision` — the ONLY path to `done`:
-  requires the card in `review`, a review-state receipt with no pending
-  cancel, a live run not cancelled, and a full-commit revision recorded on
-  the closing run's metadata.
-- `resolve --dispatch-id` — reconciles an `unknown` receipt: completed run
-  → review handoff; failed/cancelled → mirror; no run at all → `aborted`
-  (the only retryable unknown); still running → report only.
+  record `expired`; wrong actor or replay is refused. An applied grant is
+  consumed exactly once, inside the reservation transaction, for the exact
+  task-revision/spec-hash/policy-fingerprint scope — a changed card or
+  policy re-gates.
+- `accept` — **disabled**: a review-state card plus a caller-supplied
+  40-hex string is not proof of an integrated, verified revision. The Lead
+  verifies the review handoff and completes via Hermes directly. The CLI
+  flag is preserved but fails closed.
+- `resolve --dispatch-id` — reconciles an `unknown` receipt against the
+  wrapper: no run id, a 404, or an unreachable control plane all leave it
+  `unknown` (absence is not proof nothing executed — external operator
+  investigation); `cancelled`/`failed`/non-`succeeded` mirror the terminal
+  truth; `completed`+`succeeded` re-runs the **full** verification contract
+  (bound worktree intact, allowlisted argv, artifacts, scope, diff) before
+  any review handoff — never a shortcut.
 
 ## Compile (`compile`)
 
@@ -153,7 +210,7 @@ uv run cli-provider-kanban dispatch --once --board-db kanban.db \
 uv run cli-provider-kanban status --board-db kanban.db --policy P \
     --store dispatch.db (--dispatch-id D | --task-id T)
 uv run cli-provider-kanban control --board-db kanban.db --policy P \
-    --store dispatch.db --actor op-name \
+    --store dispatch.db --actor <os-user> \
     (cancel --dispatch-id D | approve|deny --approval-id A | \
      accept --task-id T --integrated-revision REV | resolve --dispatch-id D)
 uv run cli-provider-kanban compile --policy P [--apply TARGET --credential-file F]
@@ -170,6 +227,12 @@ uv run cli-provider-kanban compile --policy packages/kanban/examples/jev-routing
 uv run cli-provider-kanban dispatch --once \
     --board-db ~/.hermes/kanban/kanban.db --policy <policy> --store ~/.hermes/kanban/dispatch.db
 ```
+
+**Operator prerequisite:** a workspace bound for real dispatch needs a
+prepared worktree pinned at the card's base revision plus a Runner
+execution config whose binding points at exactly that path — and the
+Runner must be (re)started with `--execution-config` on the verified bytes;
+the dispatcher validates the file it was given, not a live Runner's memory.
 
 The systemd oneshot in `packages/kanban/examples/jev-dispatch.service` is a
 **disabled** template — `Type=oneshot`, no `Restart=`, no `[Install]`.
@@ -192,27 +255,35 @@ uv run --all-packages pytest             # whole workspace
 ```
 
 Real-thing coverage: Hermes-kernel temp boards (claim/heartbeat/review/
-block/complete through the bridge), real git worktrees and ancestry, the
-kernel singleton lock excluding a second dispatcher, and a real loopback
-HTTP stub for the wrapper contract (submit payload, cached-run reconcile,
-cancel, transport→unknown). Mock-only stand-ins are labelled where used
-(`FakeWrapper`). The live-9Router apply path is covered against a stub
-management API; a real 0.5.81 router smoke stays opt-in for the parent.
+block through the bridge), real git worktrees and ancestry, the kernel
+singleton lock excluding a second dispatcher, a real loopback HTTP stub for
+the wrapper contract, and — `tests/test_vertical_tracer.py` — the full
+vertical over real subprocesses: real `WrapperClient` → real
+`cli-provider-api` → real `cli-provider-runner` (mock driver) → run truth,
+with the prepared-worktree binding enforced by a real execution config.
+The mock lane is asserted `synthetic` in the run view rather than hidden;
+the native canary is the parent's post-merge step. The live-9Router apply
+path is covered against a stub management API; a real 0.5.81 router smoke
+stays opt-in for the parent.
 
 ## Honest status
 
 - **Implemented/tested:** route-only contract + classifier with floor
-  gates and confidence replan; receipt sidecar with crash recovery; kernel
-  bridge; trusted worktrees; single-submit dispatch to the existing wrapper
-  endpoints; verification→review handoff; approval/cancel/accept/resolve;
-  9Router plan compile + gated apply; CLI for all of it.
+  gates and confidence replan; receipt sidecar with crash recovery, durable
+  evidence, and consume-once scoped approval grants; kernel bridge;
+  prepared-worktree admission + protected Runner binding validation;
+  single-submit dispatch with strict run-status/outcome/context contract;
+  real claim heartbeats through the critical section; trusted bounded
+  verification with scope enforcement; fenced review handoff; OS-bound
+  control actors; cancel/approve/deny/resolve; `accept` disabled
+  fail-closed; 9Router plan compile + gated apply; CLI for all of it.
 - **Explicitly not here:** no scheduling loop (Hermes cron/timer owns
-  cadence), no `done` from the dispatcher (Lead `accept` only), no Codex,
-  no fifth backend, no card-chosen executor/model/workspace, no retry of a
-  submitted request, no plaintext/chat approval auth, no production gateway
-  targets.
-- **Pending the parallel core/driver merge:** `metadata.execution` rides
-  only once the core metadata contract lands (`send_execution_metadata`
-  flag); native approval continuation awaits a bridge; the shared
-  no-post-dispatch-retry guard must be attested before mutation-tier combos
-  are operational.
+  cadence), no `done` from the dispatcher or from `accept` (the Lead
+  completes via Hermes), no Codex, no fifth backend, no card-chosen
+  executor/model/workspace, no retry of a submitted request, no
+  plaintext/chat approval auth, no production gateway targets.
+- **Known limitations:** in-tick cancel reconciliation uses the data-plane
+  client when no `control_base_url` is configured (direct mode is
+  same-plane by definition; gateway mode always configures one); the
+  Runner's loaded binding is attested by file validation — restart
+  freshness is an operator prerequisite, not a cryptographic attestation.

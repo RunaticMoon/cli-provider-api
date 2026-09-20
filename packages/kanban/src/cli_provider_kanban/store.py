@@ -50,6 +50,7 @@ APPROVAL_PENDING = "pending"
 APPROVAL_APPLIED = "applied"
 APPROVAL_DENIED = "denied"
 APPROVAL_EXPIRED = "expired"
+APPROVAL_CONSUMED = "consumed"  # applied AND burned by one reservation
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS reservations (
@@ -69,6 +70,7 @@ CREATE TABLE IF NOT EXISTS reservations (
     worktree           TEXT,
     cancel_requested   INTEGER NOT NULL DEFAULT 0,
     detail             TEXT,
+    evidence           TEXT,        -- JSON: sanitized durable evidence
     created_at         REAL NOT NULL,
     updated_at         REAL NOT NULL
 );
@@ -85,6 +87,8 @@ CREATE TABLE IF NOT EXISTS approvals (
     approval_id    TEXT PRIMARY KEY,
     task_id        TEXT NOT NULL,
     task_revision  TEXT NOT NULL,
+    spec_hash      TEXT NOT NULL DEFAULT '',
+    policy_fingerprint TEXT NOT NULL DEFAULT '',
     operation      TEXT NOT NULL,
     run_id         TEXT,
     allowed_actors TEXT NOT NULL,   -- JSON array of configured identities
@@ -95,6 +99,14 @@ CREATE TABLE IF NOT EXISTS approvals (
     decided_by     TEXT
 );
 """
+
+# Columns added after the initial schema — applied idempotently.
+_MIGRATIONS = (
+    "ALTER TABLE reservations ADD COLUMN evidence TEXT",
+    "ALTER TABLE approvals ADD COLUMN spec_hash TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE approvals ADD COLUMN policy_fingerprint "
+    "TEXT NOT NULL DEFAULT ''",
+)
 
 
 class StoreError(Exception):
@@ -111,6 +123,11 @@ class ReservationExists(StoreError):
         )
         self.task_id = task_id
         self.workspace_id = workspace_id
+
+
+class GrantMismatch(StoreError):
+    """An applied approval no longer matches the exact dispatch scope —
+    the reservation must not be created and the grant must not burn."""
 
 
 @dataclass(frozen=True)
@@ -131,6 +148,7 @@ class Reservation:
     worktree: str | None
     cancel_requested: bool
     detail: str | None
+    evidence: dict | None
     created_at: float
     updated_at: float
 
@@ -144,6 +162,8 @@ class Approval:
     approval_id: str
     task_id: str
     task_revision: str
+    spec_hash: str
+    policy_fingerprint: str
     operation: str
     run_id: str | None
     allowed_actors: tuple[str, ...]
@@ -172,6 +192,7 @@ def _reservation_from_row(row: sqlite3.Row) -> Reservation:
         worktree=row["worktree"],
         cancel_requested=bool(row["cancel_requested"]),
         detail=row["detail"],
+        evidence=(json.loads(row["evidence"]) if row["evidence"] else None),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -182,6 +203,8 @@ def _approval_from_row(row: sqlite3.Row) -> Approval:
         approval_id=row["approval_id"],
         task_id=row["task_id"],
         task_revision=row["task_revision"],
+        spec_hash=row["spec_hash"],
+        policy_fingerprint=row["policy_fingerprint"],
         operation=row["operation"],
         run_id=row["run_id"],
         allowed_actors=tuple(json.loads(row["allowed_actors"])),
@@ -204,7 +227,17 @@ class DispatchStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        # The dispatcher and control commands may run in separate processes
+        # (or threads) against the same sidecar — wait on a busy writer
+        # instead of erroring on the first contention.
+        self._conn.execute("PRAGMA busy_timeout=15000")
         self._conn.executescript(_SCHEMA)
+        for stmt in _MIGRATIONS:
+            try:
+                self._conn.execute(stmt)
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc):
+                    raise
         self._conn.commit()
 
     def close(self) -> None:
@@ -230,26 +263,56 @@ class DispatchStore:
         workspace_id: str,
         base_revision: str,
         route: str,
+        consume_approval: str | None = None,
     ) -> Reservation:
-        """Persist the reservation BEFORE any claim/HTTP/worktree effect."""
+        """Persist the reservation BEFORE any claim/HTTP/worktree effect.
+
+        When ``consume_approval`` is given, the matching *applied* grant is
+        burned to ``consumed`` in the SAME transaction as the reservation
+        insert — and only when it still binds this exact scope (task
+        revision + spec hash + policy fingerprint, unexpired). Any mismatch
+        raises ``GrantMismatch`` and creates nothing.
+        """
         now = time.time()
         dispatch_id = "d_" + secrets.token_hex(8)
         try:
-            self._conn.execute(
-                """
-                INSERT INTO reservations (
-                    dispatch_id, task_id, task_revision, spec_hash,
-                    policy_fingerprint, workspace_id, base_revision, route,
-                    state, created_at, updated_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    dispatch_id, task_id, task_revision, spec_hash,
-                    policy_fingerprint, workspace_id, base_revision, route,
-                    RESERVED, now, now,
-                ),
-            )
-            self._conn.commit()
+            with self._conn:  # one txn: grant burn + insert are atomic
+                if consume_approval is not None:
+                    cur = self._conn.execute(
+                        """
+                        UPDATE approvals
+                           SET state='consumed', decided_at=?,
+                               decided_by=COALESCE(decided_by, 'jev-dispatch')
+                         WHERE approval_id=? AND state='applied'
+                           AND task_id=? AND task_revision=? AND spec_hash=?
+                           AND policy_fingerprint=? AND operation='dispatch'
+                           AND expires_at > ?
+                        """,
+                        (
+                            now, consume_approval, task_id, task_revision,
+                            spec_hash, policy_fingerprint, now,
+                        ),
+                    )
+                    if cur.rowcount != 1:
+                        raise GrantMismatch(
+                            f"approval {consume_approval} does not bind this "
+                            "exact task/spec/policy scope — refusing to "
+                            "consume it"
+                        )
+                self._conn.execute(
+                    """
+                    INSERT INTO reservations (
+                        dispatch_id, task_id, task_revision, spec_hash,
+                        policy_fingerprint, workspace_id, base_revision, route,
+                        state, created_at, updated_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        dispatch_id, task_id, task_revision, spec_hash,
+                        policy_fingerprint, workspace_id, base_revision, route,
+                        RESERVED, now, now,
+                    ),
+                )
         except sqlite3.IntegrityError as exc:
             raise ReservationExists(task_id, workspace_id) from exc
         return self.get(dispatch_id)
@@ -295,12 +358,19 @@ class DispatchStore:
         kernel_run_id: int | None = None,
         branch: str | None = None,
         worktree: str | None = None,
+        require_no_cancel: bool = False,
     ) -> Reservation:
-        """Move a reservation; terminal states are one-way doors."""
+        """Move a reservation; terminal states are one-way doors.
+
+        ``require_no_cancel`` folds the cancellation check into the same
+        atomic UPDATE — the guard against a late handoff cannot be
+        interleaved with a ``request_cancel`` write.
+        """
         if state not in ALL_STATES:
             raise StoreError(f"unknown reservation state {state!r}")
+        guard = " AND cancel_requested = 0" if require_no_cancel else ""
         cur = self._conn.execute(
-            """
+            f"""
             UPDATE reservations
                SET state = ?, detail = COALESCE(?, detail),
                    run_id = COALESCE(?, run_id),
@@ -311,6 +381,7 @@ class DispatchStore:
                    updated_at = ?
              WHERE dispatch_id = ?
                AND state NOT IN ('review','blocked','aborted','cancelled','failed')
+               {guard}
             """,
             (
                 state, detail, run_id, attempt_id, kernel_run_id, branch,
@@ -325,6 +396,18 @@ class DispatchStore:
                 f"current state {existing.state if existing else 'missing'!r}"
             )
         return self.get(dispatch_id)
+
+    def record_evidence(self, dispatch_id: str, evidence: dict) -> None:
+        """Persist sanitized verification/diff evidence durably — survives
+        any later state transition (blocked, review, unknown)."""
+        cur = self._conn.execute(
+            "UPDATE reservations SET evidence = ?, updated_at = ? "
+            "WHERE dispatch_id = ?",
+            (json.dumps(evidence, sort_keys=True), time.time(), dispatch_id),
+        )
+        self._conn.commit()
+        if cur.rowcount != 1:
+            raise StoreError(f"no reservation {dispatch_id!r}")
 
     def request_cancel(self, dispatch_id: str) -> Reservation:
         """Persist the cancel intent BEFORE touching the wrapper — a crash
@@ -346,29 +429,41 @@ class DispatchStore:
         *,
         task_id: str,
         task_revision: str,
+        spec_hash: str,
+        policy_fingerprint: str,
         operation: str,
         run_id: str | None,
         allowed_actors: list[str],
         ttl_seconds: int,
     ) -> Approval:
-        """Durable approval record: id, card, revision, run, operation,
-        actor allowlist, expiry. Pending until a configured operator acts."""
+        """Durable approval bound to the exact dispatch scope: card revision,
+        spec hash, policy fingerprint, operation, expiry. Pending until a
+        configured operator acts. A pending grant for the identical scope is
+        returned as-is — gating never piles up duplicate rows."""
         if not allowed_actors:
             raise StoreError(
                 "approval requires a non-empty actor allowlist — nobody could "
                 "ever apply it otherwise"
             )
+        existing = self.pending_approval_for(
+            task_id=task_id, operation=operation, task_revision=task_revision,
+            spec_hash=spec_hash, policy_fingerprint=policy_fingerprint,
+        )
+        if existing is not None:
+            return existing
         now = time.time()
         approval_id = "a_" + secrets.token_hex(8)
         self._conn.execute(
             """
             INSERT INTO approvals (
-                approval_id, task_id, task_revision, operation, run_id,
+                approval_id, task_id, task_revision, spec_hash,
+                policy_fingerprint, operation, run_id,
                 allowed_actors, state, expires_at, created_at
-            ) VALUES (?,?,?,?,?,?, 'pending', ?,?)
+            ) VALUES (?,?,?,?,?,?,?,?, 'pending', ?,?)
             """,
             (
-                approval_id, task_id, task_revision, operation, run_id,
+                approval_id, task_id, task_revision, spec_hash,
+                policy_fingerprint, operation, run_id,
                 json.dumps(sorted(set(allowed_actors))), now + ttl_seconds, now,
             ),
         )
@@ -381,11 +476,55 @@ class DispatchStore:
         ).fetchone()
         return _approval_from_row(row) if row else None
 
-    def pending_approval_for(self, task_id: str, operation: str) -> Approval | None:
+    def pending_approval_for(
+        self,
+        task_id: str,
+        operation: str,
+        task_revision: str | None = None,
+        spec_hash: str | None = None,
+        policy_fingerprint: str | None = None,
+    ) -> Approval | None:
+        clauses = ["task_id = ?", "operation = ?", "state = 'pending'"]
+        args: list = [task_id, operation]
+        for col, val in (
+            ("task_revision", task_revision),
+            ("spec_hash", spec_hash),
+            ("policy_fingerprint", policy_fingerprint),
+        ):
+            if val is not None:
+                clauses.append(f"{col} = ?")
+                args.append(val)
         row = self._conn.execute(
-            "SELECT * FROM approvals WHERE task_id = ? AND operation = ? "
-            "AND state = 'pending' ORDER BY created_at DESC LIMIT 1",
-            (task_id, operation),
+            "SELECT * FROM approvals WHERE " + " AND ".join(clauses)
+            + " ORDER BY created_at DESC LIMIT 1",
+            args,
+        ).fetchone()
+        return _approval_from_row(row) if row else None
+
+    def find_applied_grant(
+        self,
+        *,
+        task_id: str,
+        operation: str,
+        task_revision: str,
+        spec_hash: str,
+        policy_fingerprint: str,
+    ) -> Approval | None:
+        """An applied (unburned) grant binding this exact scope — or None.
+        Expired applied grants never match; they are marked expired."""
+        now = time.time()
+        self._conn.execute(
+            "UPDATE approvals SET state='expired' WHERE state='applied' "
+            "AND expires_at <= ?",
+            (now,),
+        )
+        self._conn.commit()
+        row = self._conn.execute(
+            "SELECT * FROM approvals WHERE task_id=? AND operation=? "
+            "AND state='applied' AND task_revision=? AND spec_hash=? "
+            "AND policy_fingerprint=? ORDER BY created_at DESC LIMIT 1",
+            (task_id, operation, task_revision, spec_hash,
+             policy_fingerprint),
         ).fetchone()
         return _approval_from_row(row) if row else None
 

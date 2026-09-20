@@ -87,6 +87,7 @@ def test_shadow_help(capsys):
 # --- Slice 5: dispatch / status / control / compile contracts -----------------
 
 from conftest import (  # noqa: E402
+    CURRENT_OS_USER,
     dispatch_policy,  # noqa: F401  (fixture)
     requires_hermes,
     stub_wrapper,  # noqa: F401  (fixture)
@@ -180,7 +181,7 @@ def test_cli_dispatch_status_control_roundtrip(
     did = out["receipt"]["dispatch_id"]
 
     rc = main(["control", "--board-db", str(board), "--policy", str(policy),
-               "--store", str(store), "--actor", "op-test",
+               "--store", str(store), "--actor", CURRENT_OS_USER,
                "cancel", "--dispatch-id", did])
     assert rc == 0
     out = json.loads(capsys.readouterr().out)

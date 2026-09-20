@@ -214,6 +214,13 @@ class _Bridge:
 
         return {"unblocked": unblock_task(self.conn, args["task_id"])}
 
+    def op_reopen_review(self, args):
+        """review -> resumable work state — the cancel/rollback path when a
+        card reached review but must not stay promotable."""
+        from hermes_cli.kanban_db import reopen_review_task
+
+        return {"reopened": reopen_review_task(self.conn, args["task_id"])}
+
     def op_notify_sub(self, args):
         """Reuse Hermes notify subscriptions for the approval/review handoff."""
         from hermes_cli.kanban_db_notify import add_notify_sub

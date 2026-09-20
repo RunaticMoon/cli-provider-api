@@ -15,12 +15,16 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 import yaml
+
+CURRENT_OS_USER = pwd.getpwuid(os.geteuid()).pw_name
 
 # Columns mirroring the real ``tasks`` schema that the shadow reader selects.
 _TASKS_DDL = """
@@ -254,12 +258,13 @@ def policy_dict(**overrides) -> dict:
         "workspaces": {
             "ws-main": {
                 "repo": "/nonexistent-but-trusted",
-                "worktree_root": "/nonexistent-but-trusted/.worktrees",
                 "wrapper_workspace_id": "ws-alpha",
+                "prepared_worktree": "/nonexistent-but-trusted/prepared",
+                "runner_execution_config": "/nonexistent-but-trusted/cfg.json",
             },
         },
         "task_map": None,
-        "control": {"operators": ["op-test"]},
+        "control": {"operators": [CURRENT_OS_USER, "op-test"]},
     }
     data.update(overrides)
     return data
@@ -397,8 +402,18 @@ class FakeWrapper:
     of real wrapper behaviour.
     """
 
-    def __init__(self, *, status: str = "completed", runs: dict | None = None):
+    _OUTCOME = {
+        "completed": "succeeded",
+        "failed": "provider_error",
+        "cancelled": "cancelled",
+        "unknown": "unknown",
+    }
+
+    def __init__(self, *, status: str = "completed", runs: dict | None = None,
+                 outcome: str | None = None, run_overrides: dict | None = None):
         self.status = status
+        self.outcome = outcome  # None -> default mapping above
+        self.run_overrides = dict(run_overrides or {})
         self.calls: list[dict] = []
         self.cancelled: list[str] = []
         self._runs = runs or {}
@@ -414,6 +429,10 @@ class FakeWrapper:
         })
         self._counter += 1
         run_id = f"run_{self._counter:04d}"
+        outcome = (
+            self.outcome if self.outcome is not None
+            else self._OUTCOME.get(self.status)
+        )
         run = {
             "run_id": run_id,
             "task_id": task_id,
@@ -421,15 +440,17 @@ class FakeWrapper:
             "status": self.status,
             "workspace_id": workspace_id,
             "preset": model,
-            "outcome": "completed" if self.status == "completed" else self.status,
+            "outcome": outcome,
             "summary": "fake completion" if self.status == "completed" else None,
             "artifacts": [],
             "detail": None,
             "cached": False,
+            "execution": execution,
         }
+        run.update(self.run_overrides)
         self._runs[run_id] = run
         return SubmitOutcome(
-            status=self.status, run=run, cached=False,
+            status=str(run.get("status") or self.status), run=run, cached=False,
             content=run["summary"] or "",
         )
 
@@ -509,10 +530,17 @@ class StubWrapperServer:
                         "workspace_id": (body.get("metadata") or {})
                         .get("workspace_id"),
                         "preset": body.get("model"),
-                        "outcome": server.run_status,
+                        "outcome": {
+                            "completed": "succeeded",
+                            "failed": "provider_error",
+                            "cancelled": "cancelled",
+                            "unknown": "unknown",
+                        }.get(server.run_status),
                         "summary": "stub done",
                         "artifacts": [],
                         "detail": None,
+                        "execution": (body.get("metadata") or {})
+                        .get("execution"),
                     }
                     resp = {
                         "id": "chatcmpl-stub",
@@ -582,16 +610,72 @@ def stub_wrapper():
     server.close()
 
 
+def make_prepared_worktree(
+    repo: Path, path: Path, base_rev: str, branch: str | None = None
+) -> Path:
+    """Create the operator-prepared worktree a real dispatch binds to.
+
+    Mirrors the Lead/operator prerequisite: an isolated git worktree whose
+    HEAD is exactly the card's pinned base, on a dedicated ``jev/*`` branch
+    (or detached), in a clean state.
+    """
+    env = dict(
+        os.environ,
+        GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+        GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t",
+    )
+    argv = ["git", "worktree", "add", "--quiet"]
+    argv += ["-b", branch] if branch else ["--detach"]
+    argv += [str(path), base_rev]
+    subprocess.run(argv, cwd=repo, env=env, check=True, capture_output=True)
+    return path.resolve()
+
+
+def write_runner_config(path: Path, workspaces: dict) -> Path:
+    """Write a Runner execution config with the trust bits its loader
+    requires: private parent dir (0700), file 0600, canonical path."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    path.write_text(
+        json.dumps({"version": 1, "workspaces": workspaces}), encoding="utf-8"
+    )
+    os.chmod(path, 0o600)
+    return path.resolve()
+
+
 @pytest.fixture
 def dispatch_policy(tmp_path, git_repo):
-    """Policy wired at the real temp repo + a fake execution target."""
+    """Policy wired at the real temp repo + a fake execution target.
+
+    The workspace is bound the production way: an operator-prepared worktree
+    at the pinned base plus a Runner execution-config file whose binding for
+    the wrapper workspace id points at exactly that prepared path.
+    """
     repo, rev = git_repo
+    prepared = make_prepared_worktree(
+        repo, tmp_path / "prepared" / "ws-main", rev,
+        branch="jev/prepared-ws-main",
+    )
+    cfg = write_runner_config(
+        tmp_path / "runner_cfg" / "exec.json",
+        {
+            "ws-alpha": {
+                "root": str(prepared),
+                "allowed_actions": [],
+                "allowed_presets": ["devin/swe-2-max", "mock/text"],
+                "allowed_models": None,
+            },
+        },
+    )
     data = policy_dict()
     data["workspaces"] = {
         "ws-main": {
             "repo": str(repo),
             "worktree_root": str(tmp_path / "worktrees"),
             "wrapper_workspace_id": "ws-alpha",
+            "prepared_worktree": str(prepared),
+            "runner_execution_config": str(cfg),
         },
     }
     data["execution"] = {
@@ -605,10 +689,19 @@ def dispatch_policy(tmp_path, git_repo):
             "false": "/usr/bin/false",
             "touch": "/usr/bin/touch",
             "echo": "/usr/bin/echo",
+            "sleep": "/usr/bin/sleep",
         },
+        "commands": [
+            ["true"],
+            ["false"],
+            ["echo", "*"],
+            ["touch", "*"],
+            ["sleep", "*"],
+            [sys.executable, "-c", "*"],
+        ],
         "timeout_seconds": 30,
         "max_output_bytes": 8192,
         "max_diff_bytes": 65536,
     }
-    data["control"] = {"operators": ["op-test"]}
+    data["control"] = {"operators": [CURRENT_OS_USER, "op-test"]}
     return data, rev
