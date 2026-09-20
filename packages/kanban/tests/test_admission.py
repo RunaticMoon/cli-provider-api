@@ -163,6 +163,36 @@ def test_prepared_worktree_dirty_refused(board, tmp_path, dispatch_policy):
     assert Path(ws["prepared_worktree"], "stray.txt").is_file()
 
 
+def test_prepared_worktree_hidden_ignored_file_refused(
+    board, tmp_path, dispatch_policy
+):
+    """An ignored/excluded file already sitting in the prepared tree used
+    to pass the porcelain cleanliness check — the disk-vs-base inventory
+    check now refuses it, since a later run could not be distinguished
+    from pre-existing hidden content."""
+    db, bridge = board
+    data, rev = dispatch_policy
+    ws = data["workspaces"]["ws-main"]
+    prepared = Path(ws["prepared_worktree"])
+    common = subprocess.run(
+        ["git", "rev-parse", "--git-common-dir"], cwd=prepared,
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    common = Path(common)
+    if not common.is_absolute():
+        common = prepared / common
+    (common / "info").mkdir(parents=True, exist_ok=True)
+    (common / "info" / "exclude").write_text("stray.log\n")
+    (prepared / "stray.log").write_text("pre-existing hidden file\n")
+    tid = _card(bridge, tmp_path, data, rev)
+    client = FakeWrapper()
+    report, _ = _run(db, tmp_path, data, client)
+    rec = _result(report, tid)
+    assert rec["action"] == "blocked"
+    assert client.calls == []
+    (common / "info" / "exclude").unlink()
+
+
 def test_prepared_worktree_foreign_repo_refused(
     board, tmp_path, dispatch_policy, git_repo
 ):

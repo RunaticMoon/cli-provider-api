@@ -8,21 +8,49 @@ only behind the explicit ``allow_ephemeral_worktree`` development flag.
 
 Dependencies must prove their ``integrated_revision`` is an ancestor of the
 base — a ``done`` status alone is never sufficient. All subprocesses are
-argv lists; no shell strings. Verification runs in its own process group
-with bounded output drain, so a timeout kills stubborn children too.
+argv lists; no shell strings.
+
+Evidence path hardening (the run owns the tree it is measured on):
+
+* Every git invocation runs under a minimal scrubbed environment with
+  model-controllable config (hooks path, fsmonitor, pager, diff drivers,
+  filter drivers, credential/include machinery) neutralized — the shared
+  repo config is writable by the untrusted run, so it is never trusted.
+* Before evidence is taken, the bound tree is revalidated: root not
+  relocated/symlinked, ``.git`` link present and pointing inside the
+  repository common dir recorded at admission, top-level resolves to the
+  bound path, the pinned base still exists and HEAD still descends from it
+  (committed work by the worker is legitimate — HEAD == base is NOT
+  required). A non-zero git exit anywhere on this path is a hard failure.
+* ``changed_files``/``capture_diff`` enumerate against a PRIVATE index
+  seeded from the base (never the shared index, so ``add -N`` leaves no
+  residue and assume-unchanged/skip-worktree flags cannot hide content)
+  plus a bounded filesystem walk, so ignored/excluded/untracked paths,
+  dotfiles, newline-bearing names and symlinks are all visible; symlinks
+  are recorded, never followed. Enumeration bounds fail closed.
+* Verification executes under a separate subreaper supervisor process with
+  an explicit minimal environment and proven descendant cleanup on EVERY
+  exit path — see ``_verify_supervisor.py``. This is process supervision,
+  not an OS sandbox; same-UID residual limits are documented in
+  docs/JEV_EVIDENCE_REPAIR.md.
 """
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import hashlib
 import json
 import os
 import re
-import signal
+import select
+import shutil
 import stat
 import subprocess
+import sys
+import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -30,8 +58,41 @@ _FULL_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _BRANCH_SAFE = re.compile(r"[^A-Za-z0-9_-]")
 
 # The Runner's cross-process claim record lives inside the bound root; it is
-# infra bookkeeping, not card output, so it never counts as a scope change.
+# infra bookkeeping, not card output, so it never counts as a scope change
+# and never appears in the persisted diff (scope and diff views agree).
 _RUNNER_LOCK_NAME = ".cli-provider-runner.lock"
+
+# The only other infrastructure exemption: a verifier scratch prefix the
+# supervisor/test harness may use inside the bound root, documented in
+# docs/JEV_EVIDENCE_REPAIR.md. No broad ignore bypass for dist/log/cache —
+# those stay fully visible.
+_VERIFIER_SCRATCH_PREFIX = ".jev-verify/"
+_EVIDENCE_EXCLUDED_PATHS = frozenset({_RUNNER_LOCK_NAME, ".jev-verify"})
+_EVIDENCE_PATHSPEC_EXCLUDES = (
+    f":(exclude){_RUNNER_LOCK_NAME}",
+    ":(exclude).jev-verify",
+)
+
+_MAX_ENUM_PATHS = 200_000          # filesystem walk bound — fail closed
+_GIT_META_CAP = 64 * 1024 * 1024   # git metadata output bound — fail closed
+_CONFIG_ENUM_CAP = 4 * 1024 * 1024
+_REPORT_CAP_BYTES = 65536
+_REAP_BUDGET_SECONDS = 10.0        # supervisor descendant-kill window
+_HELPER_GRACE_SECONDS = 15.0       # parent hard-deadline margin
+
+_SUPERVISOR = Path(__file__).with_name("_verify_supervisor.py")
+
+# Config keys that can make git execute commands or read outside input while
+# taking evidence. Every loaded key matching this is explicitly reset for
+# each evidence invocation.
+_DANGER_CONFIG_RE = re.compile(
+    r"(?i)^(?:filter\.|pager\.|alias\.|credential\.|include\.|includeIf\.|"
+    r"gpg\.|ssh\.|protocol\.|diff\.|difftool\.|mergetool\.|ext\.|"
+    r"interactive\.diffFilter|sendemail\.|instaweb\.|"
+    r"core\.(?:fsmonitor|hooksPath|pager|sshCommand|askpass|excludesFile|"
+    r"attributesFile|untrackedCache|gitProxy|sparseCheckout))"
+)
+_CONFIG_KEY_SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*$")
 
 # Mirrors cli_provider_runner.execution_config (kanban cannot import the
 # Runner package — same explicit shape, validated independently).
@@ -60,6 +121,11 @@ class Worktree:
     branch: str | None      # None = detached HEAD
     base_revision: str
     workspace_id: str
+    # Common git dir recorded at admission — evidence revalidation compares
+    # against it so a retargeted .git link is detected. Optional so callers
+    # reconstructing a Worktree from a receipt still work (consistency is
+    # then proven internally: gitdir must resolve under the common dir).
+    git_common_dir: str | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +135,9 @@ class VerifyResult:
     output: str            # bounded tail
     truncated: bool
     timed_out: bool = False
+    # confirmed | failed | unsupported — "confirmed" means the supervisor
+    # reported zero live descendants at exit; ok is never True otherwise.
+    cleanup: str = "confirmed"
 
 
 @dataclass(frozen=True)
@@ -79,13 +148,148 @@ class DepCheck:
     integrated_revision: str | None = None
 
 
+def _evidence_env() -> dict:
+    """Minimal env for git evidence commands — no inherited HOME, XDG,
+    credential/session variables, askpass, pager or proxy state."""
+    return {
+        "PATH": os.environ.get("PATH") or os.defpath,
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "",
+        "SSH_ASKPASS": "",
+        "GIT_PAGER": "cat",
+        "PAGER": "cat",
+        "GIT_EDITOR": ":",
+        "GIT_OPTIONAL_LOCKS": "0",
+    }
+
+
+def _run_capture(
+    argv: list[str], *, env: dict, cap: int, timeout: float,
+) -> tuple[int | None, bytes, bytes, bool]:
+    """Stream a child's stdout under a byte cap AND a deadline; stderr is
+    drained on a side thread so the child never blocks on a full pipe. The
+    child is always reaped and its pipe ends closed. On oversize the child
+    is killed and ``truncated`` is set; on deadline the child is killed and
+    WorktreeError raised — callers fail closed, never report a partial
+    metadata read as complete."""
+    proc = subprocess.Popen(
+        argv, env=env, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    err = bytearray()
+    err_state = {"seen": 0, "retained": 0}
+    err_thread = threading.Thread(
+        target=_drain, args=(proc.stderr, err, err_state, 65536),
+        daemon=True,
+    )
+    err_thread.start()
+    buf = bytearray()
+    truncated = False
+    deadline = time.monotonic() + timeout
+    fd = proc.stdout.fileno()
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                proc.kill()
+                raise WorktreeError(
+                    f"{argv[0]!r} exceeded the evidence deadline — "
+                    "failing closed"
+                )
+            ready, _, _ = select.select([fd], [], [], min(remaining, 0.5))
+            if not ready and proc.poll() is None:
+                continue
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            room = cap - len(buf)
+            if len(chunk) > room:
+                buf += chunk[:room]
+                truncated = True
+                proc.kill()
+                break
+            buf += chunk
+    finally:
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                stream.close()
+            except OSError:
+                pass
+        err_thread.join(timeout=5)
+    return proc.returncode, bytes(buf), bytes(err), truncated
+
+
+def _danger_config_keys(repo: Path, env: dict,
+                        base_argv: list[str]) -> list[str]:
+    """Loaded config keys able to execute commands or redirect IO during
+    evidence git — enumerated so each can be explicitly reset."""
+    rc, out, _err, truncated = _run_capture(
+        base_argv + ["config", "--list", "-z", "--includes"],
+        env=env, cap=_CONFIG_ENUM_CAP, timeout=30,
+    )
+    if rc != 0 or truncated:
+        raise WorktreeError(
+            "cannot enumerate repository config for evidence git — "
+            "failing closed"
+        )
+    keys = set()
+    for entry in out.split(b"\0"):
+        if not entry:
+            continue
+        key = entry.split(b"\n", 1)[0].decode("utf-8", "replace")
+        if _CONFIG_KEY_SAFE.match(key) and _DANGER_CONFIG_RE.match(key):
+            keys.add(key)
+    return sorted(keys)
+
+
+def _safety_git_argv(repo: Path, env: dict) -> list[str]:
+    """``git -C <repo>`` plus unconditional safety -c overrides and an
+    explicit reset for every loaded dangerous config key — the repo/worktree
+    config is writable by the untrusted run."""
+    args = [
+        "git", "-C", str(repo),
+        "-c", "core.fsmonitor=",
+        "-c", "core.hooksPath=/dev/null",
+        "-c", "core.pager=cat",
+        "-c", "core.untrackedCache=",
+        "-c", "gc.auto=0",
+        "-c", "diff.external=",
+    ]
+    for key in _danger_config_keys(repo, env, args):
+        args += ["-c", f"{key}="]
+    return args
+
+
 def _git(repo: Path, *argv: str, check: bool = True,
          capture: bool = True, timeout: float = 60.0) -> subprocess.CompletedProcess:
-    proc = subprocess.run(
-        ["git", "-C", str(repo), *argv],
-        capture_output=capture,
-        text=True,
-        timeout=timeout,
+    """Git under the scrubbed evidence environment with model-controllable
+    config neutralized — EVERY git call in this module routes here because
+    the shared repo config is writable by the untrusted run. Non-zero exit
+    is a hard WorktreeError under ``check`` (the default); ``check=False``
+    callers still get the real returncode, never a swallowed-empty read."""
+    env = _evidence_env()
+    full = _safety_git_argv(repo, env) + [str(a) for a in argv]
+    rc, out, err, truncated = _run_capture(
+        full, env=env, cap=_GIT_META_CAP, timeout=timeout,
+    )
+    if truncated:
+        raise WorktreeError(
+            f"git {' '.join(argv[:2])} output exceeded the evidence bound"
+        )
+    proc = subprocess.CompletedProcess(
+        full, rc if rc is not None else 1,
+        out.decode("utf-8", "replace"), err.decode("utf-8", "replace"),
     )
     if check and proc.returncode != 0:
         raise WorktreeError(
@@ -188,7 +392,8 @@ def validate_prepared_worktree(
         raise WorktreeError(
             f"prepared worktree {prepared!r} is not a git worktree"
         )
-    if _git_dir_of(canonical) != _git_dir_of(repo):
+    common = _git_dir_of(canonical)
+    if common != _git_dir_of(repo):
         raise WorktreeError(
             f"prepared worktree {prepared!r} belongs to a different "
             "repository than the approved workspace repo"
@@ -211,12 +416,30 @@ def validate_prepared_worktree(
             f"unexpected changes ({dirty.splitlines()[0][:80]}…); the "
             "existing state is preserved, reset it deliberately"
         )
+    # The disk inventory must equal the pinned base tree exactly — an
+    # ignored or excluded file already sitting in the prepared tree would
+    # otherwise be invisible-but-present before the run even starts.
+    disk = {
+        p for p in _walk_inventory(canonical)
+        if p not in _EVIDENCE_EXCLUDED_PATHS
+        and not p.startswith(_VERIFIER_SCRATCH_PREFIX)
+    }
+    head_paths = _list_tree_paths(canonical, base_revision, _evidence_env())
+    if disk != head_paths:
+        extra = sorted(disk - head_paths)[:3]
+        gone = sorted(head_paths - disk)[:3]
+        raise WorktreeError(
+            "prepared worktree content differs from the pinned base tree "
+            f"(unexpected: {extra or '[]'}; missing: {gone or '[]'}) — the "
+            "run's output could not be distinguished from pre-existing "
+            "files; refusing admission"
+        )
     branch = _git(
         canonical, "branch", "--show-current", check=False
     ).stdout.strip() or None
     return Worktree(
         path=canonical, branch=branch, base_revision=base_revision,
-        workspace_id=workspace_id,
+        workspace_id=workspace_id, git_common_dir=str(common),
     )
 
 
@@ -376,7 +599,7 @@ def prepare_worktree(
     _git(wt_path, "checkout", "-B", branch)
     return Worktree(
         path=wt_path, branch=branch, base_revision=base_revision,
-        workspace_id=workspace_id,
+        workspace_id=workspace_id, git_common_dir=str(_git_dir_of(wt_path)),
     )
 
 
@@ -394,38 +617,226 @@ def _resolve_in_root(root: Path, rel: str) -> Path:
     return candidate
 
 
-def capture_diff(wt: Worktree, max_bytes: int) -> str:
-    """Bounded ``git diff`` of the worktree against the pinned base.
+def _revalidate_bound_tree(wt: Worktree) -> None:
+    """Re-prove the bound tree is still the admitted worktree, in the
+    recorded repository, at a HEAD descended from the pinned base — the run
+    owns this tree and can break, retarget or relocate it. Any failure is a
+    hard WorktreeError; evidence is never taken on an unverifiable root."""
+    path = Path(wt.path)
+    if not path.is_dir():
+        raise WorktreeError(
+            "bound worktree is gone — evidence cannot be trusted"
+        )
+    if os.path.realpath(str(path)) != str(path):
+        raise WorktreeError(
+            "bound worktree root was relocated or gained a symlink "
+            "component — refusing evidence on a moved root"
+        )
+    try:
+        st = os.lstat(path / ".git")
+    except OSError:
+        raise WorktreeError(
+            "the worktree's .git link was removed — git evidence cannot "
+            "run; failing closed"
+        )
+    if not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)):
+        raise WorktreeError(
+            "the worktree's .git entry is neither the link file nor a "
+            "directory — refusing evidence"
+        )
+    env = _evidence_env()
 
-    Covers BOTH committed work on the card branch AND dirty/untracked state:
-    ``add -N`` records intent for untracked files and ``diff <base>``
-    compares the base against the whole working tree, so a committed file
-    plus a dirty edit both appear.
-    """
-    _git(wt.path, "add", "-N", ".", check=False, timeout=60)
-    proc = _git(wt.path, "diff", "--binary", wt.base_revision,
-                check=False, timeout=120)
-    out = proc.stdout or ""
-    if len(out.encode("utf-8", "replace")) > max_bytes:
-        out = out.encode("utf-8", "replace")[:max_bytes].decode(
-            "utf-8", "replace"
-        ) + "\n[diff truncated]\n"
+    def _resolved(raw: str) -> str:
+        cand = Path(raw)
+        if not cand.is_absolute():
+            cand = path / cand
+        return os.path.realpath(str(cand))
+
+    gitdir = _resolved(
+        _git(path, "rev-parse", "--git-dir").stdout.strip()
+    )
+    common = _resolved(
+        _git(path, "rev-parse", "--git-common-dir").stdout.strip()
+    )
+    top = _resolved(_git(path, "rev-parse", "--show-toplevel").stdout.strip())
+    if top != str(path):
+        raise WorktreeError(
+            "git resolves a different worktree top-level — the bound root "
+            "was moved or reconstructed"
+        )
+    if gitdir != common and Path(common) not in Path(gitdir).parents:
+        raise WorktreeError(
+            "the worktree's .git link was retargeted outside the "
+            "repository common dir"
+        )
+    if wt.git_common_dir and os.path.realpath(wt.git_common_dir) != common:
+        raise WorktreeError(
+            "the worktree now resolves a different repository common dir "
+            "than it was admitted with"
+        )
+    _git(path, "cat-file", "-e", f"{wt.base_revision}^{{commit}}")
+    _git(path, "merge-base", "--is-ancestor", wt.base_revision, "HEAD")
+
+
+def _walk_inventory(root: Path) -> set[str]:
+    """Every non-directory entry under the bound root, repo-relative.
+    Symlinks are recorded, never followed or descended; the top-level
+    ``.git`` link/dir is infrastructure, not card output. Bounds fail
+    closed."""
+    out: set[str] = set()
+    stack = [Path(root)]
+    count = 0
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                entries = list(it)
+        except OSError as exc:
+            raise WorktreeError(
+                f"cannot enumerate {current}: {type(exc).__name__} — "
+                "failing closed"
+            )
+        for entry in entries:
+            count += 1
+            if count > _MAX_ENUM_PATHS:
+                raise WorktreeError(
+                    f"worktree exceeds {_MAX_ENUM_PATHS} enumerable paths "
+                    "— failing closed"
+                )
+            if current == Path(root) and entry.name == ".git":
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                stack.append(Path(entry.path))
+                continue
+            rel = os.path.relpath(entry.path, str(root)).replace(os.sep, "/")
+            out.add(rel)
     return out
 
 
-def changed_files(wt: Worktree) -> list[str]:
-    """All paths that differ from the pinned base — committed, dirty, and
-    untracked (via intent-to-add). The Runner's lock file is excluded: it is
-    infra bookkeeping inside the bound root, not card output."""
-    _git(wt.path, "add", "-N", ".", check=False, timeout=60)
-    proc = _git(wt.path, "diff", "--name-only", wt.base_revision,
-                check=False, timeout=120)
-    names = {
-        line.strip() for line in (proc.stdout or "").splitlines()
-        if line.strip()
+def _list_tree_paths(repo: Path, base: str, env: dict) -> set[str]:
+    rc, out, _err, truncated = _run_capture(
+        _safety_git_argv(repo, env)
+        + ["ls-tree", "-r", "-z", "--name-only", base],
+        env=env, cap=_GIT_META_CAP, timeout=60,
+    )
+    if rc != 0 or truncated:
+        raise WorktreeError(
+            "cannot enumerate the pinned base tree — failing closed"
+        )
+    return {
+        p.decode("utf-8", "surrogateescape")
+        for p in out.split(b"\0") if p
     }
-    names.discard(_RUNNER_LOCK_NAME)
-    return sorted(names)
+
+
+@contextlib.contextmanager
+def _evidence_index(repo: Path, base: str, env: dict):
+    """A PRIVATE git index seeded from the pinned base — the shared index is
+    never read or written for evidence, so staged trickery plus
+    assume-unchanged/skip-worktree flags cannot hide anything and
+    ``add -N`` leaves no intent-to-add residue behind. ``-f`` forces intent
+    for ignored/excluded paths too; only the exact Runner lock and the
+    documented verifier scratch prefix are excluded, matching the scope
+    view."""
+    tmpdir = tempfile.mkdtemp(prefix="jev-egit-")
+    os.chmod(tmpdir, 0o700)
+    index = os.path.join(tmpdir, "index")
+    ienv = dict(env, GIT_INDEX_FILE=index)
+    argv = _safety_git_argv(repo, env)
+    try:
+        rc, _o, _e, trunc = _run_capture(
+            argv + ["read-tree", base], env=ienv,
+            cap=_GIT_META_CAP, timeout=60,
+        )
+        if rc != 0 or trunc:
+            raise WorktreeError(
+                "cannot seed the private evidence index — failing closed"
+            )
+        rc, _o, _e, trunc = _run_capture(
+            argv + ["add", "-N", "-f", "-A", "--", ".",
+                    *_EVIDENCE_PATHSPEC_EXCLUDES],
+            env=ienv, cap=_GIT_META_CAP, timeout=120,
+        )
+        if rc != 0 or trunc:
+            raise WorktreeError(
+                "cannot record intent-to-add for evidence — failing closed"
+            )
+        yield argv, ienv
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _diff_names(argv: list[str], ienv: dict, base: str) -> set[str]:
+    rc, out, _err, truncated = _run_capture(
+        argv + ["diff", "--name-status", "-z", "--no-renames", base,
+                "--", ".", *_EVIDENCE_PATHSPEC_EXCLUDES],
+        env=ienv, cap=_GIT_META_CAP, timeout=120,
+    )
+    if rc != 0 or truncated:
+        raise WorktreeError(
+            "git diff enumeration failed — failing closed"
+        )
+    # --name-status -z emits STATUS\0PATH\0 pairs (--no-renames keeps every
+    # record a single status+path pair).
+    fields = [f for f in out.split(b"\0") if f]
+    if len(fields) % 2:
+        raise WorktreeError(
+            "unparseable git name-status stream — failing closed"
+        )
+    names = set()
+    for i in range(0, len(fields), 2):
+        names.add(fields[i + 1].decode("utf-8", "surrogateescape"))
+    return names
+
+
+def capture_diff(wt: Worktree, max_bytes: int) -> str:
+    """Bounded, streamed ``git diff`` of the bound tree against the pinned
+    base — the same private-index view and exclusions as ``changed_files``,
+    so committed work, dirty edits, untracked AND ignored files all appear,
+    while the Runner lock never does. The byte cap is enforced WHILE
+    reading (the output is never buffered whole and sliced); a truncated
+    diff is explicitly labelled and can never pose as a complete patch.
+    Bound-tree identity is revalidated first — a non-zero git exit is a
+    hard failure, never an empty diff."""
+    _revalidate_bound_tree(wt)
+    env = _evidence_env()
+    with _evidence_index(wt.path, wt.base_revision, env) as (argv, ienv):
+        rc, blob, _err, truncated = _run_capture(
+            argv + ["diff", "--binary", "--no-ext-diff", "--no-textconv",
+                    wt.base_revision, "--", ".",
+                    *_EVIDENCE_PATHSPEC_EXCLUDES],
+            env=ienv, cap=max_bytes, timeout=120,
+        )
+    if rc != 0 and not truncated:
+        raise WorktreeError(
+            "git diff failed during evidence capture — refusing to report "
+            "a partial tree as a clean patch"
+        )
+    text = blob.decode("utf-8", "replace")
+    if truncated:
+        text += "\n[diff truncated]\n"
+    return text
+
+
+def changed_files(wt: Worktree) -> list[str]:
+    """All paths that differ from the pinned base — computed from a private
+    evidence index PLUS a bounded filesystem walk of the bound root, so
+    ignored, info/exclude-ed, assume-unchanged and skip-worktree paths are
+    all visible alongside committed, dirty, deleted and untracked changes.
+    The Runner lock and the documented verifier scratch prefix are the only
+    exclusions. Raises WorktreeError (fail closed) whenever bound-tree
+    identity, the pinned base, or enumeration cannot be trusted."""
+    _revalidate_bound_tree(wt)
+    env = _evidence_env()
+    head = _list_tree_paths(wt.path, wt.base_revision, env)
+    disk = _walk_inventory(wt.path)
+    with _evidence_index(wt.path, wt.base_revision, env) as (argv, ienv):
+        names = _diff_names(argv, ienv, wt.base_revision)
+    changed = names | (disk - head) | (head - disk)
+    changed -= _EVIDENCE_EXCLUDED_PATHS
+    return sorted(
+        p for p in changed if not p.startswith(_VERIFIER_SCRATCH_PREFIX)
+    )
 
 
 def _scope_entry_enforceable(entry: str) -> bool:
@@ -567,6 +978,77 @@ def _drain(stream, sink: bytearray, state: dict, cap: int) -> None:
         return
 
 
+def _supervision_supported() -> str | None:
+    """None when this host can prove descendant cleanup, else the reason
+    verification must refuse (fail closed — never claim an unproven
+    cleanup)."""
+    if not sys.platform.startswith("linux"):
+        return (
+            "verification unsupported: descendant cleanup requires Linux "
+            "/proc + PR_SET_CHILD_SUBREAPER"
+        )
+    if not os.path.isdir("/proc"):
+        return (
+            "verification unsupported: /proc is required to prove "
+            "descendant cleanup"
+        )
+    if not sys.executable or not _SUPERVISOR.is_file():
+        return "verification unsupported: supervisor helper unavailable"
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6")
+    except (OSError, ImportError):
+        return "verification unsupported: libc/prctl unavailable"
+    return None
+
+
+def _verify_child_env(tmp_home: str) -> dict:
+    """The ONLY environment model-authored test code may see — an explicit
+    minimal allowlist, never the inherited parent env (no credentials,
+    PYTHONPATH, LD_PRELOAD, proxy or session variables). This is
+    environment scrubbing, NOT a filesystem or network sandbox."""
+    return {
+        "PATH": os.environ.get("PATH") or os.defpath,
+        "HOME": tmp_home,
+        "TMPDIR": tmp_home,
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        # Test tooling may disable bytecode writes rather than making
+        # generated files globally invisible (scope stays honest).
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_AUTHOR_NAME": "jev-verify",
+        "GIT_AUTHOR_EMAIL": "jev-verify@localhost",
+        "GIT_COMMITTER_NAME": "jev-verify",
+        "GIT_COMMITTER_EMAIL": "jev-verify@localhost",
+    }
+
+
+def _read_report(rfd: int, timeout: float = 5.0) -> dict | None:
+    """Bounded read of the supervisor's JSON report (small, on its own fd —
+    never interleaved with child output)."""
+    buf = bytearray()
+    deadline = time.monotonic() + timeout
+    while len(buf) < _REPORT_CAP_BYTES:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        ready, _, _ = select.select([rfd], [], [], remaining)
+        if not ready:
+            return None
+        try:
+            chunk = os.read(rfd, min(65536, _REPORT_CAP_BYTES - len(buf)))
+        except OSError:
+            break
+        if not chunk:
+            break
+        buf += chunk
+    try:
+        return json.loads(bytes(buf).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
 def run_verification(
     wt: Worktree,
     argv: list[str],
@@ -577,8 +1059,19 @@ def run_verification(
     max_output_bytes: int,
 ) -> VerifyResult:
     """Run the card's declared verification argv — full-argv allowlist only,
-    argv array (never a shell string), bounded capture, and a process-group
-    kill on timeout so stubborn children die with the leader."""
+    argv array (never a shell string), bounded output capture.
+
+    The allowlisted argv executes model-authored worktree content, so it is
+    NOT trusted: it runs under the separate subreaper supervisor
+    (``_verify_supervisor.py``) with an explicit minimal environment and a
+    private HOME/TMPDIR outside the worktree. On EVERY exit path — success,
+    failure, timeout — the supervisor deterministically finds and kills all
+    descendants (same-group children, setsid and double-fork escapees)
+    within a bounded reap budget and reports over a dedicated fd. ok=True
+    only when the leader exited 0, no timeout fired, and the report
+    confirms zero survivors; a missing report, survivors, or a helper that
+    had to be killed all fail closed. Hosts that cannot prove cleanup
+    refuse verification instead of claiming it."""
     resolved = _argv_allowed(argv, executables=executables, commands=commands)
     if resolved is None:
         shown = " ".join(str(a) for a in argv)[:200] if argv else "<empty>"
@@ -590,49 +1083,148 @@ def run_verification(
             ),
             truncated=False,
         )
-    out_buf = bytearray()
-    err_buf = bytearray()
-    state = {"seen": 0, "retained": 0}
-    try:
-        proc = subprocess.Popen(
-            resolved, cwd=str(wt.path),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            start_new_session=True,   # own process group — killable whole
+    unsupported = _supervision_supported()
+    if unsupported:
+        return VerifyResult(
+            ok=False, exit_code=None, output=unsupported,
+            truncated=False, cleanup="unsupported",
         )
-    except OSError as exc:
-        return VerifyResult(ok=False, exit_code=None,
-                            output=f"spawn failed: {exc}", truncated=False)
-    threads = [
-        threading.Thread(target=_drain,
-                         args=(proc.stdout, out_buf, state, max_output_bytes),
-                         daemon=True),
-        threading.Thread(target=_drain,
-                         args=(proc.stderr, err_buf, state, max_output_bytes),
-                         daemon=True),
-    ]
-    for t in threads:
-        t.start()
-    timed_out = False
+
+    tmp_home = tempfile.mkdtemp(prefix="jev-verify-home-")
+    os.chmod(tmp_home, 0o700)
+    rfd = wfd = -1
     try:
-        proc.wait(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
-        timed_out = True
+        child_env = _verify_child_env(tmp_home)
+        spec = {
+            "argv": resolved, "cwd": str(wt.path), "env": child_env,
+            "deadline": float(timeout_seconds), "reap": _REAP_BUDGET_SECONDS,
+        }
+        spec_path = Path(tmp_home) / "spec.json"
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        os.chmod(spec_path, 0o600)
+        rfd, wfd = os.pipe()
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
+            helper = subprocess.Popen(
+                [sys.executable, str(_SUPERVISOR), str(spec_path)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                pass_fds=[wfd],
+                env={
+                    "PATH": child_env["PATH"], "HOME": tmp_home,
+                    "TMPDIR": tmp_home, "LC_ALL": "C",
+                    "_JEV_REPORT_FD": str(wfd),
+                },
+            )
+        except OSError as exc:
+            return VerifyResult(
+                ok=False, exit_code=None,
+                output=f"supervisor spawn failed: {type(exc).__name__}",
+                truncated=False, cleanup="unsupported",
+            )
+        os.close(wfd)
+        wfd = -1
+
+        out_buf = bytearray()
+        err_buf = bytearray()
+        state = {"seen": 0, "retained": 0}
+        threads = [
+            threading.Thread(
+                target=_drain,
+                args=(helper.stdout, out_buf, state, max_output_bytes),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=_drain,
+                args=(helper.stderr, err_buf, state, max_output_bytes),
+                daemon=True,
+            ),
+        ]
+        for t in threads:
+            t.start()
+
+        hard_deadline = (
+            float(timeout_seconds) + _REAP_BUDGET_SECONDS
+            + _HELPER_GRACE_SECONDS
+        )
+        helper_killed = False
+        try:
+            helper.wait(timeout=hard_deadline)
+        except subprocess.TimeoutExpired:
+            helper.kill()
+            try:
+                helper.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+            helper_killed = True
+        report = None if helper_killed else _read_report(rfd)
+        try:
+            os.close(rfd)
+        except OSError:
             pass
-        proc.wait(timeout=10)
-    for t in threads:
-        t.join(timeout=10)
-    output = (out_buf + b"\n" + err_buf).decode("utf-8", "replace").strip()
-    truncated = state["seen"] > state["retained"]
-    if truncated:
-        output += "\n[output truncated]"
-    return VerifyResult(
-        ok=proc.returncode == 0 and not timed_out,
-        exit_code=None if timed_out else proc.returncode,
-        output=output, truncated=truncated, timed_out=timed_out,
-    )
+        rfd = -1
+        for t in threads:
+            t.join(timeout=10)
+        for stream in (helper.stdout, helper.stderr):
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+        output = (out_buf + b"\n" + err_buf).decode(
+            "utf-8", "replace"
+        ).strip()
+        truncated = state["seen"] > state["retained"]
+        if truncated:
+            output += "\n[output truncated]"
+
+        if helper_killed:
+            return VerifyResult(
+                ok=False, exit_code=None,
+                output=output + "\n[supervision incomplete: helper "
+                               "exceeded the hard deadline and was killed]",
+                truncated=truncated, timed_out=True, cleanup="failed",
+            )
+        if report is None:
+            return VerifyResult(
+                ok=False, exit_code=None,
+                output=output + "\n[supervision incomplete: no supervisor "
+                                "report — cleanup unconfirmed]",
+                truncated=truncated, cleanup="failed",
+            )
+        if report.get("unsupported"):
+            return VerifyResult(
+                ok=False, exit_code=None,
+                output=output + f"\n[{report['unsupported']}]",
+                truncated=truncated, cleanup="unsupported",
+            )
+        if report.get("spawn_error"):
+            return VerifyResult(
+                ok=False, exit_code=None,
+                output=f"spawn failed: {report['spawn_error']}",
+                truncated=truncated, cleanup="failed",
+            )
+        survivors = report.get("survivors") or []
+        timed_out = bool(report.get("timed_out"))
+        if survivors:
+            return VerifyResult(
+                ok=False, exit_code=report.get("leader_exit"),
+                output=output + f"\n[supervision failed: {len(survivors)} "
+                                "descendant(s) survived the reap budget]",
+                truncated=truncated, timed_out=timed_out, cleanup="failed",
+            )
+        return VerifyResult(
+            ok=(report.get("leader_exit") == 0 and not timed_out),
+            exit_code=report.get("leader_exit"),
+            output=output, truncated=truncated, timed_out=timed_out,
+        )
+    finally:
+        for fd in (rfd, wfd):
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        shutil.rmtree(tmp_home, ignore_errors=True)
 
 
 def remove_worktree(wt: Worktree, repo: Path) -> None:
