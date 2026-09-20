@@ -62,13 +62,28 @@ dispatch and resolve call sites). `VerifyResult` gained one optional field
 * The ONLY exclusion is the exact filename `.cli-provider-runner.lock`,
   applied to BOTH the scope and diff views (pathspec exclude) — the lock
   can no longer leak into the persisted diff while being hidden from
-  scope. There is NO verifier scratch prefix or directory exemption: the
-  supervisor's own scratch (private HOME/TMP, spec file, private index)
-  lives outside the bound root, so an in-tree `.jev-verify/` directory is
-  ordinary worker output like any other. No dist/log/cache bypasses.
-* `validate_prepared_worktree` additionally requires disk inventory ==
-  base tree at admission: an ignored file pre-existing in the prepared
-  tree is refused (it would be indistinguishable from run output later).
+  scope. The exclusion is gated by `_runner_lock_exemptible`, a check
+  shared by admission AND evidence and evaluated once per call before any
+  exclusion applies: the path must be absent from the pinned base tree
+  (a base-tracked file of that name is ordinary application data — never
+  exempted by name alone) and must lstat as a regular file with exactly
+  one link. A lock-named directory, symlink, fifo or hardlink fails closed
+  with `WorktreeError`, so the Git prefix pathspec can never hide a
+  directory's contents. There is NO verifier scratch prefix or directory
+  exemption: the supervisor's own scratch (private HOME/TMP, spec file,
+  private index) lives outside the bound root, so an in-tree
+  `.jev-verify/` directory is ordinary worker output like any other. No
+  dist/log/cache bypasses.
+* `validate_prepared_worktree` requires an exact base-to-disk comparison
+  at admission: `git status --porcelain -z --no-renames` on the shared
+  index (staged renames/deletions/flag states are still rejected; the
+  lock filter there is exact-path, never a substring), UNION the private
+  evidence index's `git diff --name-status` against the pinned base (file
+  CONTENT must equal base — assume-unchanged/skip-worktree flags cannot
+  hide a modified tracked file), UNION the disk-vs-`ls-tree` inventory
+  (an ignored file or a non-regular entry like a fifo pre-existing in the
+  prepared tree is refused — it would be indistinguishable from run
+  output later).
 
 ### Buffer safety
 * `_run_capture` streams stdout under a byte cap *and* a deadline (select
@@ -133,8 +148,11 @@ untouched) on this branch:
   (owned by the parallel state worker).
 * `validate_prepared_worktree` now also refuses a prepared tree whose disk
   content differs from the base tree even when `git status` is clean
-  (hidden ignored/excluded file) — new test
-  `test_prepared_worktree_hidden_ignored_file_refused`.
+  (hidden ignored/excluded file, or a tracked file modified under
+  assume-unchanged/skip-worktree flags, or a lock-substring path —
+  see `test_runner_lock_evidence_review.py`), and refuses a lock-named
+  non-regular-file at the tree root instead of exempting it — earlier
+  test `test_prepared_worktree_hidden_ignored_file_refused`.
 * `run_verification` no longer leaks the dispatcher env and reaps
   descendants on the success path; hosts without Linux `/proc` +
   `PR_SET_CHILD_SUBREAPER` get `ok=False`/`cleanup="unsupported"` instead
@@ -156,9 +174,17 @@ untouched) on this branch:
   that microsecond window. Fail-closed survivor reporting bounds the
   consequence to evidence rejection, not a wrong signal target.
 * **Admission strictness.** Prepared trees must contain exactly the base
-  tree on disk (single operator-managed exception: the exact Runner lock
-  filename). Trees with legitimately pre-seeded ignored content need
+  tree on disk — same path set AND same content — with a clean shared
+  index (single operator-managed exception: the exact Runner lock
+  filename, verified regular and singly-linked and absent from the base
+  tree). Trees with legitimately pre-seeded ignored content need
   operator cleanup; this is intentional fail-closed behaviour.
+* **Lock-shape check is lstat-only.** `_runner_lock_exemptible` inspects
+  the lock path once before the exclusion applies; a hostile same-UID
+  writer could swap the entry between that check and the git read (the
+  same inter-step TOCTOU class documented above). This is not an OS
+  sandbox and not claimed race-free — the fix removes the substring and
+  prefix-matching holes; it does not add concurrency containment.
 * **Filter neutralization is global to evidence git.** Legitimate
   repos relying on clean/smudge filters or textconv for real content will
   see unconverted content in the evidence diff; the safer reading is
@@ -194,5 +220,16 @@ untouched) on this branch:
 * `packages/kanban/tests/test_evidence_parent_bounds.py` — 3 parent
   regressions: in-tree `.jev-verify/` visibility, /proc enumeration
   error, `filter.bad/name.clean` subsection.
+* `packages/kanban/tests/test_runner_lock_evidence_review.py` — 20
+  EV3-1/EV3-2 regressions: lock-substring tracked modifications refused
+  at admission (incl. newline-bearing names and
+  assume-unchanged/skip-worktree flags), staged rename onto a
+  lock-substring path and index-only staged state refused, lock-named
+  directory/symlink/hardlink/fifo fail closed at both evidence
+  entrypoints, a lock-named directory can never produce a
+  complete-looking partial diff, shared index bytes untouched, ordinary
+  regular lock file still admitted and excluded, nested lookalikes stay
+  ordinary evidence, and a base-tracked file of the exact lock name is
+  never exempted.
 * `uv run --all-packages pytest packages/kanban -q -o addopts=''` —
-  425 passed.
+  472 passed.

@@ -60,9 +60,12 @@ _BRANCH_SAFE = re.compile(r"[^A-Za-z0-9_-]")
 # The Runner's cross-process claim record lives inside the bound root; it is
 # infra bookkeeping, not card output, so it never counts as a scope change
 # and never appears in the persisted diff (scope and diff views agree).
-# This is the ONLY infrastructure exemption — one exact filename, never a
-# directory or prefix bypass: any look-alike scratch dir stays ordinary
-# evidence, and the supervisor's own HOME/TMP live outside the tree.
+# The exemption is exactly ONE top-level filename, and only after it is
+# verified on disk as a regular singly-linked file AND confirmed absent
+# from the pinned base tree — never a directory or prefix bypass: a
+# lock-named directory/symlink/fifo/hardlink fails closed, a base-tracked
+# file of that name is ordinary application data, and any look-alike
+# scratch dir stays ordinary evidence.
 _RUNNER_LOCK_NAME = ".cli-provider-runner.lock"
 _EVIDENCE_EXCLUDED_PATHS = frozenset({_RUNNER_LOCK_NAME})
 _EVIDENCE_PATHSPEC_EXCLUDES = (
@@ -431,25 +434,47 @@ def validate_prepared_worktree(
             f"{base_revision[:12]} — refusing to run against the wrong "
             "revision"
         )
-    dirty = _git(canonical, "status", "--porcelain").stdout
-    dirty = "\n".join(
-        line for line in dirty.splitlines()
-        if line.strip() and _RUNNER_LOCK_NAME not in line
-    ).strip()
+    env = _evidence_env()
+    head_paths = _list_tree_paths(canonical, base_revision, env)
+    exempt = _runner_lock_exemptible(
+        canonical, _RUNNER_LOCK_NAME in head_paths
+    )
+    # Shared-index state (staged renames, staged deletions, intent flags)
+    # must still be clean — the private index cannot see it. The lock
+    # filter is exact-path only, never a substring.
+    status = _git(
+        canonical, "status", "--porcelain", "-z", "--no-renames"
+    ).stdout
+    dirty = [
+        entry for entry in status.split("\0")
+        if entry and not (exempt and entry[3:] == _RUNNER_LOCK_NAME)
+    ]
     if dirty:
         raise WorktreeError(
             "prepared worktree is not clean — refusing to run on top of "
-            f"unexpected changes ({dirty.splitlines()[0][:80]}…); the "
-            "existing state is preserved, reset it deliberately"
+            f"unexpected changes ({dirty[0][:80]}…); the existing state "
+            "is preserved, reset it deliberately"
+        )
+    # Exact base-to-disk content comparison on the private evidence index —
+    # independent of shared-index flags (assume-unchanged/skip-worktree)
+    # and staged trickery: file CONTENT must equal the pinned base, not
+    # just the path set.
+    with _evidence_index(
+        canonical, base_revision, env, lock_exempt=exempt
+    ) as (argv, ienv):
+        names = _diff_names(argv, ienv, base_revision, lock_exempt=exempt)
+    if names:
+        raise WorktreeError(
+            "prepared worktree content differs from the pinned base "
+            f"({sorted(names)[:3]}) — the run's output could not be "
+            "distinguished from pre-existing changes; refusing admission"
         )
     # The disk inventory must equal the pinned base tree exactly — an
     # ignored or excluded file already sitting in the prepared tree would
     # otherwise be invisible-but-present before the run even starts.
-    disk = {
-        p for p in _walk_inventory(canonical)
-        if p not in _EVIDENCE_EXCLUDED_PATHS
-    }
-    head_paths = _list_tree_paths(canonical, base_revision, _evidence_env())
+    disk = _walk_inventory(canonical)
+    if exempt:
+        disk -= _EVIDENCE_EXCLUDED_PATHS
     if disk != head_paths:
         extra = sorted(disk - head_paths)[:3]
         gone = sorted(head_paths - disk)[:3]
@@ -754,19 +779,70 @@ def _list_tree_paths(repo: Path, base: str, env: dict) -> set[str]:
     }
 
 
+def _runner_lock_in_base(repo: Path, base: str, env: dict) -> bool:
+    """Is the exact lock path itself tracked in the pinned base tree? A
+    base-tracked file of this name is ordinary application data — a name
+    match alone never exempts it."""
+    rc, out, _err, truncated = _run_capture(
+        _safety_git_argv(repo, env)
+        + ["ls-tree", "-z", "--name-only", base, "--", _RUNNER_LOCK_NAME],
+        env=env, cap=_GIT_META_CAP, timeout=30,
+    )
+    if rc != 0 or truncated:
+        raise WorktreeError(
+            "cannot inspect the pinned base tree — failing closed"
+        )
+    return bool(out.strip(b"\0"))
+
+
+def _runner_lock_exemptible(root: Path, tracked_in_base: bool) -> bool:
+    """Whether the exact top-level Runner lock path may be excluded from
+    admission/evidence at all. True only when the name is absent from the
+    pinned base tree and the on-disk entry is a regular file with exactly
+    one link; absent from disk means there is nothing to exclude. A
+    directory, symlink, fifo or multi-linked file fails closed so the Git
+    prefix exclusion below can never hide content behind the lock name.
+    This is an lstat guard, not a race-free claim — a same-UID writer could
+    swap the entry between this check and the git read (residual documented
+    in docs/JEV_EVIDENCE_REPAIR.md)."""
+    if tracked_in_base:
+        return False
+    try:
+        st = os.lstat(os.path.join(str(root), _RUNNER_LOCK_NAME))
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise WorktreeError(
+            f"cannot inspect {_RUNNER_LOCK_NAME}: {type(exc).__name__} — "
+            "failing closed"
+        )
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        raise WorktreeError(
+            f"{_RUNNER_LOCK_NAME} is not a singly-linked regular file — "
+            "the lock exemption covers exactly one top-level file, so a "
+            "directory, symlink, fifo or hardlink of that name fails "
+            "closed rather than being hidden from evidence"
+        )
+    return True
+
+
 @contextlib.contextmanager
-def _evidence_index(repo: Path, base: str, env: dict):
+def _evidence_index(repo: Path, base: str, env: dict, *,
+                    lock_exempt: bool):
     """A PRIVATE git index seeded from the pinned base — the shared index is
     never read or written for evidence, so staged trickery plus
     assume-unchanged/skip-worktree flags cannot hide anything and
     ``add -N`` leaves no intent-to-add residue behind. ``-f`` forces intent
-    for ignored/excluded paths too; only the exact Runner lock filename is
-    excluded, matching the scope view."""
+    for ignored/excluded paths too; the exact Runner lock filename is
+    excluded only when ``lock_exempt`` (its shape was verified) — the
+    pathspec is a directory-prefix match, so it must never be applied to a
+    path that could be a directory."""
     tmpdir = tempfile.mkdtemp(prefix="jev-egit-")
     os.chmod(tmpdir, 0o700)
     index = os.path.join(tmpdir, "index")
     ienv = dict(env, GIT_INDEX_FILE=index)
     argv = _safety_git_argv(repo, env)
+    excludes = _EVIDENCE_PATHSPEC_EXCLUDES if lock_exempt else ()
     try:
         rc, _o, _e, trunc = _run_capture(
             argv + ["read-tree", base], env=ienv,
@@ -777,8 +853,7 @@ def _evidence_index(repo: Path, base: str, env: dict):
                 "cannot seed the private evidence index — failing closed"
             )
         rc, _o, _e, trunc = _run_capture(
-            argv + ["add", "-N", "-f", "-A", "--", ".",
-                    *_EVIDENCE_PATHSPEC_EXCLUDES],
+            argv + ["add", "-N", "-f", "-A", "--", ".", *excludes],
             env=ienv, cap=_GIT_META_CAP, timeout=120,
         )
         if rc != 0 or trunc:
@@ -790,10 +865,12 @@ def _evidence_index(repo: Path, base: str, env: dict):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def _diff_names(argv: list[str], ienv: dict, base: str) -> set[str]:
+def _diff_names(argv: list[str], ienv: dict, base: str, *,
+                lock_exempt: bool) -> set[str]:
+    excludes = _EVIDENCE_PATHSPEC_EXCLUDES if lock_exempt else ()
     rc, out, _err, truncated = _run_capture(
         argv + ["diff", "--name-status", "-z", "--no-renames", base,
-                "--", ".", *_EVIDENCE_PATHSPEC_EXCLUDES],
+                "--", ".", *excludes],
         env=ienv, cap=_GIT_META_CAP, timeout=120,
     )
     if rc != 0 or truncated:
@@ -817,18 +894,23 @@ def capture_diff(wt: Worktree, max_bytes: int) -> str:
     """Bounded, streamed ``git diff`` of the bound tree against the pinned
     base — the same private-index view and exclusions as ``changed_files``,
     so committed work, dirty edits, untracked AND ignored files all appear,
-    while the Runner lock never does. The byte cap is enforced WHILE
+    while a verified Runner lock never does. The byte cap is enforced WHILE
     reading (the output is never buffered whole and sliced); a truncated
     diff is explicitly labelled and can never pose as a complete patch.
     Bound-tree identity is revalidated first — a non-zero git exit is a
     hard failure, never an empty diff."""
     _revalidate_bound_tree(wt)
     env = _evidence_env()
-    with _evidence_index(wt.path, wt.base_revision, env) as (argv, ienv):
+    exempt = _runner_lock_exemptible(
+        wt.path, _runner_lock_in_base(wt.path, wt.base_revision, env)
+    )
+    excludes = _EVIDENCE_PATHSPEC_EXCLUDES if exempt else ()
+    with _evidence_index(
+        wt.path, wt.base_revision, env, lock_exempt=exempt
+    ) as (argv, ienv):
         rc, blob, _err, truncated = _run_capture(
             argv + ["diff", "--binary", "--no-ext-diff", "--no-textconv",
-                    wt.base_revision, "--", ".",
-                    *_EVIDENCE_PATHSPEC_EXCLUDES],
+                    wt.base_revision, "--", ".", *excludes],
             env=ienv, cap=max_bytes, timeout=120,
         )
     if rc != 0 and not truncated:
@@ -847,18 +929,24 @@ def changed_files(wt: Worktree) -> list[str]:
     evidence index PLUS a bounded filesystem walk of the bound root, so
     ignored, info/exclude-ed, assume-unchanged and skip-worktree paths are
     all visible alongside committed, dirty, deleted and untracked changes.
-    The exact Runner lock filename is the only exclusion — no directory or
-    prefix exemptions. Raises WorktreeError (fail closed) whenever
-    bound-tree identity, the pinned base, or enumeration cannot be
-    trusted."""
+    The exact Runner lock filename is the only exclusion — applied only
+    after its shape is verified and it is confirmed absent from the pinned
+    base; no directory or prefix exemptions. Raises WorktreeError (fail
+    closed) whenever bound-tree identity, the pinned base, the lock shape,
+    or enumeration cannot be trusted."""
     _revalidate_bound_tree(wt)
     env = _evidence_env()
     head = _list_tree_paths(wt.path, wt.base_revision, env)
+    exempt = _runner_lock_exemptible(wt.path, _RUNNER_LOCK_NAME in head)
     disk = _walk_inventory(wt.path)
-    with _evidence_index(wt.path, wt.base_revision, env) as (argv, ienv):
-        names = _diff_names(argv, ienv, wt.base_revision)
+    with _evidence_index(
+        wt.path, wt.base_revision, env, lock_exempt=exempt
+    ) as (argv, ienv):
+        names = _diff_names(argv, ienv, wt.base_revision,
+                            lock_exempt=exempt)
     changed = names | (disk - head) | (head - disk)
-    changed -= _EVIDENCE_EXCLUDED_PATHS
+    if exempt:
+        changed -= _EVIDENCE_EXCLUDED_PATHS
     return sorted(changed)
 
 
