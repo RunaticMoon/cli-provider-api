@@ -106,7 +106,8 @@ none is emitted.
 - Transport: `http.client`, no redirects (3xx is terminal — urllib's default
   handler would forward `Authorization` off-host), no environment proxy,
   bounded bodies (`max_response_bytes`), whole-response deadline (the socket
-  budget is *remaining* time — a drip-feed cannot stretch it), loopback-only
+  budget is *remaining* time, with a per-request socket-shutdown watchdog
+  also bounding status/header/chunk framing), loopback-only
   targets, canonical-id path segments (no traversal).
 - `run.cached` in the body is authoritative for replay state — the
   `X-Run-Cached` header is only a fallback since a gateway may drop it.

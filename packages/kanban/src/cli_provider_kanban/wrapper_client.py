@@ -41,6 +41,7 @@ import os
 import re
 import socket
 import stat
+import threading
 import time
 import urllib.parse
 from dataclasses import dataclass
@@ -160,11 +161,28 @@ def _bounded_request(
     conn = http.client.HTTPConnection(
         base.connect_host, base.port, timeout=max(timeout_seconds, 0.001)
     )
+    watchdog = None
+    response = None
+    expired = threading.Event()
     try:
         conn.connect()
         # getresponse() hands the socket to the HTTPResponse and clears
         # conn.sock — capture it now and keep driving the deadline on it.
         sock = conn.sock
+
+        def expire():
+            # http.client parses status/header/chunk lines inside buffered
+            # readline calls, which otherwise renew the per-socket timeout.
+            # Keep the socket object (not its reusable integer descriptor).
+            expired.set()
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass  # This exact socket can already be closed by the reader.
+
+        watchdog = threading.Timer(max(deadline - time.monotonic(), 0), expire)
+        watchdog.daemon = True
+        watchdog.start()
         sock.settimeout(max(deadline - time.monotonic(), 0.001))
         req_path = (base.prefix + path) or "/"
         conn.putrequest(
@@ -176,7 +194,7 @@ def _bounded_request(
             conn.putheader(key, value)
         conn.putheader("Content-Length", str(len(data) if data else 0))
         conn.endheaders(data)
-        resp = conn.getresponse()
+        resp = response = conn.getresponse()
 
         resp_headers: dict[str, str] = {}
         set_cookies: list[str] = []
@@ -207,12 +225,20 @@ def _bounded_request(
                 raise _TransportFailure(
                     f"response exceeds {max_response_bytes} bytes")
             chunks.append(chunk)
+        if expired.is_set() or time.monotonic() >= deadline:
+            raise _TransportFailure("response deadline exceeded")
         return resp.status, resp_headers, b"".join(chunks)
     except _TransportFailure:
         raise
     except (OSError, http.client.HTTPException) as exc:
-        raise _TransportFailure(type(exc).__name__) from exc
+        message = "response deadline exceeded" if expired.is_set() else type(exc).__name__
+        raise _TransportFailure(message) from exc
     finally:
+        if watchdog is not None:
+            watchdog.cancel()
+            watchdog.join()
+        if response is not None:
+            response.close()
         conn.close()
 
 
