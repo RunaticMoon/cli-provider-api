@@ -35,6 +35,8 @@ from cli_provider_sdk import (
     Outcome,
     ProcessExecutor,
     ProviderDriver,
+    RunFailedEvent,
+    RunFailedPayload,
     RunResult,
     RuntimeContext,
     SimpleCancellation,
@@ -54,6 +56,15 @@ from cli_provider_transports import (
     encode_frame,
 )
 
+from .execution_config import (
+    BoundPermissions,
+    BoundWorkspace,
+    ExecutionConfig,
+    ExecutionConfigError,
+    WorkspaceBinding,
+    claim_workspace_lock,
+    load_execution_config,
+)
 from .protocol import (
     CancelParams,
     ErrorCode,
@@ -71,6 +82,14 @@ DEFAULT_MAX_RUN_SECONDS = 300.0
 
 
 @dataclass
+class _BindingDenial:
+    """A pre-admission policy refusal: no driver code may run for it."""
+
+    code: str
+    message: str
+
+
+@dataclass
 class ActiveRun:
     run_id: str
     request: NormalizedRequest
@@ -84,6 +103,8 @@ class ActiveRun:
     deadline_exceeded: bool = False
     events_seen: int = 0
     last_sequence: int = 0
+    binding: WorkspaceBinding | None = None
+    claim_fd: int | None = None
 
 
 class RunnerServer:
@@ -99,11 +120,17 @@ class RunnerServer:
         max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
         cancel_deadline_seconds: float = 5.0,
         max_run_seconds: float = DEFAULT_MAX_RUN_SECONDS,
+        execution_config_path: str | None = None,
+        execution_config: ExecutionConfig | None = None,
     ) -> None:
         if max_queue < 1:
             raise ValueError("max_queue must be at least 1")
         if (entry is None) == (driver is None):
             raise ValueError("provide exactly one of 'entry' or 'driver'")
+        if execution_config_path is not None and execution_config is not None:
+            raise ValueError(
+                "provide at most one of 'execution_config_path' or 'execution_config'"
+            )
         self.socket_path = socket_path
         self.instance_id = instance_id
         self.entry = entry
@@ -111,6 +138,8 @@ class RunnerServer:
         self.max_frame_bytes = max_frame_bytes
         self.cancel_deadline_seconds = cancel_deadline_seconds
         self.max_run_seconds = max_run_seconds
+        self._execution_config_path = execution_config_path
+        self._execution_config = execution_config
 
         self._driver: ProviderDriver | None = driver
         # The Runner supplies the process executor so drivers never choose how
@@ -131,6 +160,11 @@ class RunnerServer:
             raise RuntimeError("driver not loaded; call load() first")
         return self._driver
 
+    @property
+    def execution_config(self) -> ExecutionConfig | None:
+        """The loaded operator execution config, or None when unconfigured."""
+        return self._execution_config
+
     def load(self) -> ProviderDriver:
         """Resolve and validate the driver. Fails closed before running."""
         if self._driver is None:
@@ -141,6 +175,12 @@ class RunnerServer:
             self._driver = load_driver(self.entry)
         else:
             validate_manifest(self._driver.manifest)
+        if self._execution_config_path is not None:
+            # Operator-controlled workspace/action bindings; the file must be a
+            # protected regular file or serving refuses to start at all.
+            self._execution_config = load_execution_config(
+                self._execution_config_path
+            )
         return self._driver
 
     def request_stop(self) -> None:
@@ -347,6 +387,11 @@ class RunnerServer:
         driver_request = params.to_driver_request()
         run_id = driver_request.run_id
 
+        binding = self._resolve_binding(driver_request)
+        if isinstance(binding, _BindingDenial):
+            await self._deny_run(writer, request.id, driver_request, binding)
+            return
+
         if run_id in self._active:
             await self._send_error(
                 writer,
@@ -366,7 +411,11 @@ class RunnerServer:
             )
             return
 
-        active = ActiveRun(run_id=run_id, request=driver_request)
+        active = ActiveRun(
+            run_id=run_id,
+            request=driver_request,
+            binding=binding if isinstance(binding, WorkspaceBinding) else None,
+        )
         self._active[run_id] = active
         acquired = False
         try:
@@ -403,6 +452,20 @@ class RunnerServer:
 
             active.queued = False
             active.started = True
+            if active.binding is not None:
+                # Serialize runs against the same bound root across runner
+                # processes: the claim is held for the run's whole lifetime and
+                # released in the finally below (flock is released on close).
+                try:
+                    active.claim_fd = claim_workspace_lock(active.binding.root)
+                except ExecutionConfigError as exc:
+                    await self._deny_run(
+                        writer,
+                        request.id,
+                        driver_request,
+                        _BindingDenial(exc.code, exc.message),
+                    )
+                    return
             result = await self._run_with_deadline(active, writer, request.id)
             await self._send_response(writer, request.id, result.model_dump(mode="json"))
         except (ConnectionResetError, BrokenPipeError, OSError):
@@ -414,6 +477,12 @@ class RunnerServer:
         finally:
             self._active.pop(run_id, None)
             active.finished.set()
+            if active.claim_fd is not None:
+                try:
+                    os.close(active.claim_fd)
+                except OSError:
+                    pass
+                active.claim_fd = None
             if acquired:
                 self._run_slot.release()
 
@@ -452,11 +521,131 @@ class RunnerServer:
         """Context for probe/discovery calls (no run-scoped cancellation)."""
         return RuntimeContext(executor=self._executor)
 
+    # ------------------------------------------------- workspace binding
+
+    def _driver_is_effectful(self) -> bool:
+        """Whether the loaded driver can produce real (non-synthetic) effects.
+
+        A synthetic fixture driver (the mock) may run unbound for legacy
+        tests; every real CLI driver requires an operator execution config and
+        a bound workspace before its code is invoked.
+        """
+        return not self.driver.manifest.synthetic
+
+    def _resolve_binding(
+        self, request: NormalizedRequest
+    ) -> WorkspaceBinding | _BindingDenial | None:
+        """Map the request's workspace_id to an operator binding — or deny.
+
+        Resolution consults only the operator-supplied execution config loaded
+        at startup; the request can never name a path, argv, env or action.
+        """
+        config = self._execution_config
+        if config is None:
+            if self._driver_is_effectful():
+                return _BindingDenial(
+                    "execution_config_required",
+                    "this driver produces real effects and the runner was "
+                    "started without --execution-config; refusing to run an "
+                    "unbound workspace",
+                )
+            return None
+        binding = config.binding_for(request.workspace.workspace_id)
+        if binding is None:
+            return _BindingDenial(
+                "workspace_not_bound",
+                f"workspace {request.workspace.workspace_id!r} is not bound in "
+                "the runner execution config",
+            )
+        if (
+            binding.allowed_presets is not None
+            and request.preset not in binding.allowed_presets
+        ):
+            return _BindingDenial(
+                "preset_not_allowed",
+                f"preset {request.preset!r} is not allowed in workspace "
+                f"{request.workspace.workspace_id!r}",
+            )
+        if (
+            binding.allowed_models is not None
+            and request.model_alias is not None
+            and request.model_alias not in binding.allowed_models
+        ):
+            return _BindingDenial(
+                "model_not_allowed",
+                f"model {request.model_alias!r} is not allowed in workspace "
+                f"{request.workspace.workspace_id!r}",
+            )
+        return binding
+
+    def _denied_result(
+        self, request: NormalizedRequest, denial: _BindingDenial
+    ) -> RunResult:
+        return RunResult(
+            run_id=request.run_id,
+            status=CompletionStatus.FAILED,
+            outcome=Outcome.PROVIDER_ERROR,
+            verification=Verification(
+                status=VerificationStatus.NOT_RUN,
+                source="runner",
+                reason=(
+                    "run denied by the operator execution binding before any "
+                    f"driver effect: {denial.message}"
+                ),
+            ),
+            usage=Usage(provenance=UsageProvenance.UNKNOWN),
+            terminal_kind=EventKind.RUN_FAILED,
+            terminal_sequence=1,
+            events_seen=1,
+            synthetic=self.driver.manifest.synthetic,
+            detail=denial.message,
+        )
+
+    async def _deny_run(
+        self,
+        writer: asyncio.StreamWriter,
+        request_id: str,
+        request: NormalizedRequest,
+        denial: _BindingDenial,
+    ) -> None:
+        """A runner-emitted terminal refusal — the driver is never invoked."""
+        event = RunFailedEvent(
+            run_id=request.run_id,
+            sequence=1,
+            timestamp=datetime.now(timezone.utc),
+            synthetic=self.driver.manifest.synthetic,
+            payload=RunFailedPayload(code=denial.code, message=denial.message),
+        )
+        await self._safe_write(
+            writer,
+            RunnerEventEnvelope(request_id=request_id, event=event).model_dump(
+                mode="json"
+            ),
+        )
+        await self._send_response(
+            writer,
+            request_id,
+            self._denied_result(request, denial).model_dump(mode="json"),
+        )
+
     async def _consume(
         self, active: ActiveRun, writer: asyncio.StreamWriter, request_id: str
     ) -> RunResult:
+        binding = active.binding
+        workspace_id = active.request.workspace.workspace_id
         context = RuntimeContext(
-            cancellation=active.cancellation, executor=self._executor
+            cancellation=active.cancellation,
+            executor=self._executor,
+            workspace=(
+                BoundWorkspace(workspace_id, binding.root)
+                if binding is not None
+                else None
+            ),
+            permissions=(
+                BoundPermissions(workspace_id, binding.allowed_actions)
+                if binding is not None
+                else None
+            ),
         )
         terminal: Any = None
         violation: str | None = None

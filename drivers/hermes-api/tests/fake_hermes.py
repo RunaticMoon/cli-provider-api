@@ -77,7 +77,8 @@ def capture(argv: list[str]) -> None:
             query_text = "<unreadable>"
     # Env allowlist only: dumping os.environ wholesale could leak test secrets.
     env_seen = {k: bool(os.environ.get(k)) for k in
-                ("HERMES_HOME", "BAI_API_KEY", "COMMANDCODE_API_KEY")}
+                ("HERMES_HOME", "BAI_API_KEY", "COMMANDCODE_API_KEY",
+                 "LEAD_SESSION_TOKEN", "DEVIN_CLI", "OPENAI_API_KEY")}
     with open(CAPTURE, "w", encoding="utf-8") as fh:
         json.dump({"argv": argv, "cwd": os.getcwd(), "hermes_home": home,
                    "config": config_text, "query": query_text,

@@ -53,6 +53,36 @@ def devin_env(tmp_path: Path, mode: str = "ok", catalog: str = "ok") -> dict[str
     }
 
 
+def write_execution_config(tmp_path: Path, *, actions: list[str] | None = None) -> str:
+    """Operator-side binding: workspace id ``ws-1`` -> the test root.
+
+    The Devin driver is non-synthetic, so a real Runner refuses to run it
+    without an execution config binding the request's workspace_id. The file
+    lives in a private 0700 dir with 0600 permissions, exactly as the loader
+    requires.
+    """
+    conf_dir = tmp_path / "protected"
+    conf_dir.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(conf_dir, 0o700)
+    conf = conf_dir / "execution.json"
+    conf.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "workspaces": {
+                    "ws-1": {
+                        "root": str(tmp_path),
+                        "allowed_actions": list(actions or []),
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    conf.chmod(0o600)
+    return str(conf)
+
+
 def read_log(tmp_path: Path) -> list[dict]:
     logfile = tmp_path / "fixture.log"
     if not logfile.exists():
@@ -71,6 +101,7 @@ async def test_runner_loads_devin_driver_and_runs_over_uds(runner_factory, tmp_p
         distribution="cli-driver-devin",
         version="0.1.0",
         extra_env=devin_env(tmp_path),
+        execution_config=write_execution_config(tmp_path),
     )
     client = await RunnerClient.connect(runner.socket_path)
     try:
@@ -136,6 +167,7 @@ async def test_runner_reports_devin_failure_not_success(runner_factory, tmp_path
         distribution="cli-driver-devin",
         version="0.1.0",
         extra_env=devin_env(tmp_path, mode="model_mismatch"),
+        execution_config=write_execution_config(tmp_path),
     )
     client = await RunnerClient.connect(runner.socket_path)
     try:
@@ -161,6 +193,7 @@ async def test_runner_deadline_cancels_hung_devin_run(runner_factory, tmp_path):
         version="0.1.0",
         extra_env=devin_env(tmp_path, mode="hang"),
         cancel_deadline=2.0,
+        execution_config=write_execution_config(tmp_path),
     )
     client = await RunnerClient.connect(runner.socket_path)
     try:
@@ -172,5 +205,56 @@ async def test_runner_deadline_cancels_hung_devin_run(runner_factory, tmp_path):
         await asyncio.sleep(0.2)
         records = read_log(tmp_path)
         assert any(r.get("event") == "acp_start" for r in records)
+    finally:
+        await client.aclose()
+
+
+async def test_unbound_workspace_is_denied_before_any_spawn(
+    runner_factory, tmp_path
+):
+    # ws-9 is not in the operator config: the run must be refused before the
+    # fixture CLI (or any driver code) executes — nothing may create a task
+    # home or spawn a process for it.
+    runner = runner_factory(
+        "success",
+        driver_id="devin",
+        distribution="cli-driver-devin",
+        version="0.1.0",
+        extra_env=devin_env(tmp_path),
+        execution_config=write_execution_config(tmp_path),
+    )
+    client = await RunnerClient.connect(runner.socket_path)
+    try:
+        events = await drive(
+            client,
+            run_params(
+                workspace={"workspace_id": "ws-9"}, deadline_seconds=15.0
+            ),
+        )
+        result = client.last_run_response.result
+        assert result["status"] == "failed"
+        assert events[-1].event.payload.code == "workspace_not_bound"
+        assert read_log(tmp_path) == []
+    finally:
+        await client.aclose()
+
+
+async def test_devin_without_execution_config_is_denied(runner_factory, tmp_path):
+    # A real (non-synthetic) driver must never run an unbound workspace, even
+    # though the operator env still supplies a static DEVIN_WORKSPACE_ROOT.
+    runner = runner_factory(
+        "success",
+        driver_id="devin",
+        distribution="cli-driver-devin",
+        version="0.1.0",
+        extra_env=devin_env(tmp_path),
+    )
+    client = await RunnerClient.connect(runner.socket_path)
+    try:
+        events = await drive(client, run_params(deadline_seconds=15.0))
+        result = client.last_run_response.result
+        assert result["status"] == "failed"
+        assert events[-1].event.payload.code == "execution_config_required"
+        assert read_log(tmp_path) == []
     finally:
         await client.aclose()

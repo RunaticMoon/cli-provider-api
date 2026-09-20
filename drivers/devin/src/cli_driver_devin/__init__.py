@@ -692,6 +692,32 @@ class DevinDriver(BaseDriver):
             )
             return
 
+        # Catalog re-verification on every run: the bounded-TTL cache is
+        # consulted again so a stale `Free` membership is never replayed as a
+        # standing authorization. The check itself is only a read-only
+        # `models list` spawn — never an agent prompt — and an absent,
+        # not-Free, expired, or unreadable catalog fails the run before the
+        # agent subprocess exists.
+        catalog = (await self.discover_models(ctx))[0].verification
+        if catalog.status is not VerificationStatus.PASSED:
+            yield fail(
+                "catalog_not_verified",
+                f"catalog verification is {catalog.status.value}: "
+                f"{catalog.reason}; refusing to spawn the agent",
+            )
+            return
+
+        # run.started is emitted here — after every admission gate and
+        # immediately before the ACP agent subprocess is spawned — so it
+        # precedes the first effectful action of the run. A failed spawn
+        # still produces started -> failed rather than silence.
+        yield RunStartedEvent(
+            **self._event_kwargs(request, state),
+            payload=RunStartedPayload(
+                preset=request.preset, model_alias=request.model_alias
+            ),
+        )
+
         try:
             process = await ctx.executor.spawn(self._acp_argv(), cwd=cwd)
         except ProcessStartError as exc:
@@ -709,13 +735,6 @@ class DevinDriver(BaseDriver):
         terminal_sent = False
 
         try:
-            yield RunStartedEvent(
-                **self._event_kwargs(request, state),
-                payload=RunStartedPayload(
-                    preset=request.preset, model_alias=request.model_alias
-                ),
-            )
-
             phase_deadline = min(
                 deadline_at, time.monotonic() + self._handshake_timeout
             )

@@ -77,6 +77,8 @@ class UserShapeDriver:
             sdk_version=SDK_VERSION,
             protocol_family="user-shape",
             supported_transports=[TransportKind.STDIO],
+            # This double is a fixture: like the mock it may run unbound.
+            synthetic=True,
         )
 
     async def probe(self, ctx: RuntimeContext) -> ProbeReport:

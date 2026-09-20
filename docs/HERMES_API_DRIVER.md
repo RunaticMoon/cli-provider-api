@@ -20,9 +20,25 @@ Verified against Hermes `v0.21.3` (upstream `d86a1687`), installed at
 A request must carry `preset` equal to one of these aliases. If
 `model_alias` is supplied it must equal the preset's exact model id (or the
 SDK-safe descriptor id `provider:model`); anything else fails with
-`model_alias_mismatch` before spawn. `discover_models()` returns both pins
-with `VerificationStatus.UNKNOWN` — they are operator pins, not an
-authenticated catalog check.
+`model_alias_mismatch` before spawn.
+
+`discover_models()` performs a **bounded authenticated `GET {base_url}/models`**
+against each preset's official endpoint with the operator env key
+(`BAI_API_KEY` / `COMMANDCODE_API_KEY`), matching the **exact** pinned model
+id — never a family slug or alias. A parsed catalog containing the exact id
+is `passed`; a parsed catalog without it, or a 401/403, is `failed`; a missing
+key, unreachable endpoint, redirect, malformed or oversized body is `unknown`.
+Results are cached for `HERMES_API_CATALOG_TTL` (default 300 s). Catalog
+presence is membership only — never a quota, billing or entitlement claim.
+Redirects are never followed, so the credential is never forwarded
+off-origin, and response bodies/headers are never surfaced in verification
+reasons.
+
+For fixture deployments only, `HERMES_API_BAI_BASE_URL` /
+`HERMES_API_COMMANDCODE_BASE_URL` may replace the endpoint *origin* (the
+preset's `base_path` is preserved). These are operator env config — like
+`HERMES_API_CLI` — never request-derived, and they are scrubbed from the
+child environment. Production defaults remain the official endpoints.
 
 Two provider config shapes:
 
@@ -35,17 +51,25 @@ Two provider config shapes:
 
 ## Hermes invocation
 
-One process per run (verbatim argv; `env` prepends `HERMES_HOME` because the
-executor contract has no per-spawn env):
+One process per run (shape below; `env` adjusts the child's environment
+without a shell because the executor contract has no per-spawn env):
 
 ```
-env HERMES_HOME=<task-home> hermes chat \
+env -u <secret/provider env names> HERMES_HOME=<task-home> hermes chat \
   --query-file <task-home>/query.txt --oneshot \
   --provider <preset.provider_name> --model <preset.model_id> \
   --reasoning <low|high|max> --toolsets file,terminal \
   --format stream-json --in <workspace> \
   --max-turns <N> --run-budget <seconds> --yolo --ignore-rules
 ```
+
+Every environment variable whose name looks secret-shaped or provider-owned
+(`*_API_KEY`, `*TOKEN*`, `*SECRET*`, `*AUTH*`, `DEVIN_*`, `OPENAI_*`, …) is
+unset in the child via `env -u` — **names only, values never appear in
+argv**. The one exception is the *selected* preset's `key_env`: the child
+needs exactly that one backend's key. The operator's own `HERMES_HOME` is
+also unset and then reassigned to the task home, so it cannot leak through.
+This is best-effort hygiene, not a sandbox.
 
 `--safe-mode` and `--ignore-user-config` are deliberately **not** passed:
 both bypass the generated task-local provider config.
@@ -107,6 +131,14 @@ requires the runtime permission service to allow `hermes.yolo`
 spawn. `ctx.executor` must supply the process executor — see *Runner
 handoff* below.
 
+Before any effect (task home, config write, spawn), `execute()` re-verifies
+the preset's catalog membership through the same bounded `GET /models`
+check — a long-lived discovery/Registry cache must never turn a stale
+listing into a standing authorization. The result rides the TTL cache
+(`HERMES_API_CATALOG_TTL`), so repeated runs within the TTL reuse it; a lost
+membership, auth rejection or unreadable catalog fails the run with
+`catalog_not_verified` before the CLI exists.
+
 ## Bounds, cancellation, cleanup
 
 - Process lifetime: driver watchdog = `min(deadline_seconds,
@@ -127,7 +159,9 @@ handoff* below.
 
 - `tokens` in the terminal `result` maps to `Usage(REPORTED)`; all-zero or
   absent → `Usage(UNKNOWN)`. Quota and actual charge are always unknown.
-- `discover_models()` → `VerificationStatus.UNKNOWN` for both pins.
+- `discover_models()` reports the bounded catalog check honestly
+  (`passed`/`failed`/`unknown`); membership is never a quota or entitlement
+  claim.
 - The driver does not claim provider-side billing verification.
 
 ## Operator environment
@@ -140,26 +174,47 @@ handoff* below.
 | `HERMES_API_RUN_BUDGET`       | `600`     | cap on `--run-budget` seconds             |
 | `HERMES_API_STATE_DIR`        | unset     | parent dir for task-local `HERMES_HOME`s  |
 | `HERMES_API_EXPECTED_VERSION` | unset     | probe fails unless CLI version matches    |
+| `HERMES_API_CATALOG_TTL`      | `300`     | seconds a `/models` result may be cached  |
+| `HERMES_API_CATALOG_TIMEOUT`  | `10`      | bound on the catalog HTTP call            |
+| `HERMES_API_BAI_BASE_URL`     | official  | fixture-only origin override (scrubbed)   |
+| `HERMES_API_COMMANDCODE_BASE_URL` | official | fixture-only origin override (scrubbed) |
 
 ## Tests
 
 - `tests/test_hermes_api_driver.py` — unit suite against a fake Hermes
-  executable (protocol, presets, isolation, redaction, cancellation,
-  bounds). No network.
+  executable plus a loopback `/models` catalog fixture (protocol, presets,
+  isolation, redaction, cancellation, bounds, catalog verification and its
+  failure modes). No real endpoint is contacted.
 - `tests/test_hermes_api_integration.py` — real installed Hermes against a
   loopback OpenAI-compatible mock (`tests/fixtures/openai_mock.py`) for
   both presets: asserts an actual `write_file` change, clean NDJSON, the
   pinned model on the wire, `reasoning_effort`, `reasoning_content` echo on
   tool-call turns, and no tool/reasoning leakage into answer text.
+- `apps/runner/tests/test_hermes_wiring.py` — real Runner subprocess over
+  UDS driving this driver: bound workspace + `hermes.yolo` grant completes;
+  missing grant, missing config and lost catalog membership all fail before
+  any spawn; one skipped-when-absent case runs the real `hermes` binary
+  through the Runner against the loopback provider.
 
 No live provider inference is performed by this test suite; provider keys
 are synthetic.
 
 ## Runner handoff
 
-`execute()` and `probe()` need `ctx.executor` (a `ProcessExecutor`) and
-`ctx.permissions` allowing `hermes.yolo`; the current Runner constructs
-`RuntimeContext` without an executor. Runner-side injection (an executor
-bound to the operator environment — the provider key arrives through that
-env, never through request fields) is a parent-worktree task; the shared
-Runner/SDK were not modified here.
+The standalone Runner binds the runtime context from an operator-only
+`serve --execution-config FILE` (a protected, validated JSON file — never a
+request field). For an effectful (non-synthetic) driver like this one the
+run is refused before any driver code executes when the request's
+`workspace_id` has no binding. A bound run gets:
+
+- `ctx.executor` — the runner's process executor (provider key arrives
+  through that environment, never through request fields);
+- `ctx.workspace` — the bound workspace root (driver uses it for `--in` and
+  `cwd`);
+- `ctx.permissions` — the bound allow-list; `hermes.yolo` must be granted
+  there or the run fails `yolo_not_preapproved` before spawn.
+
+Binding denial happens before task-home creation or process spawn, and the
+bound workspace is claimed serially across runner processes for the life of
+the run. This is dependency injection, not an OS sandbox: the spawned CLI
+can still reach the host outside the workspace.

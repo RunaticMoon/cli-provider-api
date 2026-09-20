@@ -170,6 +170,29 @@ bounded by one fixed `request_body_timeout_seconds` deadline (byte caps do not
 bound a slow drip feed), and total request headers are bounded by
 `max_headers_bytes` (`431` over the limit).
 
+## Runner execution binding
+
+The standalone Runner takes an optional operator-only
+`serve --execution-config FILE` — a protected JSON file (private parent
+directory, owner-read/write or group-read at most, no symlink, validated on
+startup). It maps each request `workspace_id` to an absolute, existing,
+non-symlinked workspace root plus an allow-list of permission actions
+(`hermes.yolo`, `devin.acp.session_mode.bypass` — empty means deny
+everything) and optional exact `allowed_presets`/`allowed_models`.
+
+- Requests carry only the workspace *id* — never a path or runtime
+  authority; unknown ids are denied before any driver code runs.
+- Non-synthetic drivers are refused entirely without a config
+  (`execution_config_required`); the synthetic mock keeps legacy unbound
+  behavior for tests.
+- A bound run gets `RuntimeContext.workspace` + `permissions` from the
+  config, and the workspace is claimed serially (flock) for the run's
+  lifetime — including across runner processes — so the same workspace is
+  never driven concurrently (`workspace_busy`).
+
+This binding is dependency injection, **not an OS sandbox**: a spawned CLI
+can still reach the host outside the workspace.
+
 ## Tests
 
 The default suite uses synthetic drivers. The optional real, isolated 9Router

@@ -20,7 +20,7 @@ anywhere in this slice.
 | Effort/tier | none — `swe-2-max` *is* the Max variant; any effort suffix (`:high`, `@low`, `/x`) fails before spawn |
 | Protocol | ACP over stdio: `initialize`, `session/new`, `session/set_mode`, `session/prompt`, `session/cancel`, `session/update`, `session/request_permission` |
 | Sessions | explicit `session/new` only; no resume/latest-session in this slice |
-| Workspace | `cwd` = operator-configured `DEVIN_WORKSPACE_ROOT` (or `workspace_root` kwarg); `RuntimeContext.workspace` is not required |
+| Workspace | `cwd` = `RuntimeContext.workspace.root` when bound by the Runner (execution config), else the operator's static `DEVIN_WORKSPACE_ROOT` (or `workspace_root` kwarg); a run with neither fails `no_workspace` |
 
 ## Verification model
 
@@ -34,6 +34,12 @@ anywhere in this slice.
   `DEVIN_EXPECTED_COST_TIER` (default `Free`) as an operator guardrail, not a
   pricing claim. Results are cached for `DEVIN_CATALOG_TTL_SECONDS`
   (default 300 s).
+- `execute()` re-checks that cached verification **on every run, before the
+  ACP agent is spawned**: the TTL cache is consulted again so a stale `Free`
+  listing is never a standing authorization. An absent, not-`Free`, expired
+  or unreadable catalog fails the run with `catalog_not_verified` before the
+  agent subprocess exists — the check itself only ever spawns the read-only
+  `models list` command, never an agent prompt.
 - Verification status is honest: a parsed catalog missing the model →
   `failed`; an unreadable/malformed catalog → `unknown`; a matching catalog →
   `passed`. No canary inference is ever run to "verify" a model.
@@ -71,7 +77,11 @@ JSON-RPC `-32601` method-not-found error rather than hanging the turn.
 
 ## Event semantics
 
-- `run.started` is emitted before any possible side effect.
+- `run.started` is emitted after every admission gate (executor, deadline,
+  model pin, workspace, catalog re-verification) and immediately **before**
+  the ACP agent subprocess is spawned — the first effectful action of the
+  run. A denied run emits `run.failed` only; a failed spawn still produces
+  `run.started` → `run.failed` rather than silence.
 - Only `agent_message_chunk` text becomes `message.delta`. Thought chunks,
   plans, tool logs and stderr are never answer text; tool calls surface as
   `tool.started`/`tool.completed`/`artifact.created` internal events.
@@ -107,7 +117,7 @@ JSON-RPC `-32601` method-not-found error rather than hanging the turn.
 | `DEVIN_CLI` | `devin` | CLI executable path |
 | `DEVIN_MODEL` | `swe-2-max` | Exact model id (must be `swe-2-max`) |
 | `DEVIN_EXPECTED_VERSION` | unset | Pin `devin --version` output |
-| `DEVIN_WORKSPACE_ROOT` | unset | Trusted `cwd` for `session/new` (required to run) |
+| `DEVIN_WORKSPACE_ROOT` | unset | Static trusted `cwd` fallback; the Runner's bound workspace wins when present |
 | `DEVIN_ACP_MODE` | `accept-edits` | Requested session mode (`bypass` needs permission policy) |
 | `DEVIN_EXPECTED_COST_TIER` | `Free` | Catalog cost-tier guardrail |
 | `DEVIN_CATALOG_TTL_SECONDS` | `300` | Model-catalog cache lifetime |

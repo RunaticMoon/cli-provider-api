@@ -501,6 +501,90 @@ async def test_non_max_configured_model_is_refused_before_spawn(tmp_path):
     assert not any("acp" in c["argv"] for c in executor.calls)
 
 
+# ------------------------------------------------- execute: catalog re-check
+
+
+async def test_execute_fails_before_any_prompt_when_membership_is_lost(tmp_path):
+    """A stale `Free` listing is never a standing authorization: the catalog
+    is re-read on every execute (TTL=0 here) and a dropped model stops the run
+    before the agent subprocess exists."""
+    logfile = tmp_path / "fixture.log"
+    env = dict(os.environ, FAKE_DEVIN_MODE="ok", FAKE_DEVIN_LOG=str(logfile))
+    executor = RecordingExecutor(env)
+    ctx = RuntimeContext(executor=executor)
+    driver = driver_for(tmp_path, catalog_ttl_seconds=0.0)
+    events = await collect(driver, make_request(), ctx)
+    assert terminal(events).kind == EventKind.RUN_COMPLETED
+
+    executor._env["FAKE_DEVIN_CATALOG"] = "missing"  # provider drops the model
+    events = await collect(driver, make_request(run_id="run_devin_lost"), ctx)
+    result = terminal(events)
+    assert result.kind == EventKind.RUN_FAILED
+    assert result.payload.code == "catalog_not_verified"
+    # Denied runs never emit run.started, and no second agent was spawned.
+    assert EventKind.RUN_STARTED not in kinds(events)
+    acp_calls = [c for c in executor.calls if "acp" in c["argv"]]
+    assert len(acp_calls) == 1
+    seen = [r.get("received") for r in read_log(logfile)]
+    assert seen.count("session/prompt:begin") == 1
+
+
+async def test_execute_rejects_a_not_free_catalog_before_spawn(tmp_path):
+    ctx, executor = recording_ctx(
+        tmp_path, "ok", extra_env={"FAKE_DEVIN_CATALOG": "cost"}
+    )
+    driver = driver_for(tmp_path)
+    events = await collect(driver, make_request(), ctx)
+    result = terminal(events)
+    assert result.kind == EventKind.RUN_FAILED
+    assert result.payload.code == "catalog_not_verified"
+    assert not any("acp" in c["argv"] for c in executor.calls)
+
+
+async def test_execute_rejects_an_unreadable_catalog_before_spawn(tmp_path):
+    ctx, executor = recording_ctx(
+        tmp_path, "ok", extra_env={"FAKE_DEVIN_CATALOG": "bad_json"}
+    )
+    driver = driver_for(tmp_path)
+    events = await collect(driver, make_request(), ctx)
+    result = terminal(events)
+    assert result.kind == EventKind.RUN_FAILED
+    assert result.payload.code == "catalog_not_verified"
+    assert not any("acp" in c["argv"] for c in executor.calls)
+
+
+async def test_execute_rechecks_the_catalog_within_ttl_bounds(tmp_path):
+    """Every run consults the catalog: one read-only `models list` spawn per
+    execute when the TTL has expired, and never an agent prompt."""
+    ctx, executor = recording_ctx(tmp_path, "ok")
+    driver = driver_for(tmp_path, catalog_ttl_seconds=0.0)
+    for index in range(2):
+        events = await collect(
+            driver, make_request(run_id=f"run_d_{index}"), ctx
+        )
+        assert terminal(events).kind == EventKind.RUN_COMPLETED
+    catalog_calls = [c for c in executor.calls if "models" in c["argv"]]
+    assert len(catalog_calls) == 2
+    for call in catalog_calls:
+        assert "acp" not in call["argv"]
+
+
+async def test_run_started_is_emitted_after_gates_and_before_the_agent(tmp_path):
+    # A denied run emits run.failed only — no run.started precedes a refusal.
+    ctx, executor = recording_ctx(
+        tmp_path, "ok", extra_env={"FAKE_DEVIN_CATALOG": "missing"}
+    )
+    driver = driver_for(tmp_path, catalog_ttl_seconds=0.0)
+    events = await collect(driver, make_request(), ctx)
+    assert kinds(events) == ["run.failed"]
+
+    # An admitted run emits run.started first, before the ACP spawn.
+    ctx2, executor2 = recording_ctx(tmp_path, "ok")
+    events2 = await collect(driver, make_request(run_id="run_d_2"), ctx2)
+    assert kinds(events2)[0] == "run.started"
+    assert any("acp" in c["argv"] for c in executor2.calls)
+
+
 # ---------------------------------------------- execute: model/mode pinning
 
 

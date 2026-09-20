@@ -91,6 +91,7 @@ def runner_factory(sock_dir):
         cancel_detail: str | None = None,
         umask: int | None = None,
         extra_env: dict[str, str] | None = None,
+        execution_config: str | None = None,
         wait: bool = True,
     ) -> RunnerProcess:
         socket_path = os.path.join(sock_dir, f"r{counter['n']}.sock")
@@ -124,6 +125,8 @@ def runner_factory(sock_dir):
             cmd += ["--max-queue", str(max_queue)]
         if cancel_deadline is not None:
             cmd += ["--cancel-deadline", str(cancel_deadline)]
+        if execution_config is not None:
+            cmd += ["--execution-config", str(execution_config)]
         preexec_fn = None
         if umask is not None:
             preexec_fn = lambda: os.umask(umask)  # noqa: E731 - POSIX only

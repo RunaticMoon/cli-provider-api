@@ -49,6 +49,14 @@ BAI_KEY = "sk-test-bai-fixture"
 CC_KEY = "sk-test-cc-fixture"
 
 
+@pytest.fixture(autouse=True)
+def _operator_keys(monkeypatch):
+    """Operator env keys for the driver's in-process catalog check; the child
+    gets its own copy through the executor env in ``make_ctx``."""
+    monkeypatch.setenv("BAI_API_KEY", BAI_KEY)
+    monkeypatch.setenv("COMMANDCODE_API_KEY", CC_KEY)
+
+
 class AllowAll:
     def allows(self, action: str) -> bool:
         return True
@@ -175,6 +183,13 @@ async def test_real_hermes_against_loopback_provider(tmp_path, preset_alias):
 
     # Actual isolated file change happened inside the workspace.
     assert (workspace / "agent-out.txt").read_text() == "fixture-agent-wrote-this"
+
+    # The exact-id catalog check hit the loopback /models with auth, before
+    # any chat completion.
+    catalog_hits = [
+        r for r in wire_requests(log) if r.get("_path", "").endswith("/models")
+    ]
+    assert catalog_hits and all(r["_auth"] for r in catalog_hits)
 
     chats = chat_requests(log)
     assert len(chats) >= 3, [r.get("_path") for r in wire_requests(log)]

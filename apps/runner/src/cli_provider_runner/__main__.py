@@ -23,6 +23,7 @@ from typing import Any, Sequence
 from cli_provider_transports import DEFAULT_MAX_FRAME_BYTES
 
 from .client import RunnerClient
+from .execution_config import ExecutionConfigError
 from .registry import DriverAllowlistEntry, DriverLoadError
 from .server import DEFAULT_MAX_RUN_SECONDS, RunnerServer
 
@@ -45,6 +46,15 @@ def _build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--max-frame-bytes", type=int, default=DEFAULT_MAX_FRAME_BYTES)
     serve.add_argument("--cancel-deadline", type=float, default=5.0)
     serve.add_argument("--max-run-seconds", type=float, default=DEFAULT_MAX_RUN_SECONDS)
+    serve.add_argument(
+        "--execution-config",
+        default=None,
+        help=(
+            "operator-owned JSON file binding workspace_id -> absolute root + "
+            "allowed actions/presets/models; required before any real "
+            "(non-synthetic) driver may run"
+        ),
+    )
 
     for name in ("manifest", "probe", "discover-models"):
         call = sub.add_parser(name)
@@ -85,10 +95,11 @@ async def _serve(args: argparse.Namespace) -> int:
         max_frame_bytes=args.max_frame_bytes,
         cancel_deadline_seconds=args.cancel_deadline,
         max_run_seconds=args.max_run_seconds,
+        execution_config_path=args.execution_config,
     )
     try:
         server.load()
-    except DriverLoadError as exc:
+    except (DriverLoadError, ExecutionConfigError) as exc:
         _emit({"type": "error", "code": exc.code, "message": exc.message})
         return 2
 
@@ -106,6 +117,11 @@ async def _serve(args: argparse.Namespace) -> int:
             "socket": args.socket,
             "driver_id": args.driver_id,
             "driver_version": args.version,
+            "execution_config": (
+                None
+                if server.execution_config is None
+                else {"workspaces": len(server.execution_config.workspaces)}
+            ),
         }
     )
     await server.serve()

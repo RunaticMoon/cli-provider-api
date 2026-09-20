@@ -64,7 +64,21 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     def do_GET(self) -> None:
-        body = json.dumps({"object": "list", "data": []}).encode()
+        log_request(
+            self.path,
+            {"_get": True, "_auth": bool(self.headers.get("Authorization"))},
+        )
+        if self.path.endswith("/models"):
+            # The official catalog check: the two pinned exact ids are members.
+            body = json.dumps({
+                "object": "list",
+                "data": [
+                    {"id": "deepseek-v4.1-flash", "object": "model"},
+                    {"id": "deepseek/deepseek-v4.1-flash", "object": "model"},
+                ],
+            }).encode()
+        else:
+            body = json.dumps({"object": "list", "data": []}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))

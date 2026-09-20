@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import gc
 import importlib.metadata
 import json
 import os
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -24,11 +27,13 @@ from cli_provider_sdk import (
     StreamingMode,
     StructuredOutputMode,
     UsageProvenance,
+    VerificationStatus,
     WorkspaceRef,
 )
 from cli_provider_transports import LocalProcessExecutor
 
 from cli_driver_hermes_api import (
+    CATALOG_MAX_BYTES,
     HermesApiDriver,
     PRESETS,
     REASONING_LEVELS,
@@ -41,6 +46,7 @@ ENTRY_POINT_GROUP = "cli_provider.drivers"
 BAI_PRESET = "bai/deepseek-v4.1-flash"
 CC_PRESET = "commandcode/deepseek-v4.1-flash"
 SECRET_VALUE = "sk-fixture-secret-000"
+MODEL_IDS = ("deepseek-v4.1-flash", "deepseek/deepseek-v4.1-flash")
 
 
 @pytest.fixture(autouse=True)
@@ -56,6 +62,149 @@ def make_wrapper(tmp_path: Path) -> Path:
     )
     wrapper.chmod(0o755)
     return wrapper
+
+
+# --------------------------------------------------------- loopback catalog
+
+
+class _CatalogHandler(BaseHTTPRequestHandler):
+    """Serves ``GET .../models`` per the owning server's current mode."""
+
+    def log_message(self, *args) -> None:
+        return None
+
+    def _respond(self, status: int, body: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        catalog = self.server.catalog  # type: ignore[attr-defined]
+        catalog.hits.append(
+            {
+                "path": self.path,
+                "authorization": self.headers.get("Authorization"),
+            }
+        )
+        mode = catalog.mode
+        if mode == "slow":
+            time.sleep(5)
+            mode = "ok"
+        if not self.path.endswith("/models"):
+            self._respond(404, b"{}")
+            return
+        if mode == "unauthorized":
+            # The body echoes the key back; the driver must never surface it.
+            self._respond(
+                401,
+                json.dumps({"error": f"key {SECRET_VALUE} rejected"}).encode(),
+            )
+            return
+        if mode == "redirect":
+            self.send_response(302)
+            self.send_header(
+                "Location", f"{catalog.base_url}/elsewhere/models"
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if mode == "malformed":
+            self._respond(200, b"{not valid json")
+            return
+        if mode == "oversize":
+            self._respond(200, b"x" * (CATALOG_MAX_BYTES + 8))
+            return
+        if mode == "wrong_shape":
+            self._respond(200, json.dumps({"data": "nope"}).encode())
+            return
+        ids = {
+            "ok": list(MODEL_IDS),
+            "empty": [],
+            "missing": ["someone/else-model"],
+        }[mode]
+        self._respond(
+            200,
+            json.dumps(
+                {
+                    "object": "list",
+                    "data": [{"id": mid, "object": "model"} for mid in ids],
+                }
+            ).encode(),
+        )
+
+
+class CatalogServer:
+    """Loopback ``/models`` endpoint — the only endpoint tests may inject."""
+
+    def __init__(self) -> None:
+        self.mode = "ok"
+        self.hits: list[dict] = []
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _CatalogHandler)
+        self._server.catalog = self  # type: ignore[attr-defined]
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, daemon=True
+        )
+        self._thread.start()
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self._server.server_address[1]}"
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+
+_CATALOG: CatalogServer | None = None
+
+
+def _default_catalog() -> CatalogServer:
+    """Session-shared loopback catalog; mode/hits are reset after each test."""
+    global _CATALOG
+    if _CATALOG is None:
+        _CATALOG = CatalogServer()
+    return _CATALOG
+
+
+@pytest.fixture(autouse=True)
+def _reset_catalog():
+    yield
+    if _CATALOG is not None:
+        _CATALOG.mode = "ok"
+        _CATALOG.hits.clear()
+
+
+@pytest.fixture(autouse=True)
+def _operator_keys(monkeypatch):
+    """Operator env keys for the in-process catalog check (never the child's
+    only source — the executor env carries its own copies)."""
+    monkeypatch.setenv("BAI_API_KEY", SECRET_VALUE)
+    monkeypatch.setenv("COMMANDCODE_API_KEY", SECRET_VALUE)
+
+
+def driver_for(
+    tmp_path: Path,
+    catalog: CatalogServer | None = None,
+    *,
+    only: tuple[str, ...] | None = None,
+    **kwargs,
+) -> HermesApiDriver:
+    """Driver pinned at the loopback catalog — production defaults are
+    unchanged; tests substitute only the endpoint origin."""
+    cat = catalog or _default_catalog()
+    presets = {
+        alias: dataclasses.replace(
+            preset, base_url=f"{cat.base_url}{preset.base_path}"
+        )
+        for alias, preset in PRESETS.items()
+        if only is None or alias in only
+    }
+    return HermesApiDriver(
+        cli_command=str(make_wrapper(tmp_path)), presets=presets, **kwargs
+    )
 
 
 class AllowAll:
@@ -191,7 +340,7 @@ def test_presets_cover_both_backends_with_exact_pins():
 
 
 async def test_probe_reports_the_exact_cli_version(tmp_path):
-    driver = HermesApiDriver(cli_command=str(make_wrapper(tmp_path)))
+    driver = driver_for(tmp_path)
     report = await driver.probe(make_ctx(tmp_path, "ok"))
     assert report.ok is True
     assert report.cli_version == "0.21.3"
@@ -204,9 +353,7 @@ async def test_probe_fails_closed_without_an_executor():
 
 
 async def test_probe_refuses_a_version_that_does_not_match_the_pin(tmp_path):
-    driver = HermesApiDriver(
-        cli_command=str(make_wrapper(tmp_path)), expected_version="9.9.9"
-    )
+    driver = driver_for(tmp_path, expected_version="9.9.9")
     report = await driver.probe(make_ctx(tmp_path, "ok"))
     assert report.ok is False
     assert report.cli_version == "0.21.3"
@@ -215,20 +362,157 @@ async def test_probe_refuses_a_version_that_does_not_match_the_pin(tmp_path):
 # ----------------------------------------------------------------- discovery
 
 
-async def test_discovery_lists_operator_presets_without_claiming_verification(tmp_path):
-    driver = HermesApiDriver(cli_command=str(make_wrapper(tmp_path)))
+async def test_discovery_verifies_exact_ids_against_the_catalog(tmp_path):
+    cat = _default_catalog()
+    driver = driver_for(tmp_path)
+    models = {
+        m.model_id: m
+        for m in await driver.discover_models(make_ctx(tmp_path, "ok"))
+    }
+    assert set(models) == {
+        "bai:deepseek-v4.1-flash",
+        "commandcode:deepseek-v4.1-flash",
+    }
+    for m in models.values():
+        assert m.verification.status is VerificationStatus.PASSED
+        assert "not a quota" in (m.verification.reason or "")
+        assert SECRET_VALUE not in (m.verification.reason or "")
+    # One bounded GET per preset, exact path, Bearer auth on the origin only.
+    assert sorted(h["path"] for h in cat.hits) == [
+        "/provider/v1/models",
+        "/v1/models",
+    ]
+    assert all(
+        h["authorization"] == f"Bearer {SECRET_VALUE}" for h in cat.hits
+    )
+
+
+async def test_discovery_is_unknown_without_the_operator_key(
+    tmp_path, monkeypatch
+):
+    cat = _default_catalog()
+    monkeypatch.delenv("BAI_API_KEY")
+    driver = driver_for(tmp_path, only=(BAI_PRESET,))
     models = await driver.discover_models(make_ctx(tmp_path, "ok"))
-    ids = sorted(m.model_id for m in models)
-    assert ids == ["bai:deepseek-v4.1-flash", "commandcode:deepseek-v4.1-flash"]
-    for m in models:
-        assert m.verification.status.value == "unknown"
+    assert models[0].verification.status is VerificationStatus.UNKNOWN
+    assert "BAI_API_KEY" in (models[0].verification.reason or "")
+    assert not cat.hits, "no key means the provider was never queried"
+
+
+async def test_catalog_membership_is_cached_within_the_bounded_ttl(tmp_path):
+    cat = _default_catalog()
+    driver = driver_for(tmp_path, catalog_ttl_seconds=60.0)
+    ctx = make_ctx(tmp_path, "ok")
+    await driver.discover_models(ctx)
+    await driver.discover_models(ctx)
+    assert len(cat.hits) == 2, "one GET per preset, then cached"
+
+
+async def test_catalog_absent_model_id_is_a_failed_verification(tmp_path):
+    cat = _default_catalog()
+    cat.mode = "missing"
+    driver = driver_for(tmp_path, only=(BAI_PRESET,))
+    models = await driver.discover_models(make_ctx(tmp_path, "ok"))
+    assert models[0].verification.status is VerificationStatus.FAILED
+    assert "not present" in (models[0].verification.reason or "")
+
+
+async def test_catalog_auth_rejection_is_failed_and_never_leaks(tmp_path):
+    cat = _default_catalog()
+    cat.mode = "unauthorized"
+    driver = driver_for(tmp_path, only=(BAI_PRESET,))
+    models = await driver.discover_models(make_ctx(tmp_path, "ok"))
+    verification = models[0].verification
+    assert verification.status is VerificationStatus.FAILED
+    assert "401" in (verification.reason or "")
+    # The endpoint echoed the key in its body; it must not surface.
+    assert SECRET_VALUE not in (verification.reason or "")
+
+
+async def test_catalog_redirect_is_never_followed(tmp_path):
+    cat = _default_catalog()
+    cat.mode = "redirect"
+    driver = driver_for(tmp_path, only=(BAI_PRESET,))
+    models = await driver.discover_models(make_ctx(tmp_path, "ok"))
+    assert models[0].verification.status is VerificationStatus.UNKNOWN
+    assert "redirect" in (models[0].verification.reason or "")
+    # One hit, on the origin only: the credential is never forwarded.
+    assert len(cat.hits) == 1
+    assert cat.hits[0]["path"] == "/v1/models"
+
+
+async def test_malformed_and_oversize_catalogs_are_unknown(tmp_path):
+    cat = _default_catalog()
+    driver = driver_for(tmp_path, only=(BAI_PRESET,))
+    ctx = make_ctx(tmp_path, "ok")
+    cat.mode = "malformed"
+    models = await driver.discover_models(ctx)
+    assert models[0].verification.status is VerificationStatus.UNKNOWN
+    cat.mode = "oversize"
+    oversized = driver_for(tmp_path, only=(BAI_PRESET,))
+    models = await oversized.discover_models(ctx)
+    assert models[0].verification.status is VerificationStatus.UNKNOWN
+    assert "bound" in (models[0].verification.reason or "")
+    cat.mode = "wrong_shape"
+    wrong = driver_for(tmp_path, only=(BAI_PRESET,))
+    models = await wrong.discover_models(ctx)
+    assert models[0].verification.status is VerificationStatus.UNKNOWN
+
+
+async def test_a_hung_catalog_is_bounded_by_the_timeout(tmp_path):
+    cat = _default_catalog()
+    cat.mode = "slow"
+    driver = driver_for(tmp_path, only=(BAI_PRESET,), catalog_timeout_seconds=0.3)
+    started = time.monotonic()
+    models = await driver.discover_models(make_ctx(tmp_path, "ok"))
+    assert time.monotonic() - started < 5.0
+    assert models[0].verification.status is VerificationStatus.UNKNOWN
+
+
+async def test_execute_fails_before_effects_when_membership_is_lost(tmp_path):
+    cat = _default_catalog()
+    driver = driver_for(tmp_path, catalog_ttl_seconds=0.0)
+    capture = tmp_path / "capture.json"
+    events = await collect(
+        driver, make_request(), make_ctx(tmp_path, "ok", capture=capture)
+    )
+    assert terminal(events).kind == EventKind.RUN_COMPLETED
+
+    # The provider drops the model; the next run must die before task-home or
+    # process creation — a stale listing is never a standing authorization.
+    cat.mode = "missing"
+    capture2 = tmp_path / "capture2.json"
+    events2 = await collect(
+        driver,
+        make_request(run_id="run_ha_lost"),
+        make_ctx(tmp_path, "ok", capture=capture2),
+    )
+    result = terminal(events2)
+    assert result.kind == EventKind.RUN_FAILED
+    assert result.payload.code == "catalog_not_verified"
+    assert not capture2.exists(), "the CLI ran despite lost membership"
+
+
+async def test_execute_is_denied_when_the_catalog_cannot_be_verified(tmp_path):
+    cat = _default_catalog()
+    cat.mode = "unauthorized"
+    capture = tmp_path / "capture.json"
+    driver = driver_for(tmp_path)
+    events = await collect(
+        driver, make_request(), make_ctx(tmp_path, "ok", capture=capture)
+    )
+    result = terminal(events)
+    assert result.kind == EventKind.RUN_FAILED
+    assert result.payload.code == "catalog_not_verified"
+    assert SECRET_VALUE not in (result.payload.message or "")
+    assert not capture.exists()
 
 
 # ------------------------------------------------------------------- execute
 
 
 async def test_happy_path_maps_only_text_records_to_answer(tmp_path):
-    driver = HermesApiDriver(cli_command=str(make_wrapper(tmp_path)))
+    driver = driver_for(tmp_path)
     events = await collect(driver, make_request(), make_ctx(tmp_path, "ok"))
     assert answer_text(events) == "fixture-answer-text"
     assert kinds(events).count(EventKind.TOOL_STARTED) == 1
@@ -241,13 +525,13 @@ async def test_happy_path_maps_only_text_records_to_answer(tmp_path):
 async def test_result_text_is_not_reemitted_as_a_delta(tmp_path):
     # hermes result.text duplicates the streamed answer; emitting it again
     # would double the answer the caller sees.
-    driver = HermesApiDriver(cli_command=str(make_wrapper(tmp_path)))
+    driver = driver_for(tmp_path)
     events = await collect(driver, make_request(), make_ctx(tmp_path, "ok"))
     assert answer_text(events) == "fixture-answer-text"  # not doubled
 
 
 async def test_reported_usage_is_used_and_zero_usage_stays_unknown(tmp_path):
-    driver = HermesApiDriver(cli_command=str(make_wrapper(tmp_path)))
+    driver = driver_for(tmp_path)
     events = await collect(driver, make_request(), make_ctx(tmp_path, "ok"))
     result = terminal(events)
     assert result.payload.usage.provenance == UsageProvenance.REPORTED
@@ -262,7 +546,7 @@ async def test_reported_usage_is_used_and_zero_usage_stays_unknown(tmp_path):
 
 
 async def test_tool_error_marks_run_partial_not_succeeded(tmp_path):
-    driver = HermesApiDriver(cli_command=str(make_wrapper(tmp_path)))
+    driver = driver_for(tmp_path)
     events = await collect(driver, make_request(), make_ctx(tmp_path, "tool_error"))
     result = terminal(events)
     assert result.kind == EventKind.RUN_COMPLETED
@@ -270,9 +554,7 @@ async def test_tool_error_marks_run_partial_not_succeeded(tmp_path):
 
 
 async def test_reasoning_reporting_is_configured_not_observed(tmp_path):
-    driver = HermesApiDriver(
-        cli_command=str(make_wrapper(tmp_path)), reasoning="high"
-    )
+    driver = driver_for(tmp_path, reasoning="high")
     events = await collect(driver, make_request(), make_ctx(tmp_path, "ok"))
     result = terminal(events)
     assert result.kind == EventKind.RUN_COMPLETED
@@ -286,7 +568,7 @@ async def test_reasoning_reporting_is_configured_not_observed(tmp_path):
 
 async def test_unknown_preset_fails_before_spawn(tmp_path):
     capture = tmp_path / "capture.json"
-    driver = HermesApiDriver(cli_command=str(make_wrapper(tmp_path)))
+    driver = driver_for(tmp_path)
     events = await collect(
         driver, make_request(preset="evil/other-model"),
         make_ctx(tmp_path, "ok", capture=capture))
@@ -298,9 +580,7 @@ async def test_unknown_preset_fails_before_spawn(tmp_path):
 
 async def test_unsupported_reasoning_fails_before_spawn(tmp_path):
     capture = tmp_path / "capture.json"
-    driver = HermesApiDriver(
-        cli_command=str(make_wrapper(tmp_path)), reasoning="xhigh"
-    )
+    driver = driver_for(tmp_path, reasoning="xhigh")
     events = await collect(
         driver, make_request(), make_ctx(tmp_path, "ok", capture=capture))
     result = terminal(events)
@@ -313,9 +593,7 @@ async def test_unsupported_reasoning_fails_before_spawn(tmp_path):
                                  "maximum", "minimal", "ultra", "none", "xhigh"])
 async def test_internal_effort_hints_never_reach_the_cli(tmp_path, bad):
     capture = tmp_path / "capture.json"
-    driver = HermesApiDriver(
-        cli_command=str(make_wrapper(tmp_path)), reasoning=bad
-    )
+    driver = driver_for(tmp_path, reasoning=bad)
     events = await collect(
         driver, make_request(), make_ctx(tmp_path, "ok", capture=capture))
     assert terminal(events).payload.code == "unsupported_reasoning"
@@ -323,7 +601,7 @@ async def test_internal_effort_hints_never_reach_the_cli(tmp_path, bad):
 
 
 async def test_no_executor_and_no_deadline_fail_closed(tmp_path):
-    driver = HermesApiDriver(cli_command=str(make_wrapper(tmp_path)))
+    driver = driver_for(tmp_path)
     no_exec = await collect(driver, make_request(), RuntimeContext())
     assert terminal(no_exec).payload.code == "no_process_executor"
     no_deadline = await collect(
@@ -333,7 +611,7 @@ async def test_no_executor_and_no_deadline_fail_closed(tmp_path):
 
 async def test_yolo_requires_preapproved_permissions(tmp_path):
     capture = tmp_path / "capture.json"
-    driver = HermesApiDriver(cli_command=str(make_wrapper(tmp_path)))
+    driver = driver_for(tmp_path)
     events = await collect(
         driver, make_request(),
         make_ctx(tmp_path, "ok", capture=capture, permissions=False))
@@ -345,7 +623,7 @@ async def test_yolo_requires_preapproved_permissions(tmp_path):
 
 async def test_missing_permissions_service_fails_closed(tmp_path):
     capture = tmp_path / "capture.json"
-    driver = HermesApiDriver(cli_command=str(make_wrapper(tmp_path)))
+    driver = driver_for(tmp_path)
     ctx = make_ctx(tmp_path, "ok", capture=capture)
     ctx.permissions = None
     events = await collect(driver, make_request(), ctx)
@@ -358,9 +636,8 @@ async def test_missing_permissions_service_fails_closed(tmp_path):
 
 async def test_argv_pins_provider_model_reasoning_and_bounds(tmp_path):
     capture = tmp_path / "capture.json"
-    driver = HermesApiDriver(
-        cli_command=str(make_wrapper(tmp_path)), reasoning="max", max_turns=7,
-        run_budget_cap=111,
+    driver = driver_for(
+        tmp_path, reasoning="max", max_turns=7, run_budget_cap=111
     )
     events = await collect(
         driver, make_request(deadline=500), make_ctx(tmp_path, "ok", capture=capture))
@@ -384,14 +661,35 @@ async def test_argv_pins_provider_model_reasoning_and_bounds(tmp_path):
     assert SECRET_VALUE not in json.dumps(argv)
     assert data["env_seen"]["HERMES_HOME"] is True
     assert data["env_seen"]["BAI_API_KEY"] is True
+    # The unselected backend's key is scrubbed from the child environment.
+    assert data["env_seen"]["COMMANDCODE_API_KEY"] is False
     assert Path(data["hermes_home"]).is_dir()
+
+
+async def test_child_env_keeps_only_the_selected_backends_key(
+    tmp_path, monkeypatch
+):
+    """Unrelated provider keys and Lead profiles never reach the CLI child."""
+    capture = tmp_path / "capture.json"
+    monkeypatch.setenv("LEAD_SESSION_TOKEN", "lead-secret-value")
+    monkeypatch.setenv("DEVIN_CLI", "/usr/bin/devin")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-other-provider")
+    driver = driver_for(tmp_path)
+    events = await collect(
+        driver, make_request(), make_ctx(tmp_path, "ok", capture=capture)
+    )
+    assert terminal(events).kind == EventKind.RUN_COMPLETED
+    env_seen = read_capture(capture)["env_seen"]
+    assert env_seen["BAI_API_KEY"] is True
+    assert env_seen["COMMANDCODE_API_KEY"] is False
+    assert env_seen["LEAD_SESSION_TOKEN"] is False
+    assert env_seen["DEVIN_CLI"] is False
+    assert env_seen["OPENAI_API_KEY"] is False
 
 
 async def test_generated_config_is_strict_and_secret_free(tmp_path):
     capture = tmp_path / "capture.json"
-    driver = HermesApiDriver(
-        cli_command=str(make_wrapper(tmp_path)), reasoning="high"
-    )
+    driver = driver_for(tmp_path, reasoning="high")
     await collect(driver, make_request(), make_ctx(tmp_path, "ok", capture=capture))
     data = read_capture(capture)
     cfg = json.loads(data["config"])  # emitted as JSON (valid YAML subset)
@@ -401,7 +699,7 @@ async def test_generated_config_is_strict_and_secret_free(tmp_path):
     providers = cfg.get("providers") or {}
     assert set(providers) == {"bai"}
     entry = providers["bai"]
-    assert entry["base_url"] == "https://api.b.ai/v1"
+    assert entry["base_url"] == f"{_default_catalog().base_url}/v1"
     assert entry["api_mode"] == "chat_completions"
     assert entry["key_env"] == "BAI_API_KEY"
     assert "api_key" not in entry
@@ -417,7 +715,7 @@ async def test_generated_config_is_strict_and_secret_free(tmp_path):
 
 async def test_commandcode_preset_uses_builtin_profile_not_custom(tmp_path):
     capture = tmp_path / "capture.json"
-    driver = HermesApiDriver(cli_command=str(make_wrapper(tmp_path)))
+    driver = driver_for(tmp_path)
     events = await collect(
         driver, make_request(preset=CC_PRESET),
         make_ctx(tmp_path, "ok", capture=capture))
@@ -432,13 +730,18 @@ async def test_commandcode_preset_uses_builtin_profile_not_custom(tmp_path):
     providers = cfg.get("providers") or {}
     assert "commandcode" not in providers
     assert cfg["model"]["provider"] == "commandcode"
-    assert cfg["model"]["base_url"] == "https://api.commandcode.ai/provider/v1"
+    assert cfg["model"]["base_url"] == (
+        f"{_default_catalog().base_url}/provider/v1"
+    )
     assert cfg["model"]["default"] == "deepseek/deepseek-v4.1-flash"
+    # Same registered driver, but only the selected backend's key survives.
+    assert data["env_seen"]["COMMANDCODE_API_KEY"] is True
+    assert data["env_seen"]["BAI_API_KEY"] is False
 
 
 async def test_workspace_root_drives_dash_in_and_cwd(tmp_path):
     capture = tmp_path / "capture.json"
-    driver = HermesApiDriver(cli_command=str(make_wrapper(tmp_path)))
+    driver = driver_for(tmp_path)
     ctx = make_ctx(tmp_path, "ok", capture=capture)
     ws = tmp_path / "ws"
     ws.mkdir()
@@ -451,9 +754,7 @@ async def test_workspace_root_drives_dash_in_and_cwd(tmp_path):
 
 async def test_missing_workspace_falls_back_to_task_local_dir(tmp_path):
     capture = tmp_path / "capture.json"
-    driver = HermesApiDriver(
-        cli_command=str(make_wrapper(tmp_path)), state_dir=str(tmp_path / "state")
-    )
+    driver = driver_for(tmp_path, state_dir=str(tmp_path / "state"))
     events = await collect(
         driver, make_request(), make_ctx(tmp_path, "ok", capture=capture, workspace=False))
     assert terminal(events).kind == EventKind.RUN_COMPLETED
@@ -466,7 +767,7 @@ async def test_missing_workspace_falls_back_to_task_local_dir(tmp_path):
 
 async def test_model_alias_mismatch_is_rejected_before_spawn(tmp_path):
     capture = tmp_path / "capture.json"
-    driver = HermesApiDriver(cli_command=str(make_wrapper(tmp_path)))
+    driver = driver_for(tmp_path)
     events = await collect(
         driver, make_request(model_alias="bai/other-model"),
         make_ctx(tmp_path, "ok", capture=capture))
@@ -475,7 +776,7 @@ async def test_model_alias_mismatch_is_rejected_before_spawn(tmp_path):
 
 
 async def test_init_model_mismatch_fails_the_run(tmp_path):
-    driver = HermesApiDriver(cli_command=str(make_wrapper(tmp_path)))
+    driver = driver_for(tmp_path)
     events = await collect(driver, make_request(), make_ctx(tmp_path, "model_mismatch"))
     assert terminal(events).payload.code == "model_mismatch"
 
@@ -484,39 +785,37 @@ async def test_init_model_mismatch_fails_the_run(tmp_path):
 
 
 async def test_malformed_frame_is_a_protocol_error_not_success(tmp_path):
-    driver = HermesApiDriver(cli_command=str(make_wrapper(tmp_path)))
+    driver = driver_for(tmp_path)
     events = await collect(driver, make_request(), make_ctx(tmp_path, "malformed"))
     assert terminal(events).payload.code == "protocol_error"
 
 
 async def test_oversize_frame_is_rejected(tmp_path):
-    driver = HermesApiDriver(
-        cli_command=str(make_wrapper(tmp_path)), max_frame_bytes=4096
-    )
+    driver = driver_for(tmp_path, max_frame_bytes=4096)
     events = await collect(driver, make_request(), make_ctx(tmp_path, "oversize"))
     assert terminal(events).payload.code == "protocol_error"
 
 
 async def test_eof_without_result_is_never_success(tmp_path):
-    driver = HermesApiDriver(cli_command=str(make_wrapper(tmp_path)))
+    driver = driver_for(tmp_path)
     events = await collect(driver, make_request(), make_ctx(tmp_path, "no_result"))
     assert terminal(events).payload.code == "missing_result"
 
 
 async def test_frame_before_init_is_refused(tmp_path):
-    driver = HermesApiDriver(cli_command=str(make_wrapper(tmp_path)))
+    driver = driver_for(tmp_path)
     events = await collect(driver, make_request(), make_ctx(tmp_path, "no_init"))
     assert terminal(events).payload.code == "protocol_error"
 
 
 async def test_undocumented_record_type_is_refused(tmp_path):
-    driver = HermesApiDriver(cli_command=str(make_wrapper(tmp_path)))
+    driver = driver_for(tmp_path)
     events = await collect(driver, make_request(), make_ctx(tmp_path, "unknown_event"))
     assert terminal(events).payload.code == "unknown_event"
 
 
 async def test_cli_reported_error_is_failed_not_completed(tmp_path):
-    driver = HermesApiDriver(cli_command=str(make_wrapper(tmp_path)))
+    driver = driver_for(tmp_path)
     events = await collect(driver, make_request(), make_ctx(tmp_path, "error_result"))
     result = terminal(events)
     assert result.kind == EventKind.RUN_FAILED
@@ -524,13 +823,13 @@ async def test_cli_reported_error_is_failed_not_completed(tmp_path):
 
 
 async def test_nonzero_exit_code_in_result_frame_is_failed(tmp_path):
-    driver = HermesApiDriver(cli_command=str(make_wrapper(tmp_path)))
+    driver = driver_for(tmp_path)
     events = await collect(driver, make_request(), make_ctx(tmp_path, "nonzero_exit"))
     assert terminal(events).kind == EventKind.RUN_FAILED
 
 
 async def test_stderr_never_reaches_events_or_answer(tmp_path):
-    driver = HermesApiDriver(cli_command=str(make_wrapper(tmp_path)))
+    driver = driver_for(tmp_path)
     events = await collect(driver, make_request(), make_ctx(tmp_path, "stderr_noise"))
     assert answer_text(events) == "fixture-answer-text"
     serialized = json.dumps([e.model_dump(mode="json") for e in events])
@@ -546,9 +845,7 @@ async def test_stderr_never_reaches_events_or_answer(tmp_path):
 
 
 async def test_deadline_cancels_the_cli_without_claiming_success(tmp_path):
-    driver = HermesApiDriver(
-        cli_command=str(make_wrapper(tmp_path)), grace_seconds=0.5
-    )
+    driver = driver_for(tmp_path, grace_seconds=0.5)
     events = await collect(
         driver, make_request(deadline=0.6), make_ctx(tmp_path, "hang"))
     result = terminal(events)
@@ -557,9 +854,7 @@ async def test_deadline_cancels_the_cli_without_claiming_success(tmp_path):
 
 
 async def test_cancel_is_confirmed_and_reported_as_cancelled(tmp_path):
-    driver = HermesApiDriver(
-        cli_command=str(make_wrapper(tmp_path)), grace_seconds=0.5
-    )
+    driver = driver_for(tmp_path, grace_seconds=0.5)
     request = make_request(deadline=30.0)
     ctx = make_ctx(tmp_path, "hang")
     events: list = []

@@ -32,11 +32,14 @@ ever placed in argv, prompts, logs or result payloads.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import http.client
 import json
 import os
 import re
 import tempfile
 import time
+import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -92,12 +95,17 @@ MAX_TURNS_ENV = "HERMES_API_MAX_TURNS"
 RUN_BUDGET_ENV = "HERMES_API_RUN_BUDGET"
 STATE_DIR_ENV = "HERMES_API_STATE_DIR"
 EXPECTED_VERSION_ENV = "HERMES_API_EXPECTED_VERSION"
+CATALOG_TTL_ENV = "HERMES_API_CATALOG_TTL"
+CATALOG_TIMEOUT_ENV = "HERMES_API_CATALOG_TIMEOUT"
 
 DEFAULT_CLI = "hermes"
 DEFAULT_REASONING = "low"
 DEFAULT_MAX_TURNS = 40
 DEFAULT_RUN_BUDGET_CAP = 600
 VERSION_TIMEOUT_SECONDS = 10.0
+DEFAULT_CATALOG_TTL_SECONDS = 300.0
+DEFAULT_CATALOG_TIMEOUT_SECONDS = 10.0
+CATALOG_MAX_BYTES = 65536
 POLL_SECONDS = 0.25
 
 #: Permission-policy action required before ``--yolo`` is passed. The runtime
@@ -119,6 +127,42 @@ _SECRET_RE = re.compile(
 )
 _MAX_ERROR_CHARS = 240
 
+# Env names matching these are stripped from the spawned CLI's environment:
+# only the *selected* preset's key env survives. This keeps an unrelated
+# provider's key — or a Lead profile's credentials — out of a child that only
+# needs one backend. Best-effort hygiene, not a sandbox: values never appear
+# in argv (only names are unset via `env -u`).
+_SECRET_NAME_RE = re.compile(
+    r"(?i)(API[-_]?KEY|TOKEN|SECRET|PASSW|CREDENTIAL|BEARER|KEYRING|"
+    r"PRIVATE[-_]?KEY|AUTH|COOKIE|_JWT)"
+)
+_SCRUB_PREFIXES = (
+    "DEVIN_",
+    "CODEX_",
+    "HERMES_",
+    "OPENAI_",
+    "OPENROUTER_",
+    "ANTHROPIC",
+    "CLAUDE",
+    "DEEPSEEK",
+    "GEMINI",
+    "GOOGLE_API",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "MOONSHOT",
+    "KIMI",
+    "TOGETHER",
+    "GROQ",
+    "MISTRAL",
+    "XAI",
+    "QWEN",
+    "ZHIPU",
+    "BAI_",
+    "COMMANDCODE",
+    "HF_",
+    "HUGGING",
+    "COGNITION",
+)
+
 
 @dataclass(frozen=True)
 class ProviderPreset:
@@ -134,6 +178,13 @@ class ProviderPreset:
 
     ``base_path`` is the path component of ``base_url``; tests override
     ``base_url`` with a loopback origin and reuse ``base_path`` unchanged.
+
+    ``base_url_env`` names an *operator* env var that may replace the origin
+    (``{override}{base_path}`` becomes the effective ``base_url``). It exists
+    for fixture/loopback deployments — like ``HERMES_API_CLI`` it is runner-
+    process operator config, never request-derived, and it is scrubbed from
+    the child environment by the ``HERMES_`` prefix rule. Production default
+    remains the official endpoint.
     """
 
     alias: str
@@ -144,6 +195,7 @@ class ProviderPreset:
     base_path: str
     api_mode: str
     key_env: str
+    base_url_env: str | None = None
 
     @property
     def descriptor_id(self) -> str:
@@ -161,6 +213,7 @@ PRESETS: dict[str, ProviderPreset] = {
         base_path="/v1",
         api_mode="chat_completions",
         key_env="BAI_API_KEY",
+        base_url_env="HERMES_API_BAI_BASE_URL",
     ),
     "commandcode/deepseek-v4.1-flash": ProviderPreset(
         alias="commandcode/deepseek-v4.1-flash",
@@ -171,6 +224,7 @@ PRESETS: dict[str, ProviderPreset] = {
         base_path="/provider/v1",
         api_mode="chat_completions",
         key_env="COMMANDCODE_API_KEY",
+        base_url_env="HERMES_API_COMMANDCODE_BASE_URL",
     ),
 }
 
@@ -181,6 +235,14 @@ def _positive_int(raw: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return value if value > 0 else default
+
+
+def _float_seconds(raw: Any, default: float) -> float:
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0 else default
 
 
 class HermesApiDriver(BaseDriver):
@@ -196,6 +258,8 @@ class HermesApiDriver(BaseDriver):
         run_budget_cap: int | None = None,
         state_dir: str | None = None,
         expected_version: str | None = None,
+        catalog_ttl_seconds: float | None = None,
+        catalog_timeout_seconds: float | None = None,
         max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
         grace_seconds: float = DEFAULT_TERMINATION_GRACE_SECONDS,
     ) -> None:
@@ -206,6 +270,17 @@ class HermesApiDriver(BaseDriver):
             else (os.environ.get(REASONING_ENV) or DEFAULT_REASONING)
         )
         self._presets: dict[str, ProviderPreset] = dict(presets or PRESETS)
+        for alias, preset in self._presets.items():
+            override_raw = (
+                os.environ.get(preset.base_url_env)
+                if preset.base_url_env
+                else None
+            )
+            override = (override_raw or "").strip().rstrip("/")
+            if override:
+                self._presets[alias] = dataclasses.replace(
+                    preset, base_url=f"{override}{preset.base_path}"
+                )
         self._max_turns = _positive_int(
             max_turns if max_turns is not None else os.environ.get(MAX_TURNS_ENV),
             DEFAULT_MAX_TURNS,
@@ -222,10 +297,26 @@ class HermesApiDriver(BaseDriver):
             if expected_version is not None
             else os.environ.get(EXPECTED_VERSION_ENV)
         )
+        self._catalog_ttl = (
+            catalog_ttl_seconds
+            if catalog_ttl_seconds is not None
+            else _float_seconds(
+                os.environ.get(CATALOG_TTL_ENV), DEFAULT_CATALOG_TTL_SECONDS
+            )
+        )
+        self._catalog_timeout = (
+            catalog_timeout_seconds
+            if catalog_timeout_seconds is not None
+            else _float_seconds(
+                os.environ.get(CATALOG_TIMEOUT_ENV),
+                DEFAULT_CATALOG_TIMEOUT_SECONDS,
+            )
+        )
         self._max_frame_bytes = max_frame_bytes
         self._grace_seconds = grace_seconds
         self._active: dict[str, NdjsonProcessTransport] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
+        self._catalog_cache: dict[str, tuple[float, ModelDescriptor]] = {}
 
     # ------------------------------------------------------------- manifest
 
@@ -344,21 +435,191 @@ class HermesApiDriver(BaseDriver):
 
     # ------------------------------------------------------------- discovery
 
-    async def discover_models(self, ctx: RuntimeContext) -> list[ModelDescriptor]:
-        """Operator preset pins only; no authenticated catalog verification."""
-        return [
-            ModelDescriptor(
+    def _catalog_url(self, preset: ProviderPreset) -> str:
+        return f"{preset.base_url}/models"
+
+    def _fetch_catalog_ids(
+        self, preset: ProviderPreset, key: str
+    ) -> tuple[str, set[str] | None, str | None]:
+        """One bounded GET ``{base_url}/models`` with the operator key.
+
+        Synchronous ``http.client`` (stdlib) — run in a thread by the caller.
+        Returns ``(kind, ids, detail)`` where ``kind`` is one of ``ok``,
+        ``auth``, ``redirect``, ``http_error``, ``network``, ``malformed``,
+        ``oversize``. Redirects are never followed, so the credential is never
+        forwarded off-origin. ``detail`` carries only canned text + an HTTP
+        status code — never response bodies or headers, which could echo the
+        key back.
+        """
+        url = self._catalog_url(preset)
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            return "invalid_url", None, "catalog endpoint is not http(s)"
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        conn_cls = (
+            http.client.HTTPSConnection
+            if parts.scheme == "https"
+            else http.client.HTTPConnection
+        )
+        path = parts.path or "/"
+        if parts.query:
+            path = f"{path}?{parts.query}"
+        conn = conn_cls(parts.hostname, port, timeout=self._catalog_timeout)
+        try:
+            conn.request(
+                "GET",
+                path,
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Accept": "application/json",
+                },
+            )
+            resp = conn.getresponse()
+            status = resp.status
+            if status in (301, 302, 303, 307, 308):
+                resp.read(256)  # drain a little, then drop the connection
+                return "redirect", None, f"HTTP {status}"
+            if status in (401, 403):
+                resp.read(256)
+                return "auth", None, f"HTTP {status}"
+            if status != 200:
+                resp.read(256)
+                return "http_error", None, f"HTTP {status}"
+            body = resp.read(CATALOG_MAX_BYTES + 1)
+        except (OSError, http.client.HTTPException) as exc:
+            return "network", None, type(exc).__name__
+        finally:
+            conn.close()
+        if len(body) > CATALOG_MAX_BYTES:
+            return "oversize", None, (
+                f"catalog body exceeds {CATALOG_MAX_BYTES} bytes"
+            )
+        try:
+            doc = json.loads(body.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return "malformed", None, "catalog body is not valid JSON"
+        data = doc.get("data") if isinstance(doc, dict) else None
+        if not isinstance(data, list):
+            return "malformed", None, "catalog body carries no model list"
+        ids = {
+            entry["id"]
+            for entry in data
+            if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+        }
+        return "ok", ids, None
+
+    async def _catalog_descriptor(
+        self, preset: ProviderPreset
+    ) -> ModelDescriptor:
+        """Catalog membership for one preset, cached for a bounded TTL."""
+        cached = self._catalog_cache.get(preset.alias)
+        if (
+            cached is not None
+            and time.monotonic() - cached[0] < self._catalog_ttl
+        ):
+            return cached[1]
+        descriptor = await self._verify_catalog(preset)
+        self._catalog_cache[preset.alias] = (time.monotonic(), descriptor)
+        return descriptor
+
+    async def _verify_catalog(self, preset: ProviderPreset) -> ModelDescriptor:
+        """Bounded official ``GET /models`` check of the exact pinned id.
+
+        Presence in the catalog is *not* an entitlement claim: quota, billing
+        and eligibility are never inferred from it. A missing operator key, an
+        unreachable endpoint, a redirect or unreadable body are all reported
+        honestly (``unknown``); an authoritative refusal (auth rejection or a
+        parsed catalog without the exact id) is ``failed``.
+        """
+        source = f"GET {self._catalog_url(preset)}"
+        key = os.environ.get(preset.key_env)
+        if not key:
+            return ModelDescriptor(
                 model_id=preset.descriptor_id,
-                display_name=(
-                    f"{preset.model_id} via {preset.provider_name} "
-                    "(operator-pinned, unverified)"
-                ),
+                display_name=f"{preset.model_id} via {preset.provider_name}",
                 verification=Verification(
                     status=VerificationStatus.UNKNOWN,
-                    source="operator-pinned preset",
-                    reason="no authenticated catalog verification performed",
+                    source=source,
+                    reason=(
+                        f"operator env {preset.key_env} is not set; the "
+                        "provider catalog was not queried"
+                    ),
                 ),
             )
+        try:
+            kind, ids, detail = await asyncio.wait_for(
+                asyncio.to_thread(self._fetch_catalog_ids, preset, key),
+                timeout=self._catalog_timeout + 2.0,
+            )
+        except asyncio.TimeoutError:
+            kind, ids, detail = (
+                "network", None, "bounded catalog wait expired",
+            )
+        if kind == "ok" and ids is not None:
+            if preset.model_id in ids:
+                return ModelDescriptor(
+                    model_id=preset.descriptor_id,
+                    display_name=f"{preset.model_id} via {preset.provider_name}",
+                    verification=Verification(
+                        status=VerificationStatus.PASSED,
+                        source=source,
+                        reason=(
+                            f"exact model id {preset.model_id!r} present in "
+                            "the provider catalog; presence is not a quota or "
+                            f"entitlement claim; valid for "
+                            f"{self._catalog_ttl:.0f}s"
+                        ),
+                    ),
+                )
+            return ModelDescriptor(
+                model_id=preset.descriptor_id,
+                display_name=f"{preset.model_id} via {preset.provider_name}",
+                verification=Verification(
+                    status=VerificationStatus.FAILED,
+                    source=source,
+                    reason=(
+                        f"exact model id {preset.model_id!r} is not present "
+                        "in the provider catalog"
+                    ),
+                ),
+            )
+        if kind == "auth":
+            return ModelDescriptor(
+                model_id=preset.descriptor_id,
+                display_name=f"{preset.model_id} via {preset.provider_name}",
+                verification=Verification(
+                    status=VerificationStatus.FAILED,
+                    source=source,
+                    reason=(
+                        f"provider rejected the operator key ({detail})"
+                    ),
+                ),
+            )
+        reason_by_kind = {
+            "redirect": (
+                "provider redirected the catalog request; redirects are never "
+                "followed and credentials are never forwarded"
+            ),
+            "http_error": f"provider catalog returned {detail}",
+            "network": f"provider catalog could not be read ({detail})",
+            "malformed": f"provider catalog was not a usable document ({detail})",
+            "oversize": f"provider catalog exceeded its bound ({detail})",
+            "invalid_url": f"catalog endpoint is not usable ({detail})",
+        }
+        return ModelDescriptor(
+            model_id=preset.descriptor_id,
+            display_name=f"{preset.model_id} via {preset.provider_name}",
+            verification=Verification(
+                status=VerificationStatus.UNKNOWN,
+                source=source,
+                reason=reason_by_kind.get(kind, "catalog check inconclusive"),
+            ),
+        )
+
+    async def discover_models(self, ctx: RuntimeContext) -> list[ModelDescriptor]:
+        """Verify each preset's exact model id against its official catalog."""
+        return [
+            await self._catalog_descriptor(preset)
             for preset in self._presets.values()
         ]
 
@@ -425,13 +686,31 @@ class HermesApiDriver(BaseDriver):
             }
         return config
 
+    def _scrubbed_env_names(self, preset: ProviderPreset) -> list[str]:
+        """Env names stripped from the child: everything secret-shaped or
+        provider-owned except the *selected* preset's own key env."""
+        return sorted(
+            name
+            for name in os.environ
+            if name != preset.key_env
+            and (
+                _SECRET_NAME_RE.search(name)
+                or name.startswith(_SCRUB_PREFIXES)
+            )
+        )
+
     def _argv(self, preset: ProviderPreset, home: Path, query_file: Path,
             workspace: str, run_budget: int) -> list[str]:
-        # ``env`` prepends HERMES_HOME without a shell: the ProcessExecutor
-        # contract has no per-spawn env, and the child inherits the executor's
-        # operator-bound environment (which carries the provider key).
-        return [
-            "env", f"HERMES_HOME={home}",
+        # ``env -u`` unsets by name only — values never appear in argv. The
+        # HERMES_HOME assignment lands after any ``-u HERMES_HOME``, so the
+        # operator's own HERMES_HOME cannot leak through either. The child
+        # inherits the executor's operator-bound environment minus every
+        # unrelated provider/secret-shaped variable.
+        argv = ["env"]
+        for name in self._scrubbed_env_names(preset):
+            argv += ["-u", name]
+        return argv + [
+            f"HERMES_HOME={home}",
             self._cli, "chat",
             "--query-file", str(query_file),
             "--oneshot",
@@ -509,6 +788,25 @@ class HermesApiDriver(BaseDriver):
                 "yolo_not_preapproved",
                 f"task policy does not preapprove {YOLO_ACTION!r}; "
                 "refusing to spawn an unrestricted tool loop",
+            )
+            return
+
+        # Catalog gate before any effect: the pinned model id must be verified
+        # against the provider's official catalog on *this* run, not merely at
+        # discovery time — a long-lived Registry cache must never turn a stale
+        # listing into a permanent authorization. The TTL cache keeps this
+        # bounded; a lost membership or unreachable catalog fails the run
+        # before the task home or process is created.
+        descriptor = await self._catalog_descriptor(preset)
+        catalog = descriptor.verification
+        if catalog.status is not VerificationStatus.PASSED:
+            yield fail(
+                "catalog_not_verified",
+                self._redact(
+                    f"provider catalog verification for {preset.alias} is "
+                    f"{catalog.status.value}: {catalog.reason}; refusing to "
+                    "run"
+                ),
             )
             return
 
