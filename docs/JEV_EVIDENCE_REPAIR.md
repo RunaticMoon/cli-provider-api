@@ -27,10 +27,16 @@ dispatch and resolve call sites). `VerifyResult` gained one optional field
   `-c`s plus an explicit reset of every loaded dangerous key
   (`filter.*`, `diff.*`, `core.fsmonitor`, `core.hooksPath`, `alias.*`,
   `include*`/`includeIf`, credential/gpg/ssh/pager/difftool/mergetool)
-  enumerated from `git config --list -z --includes`. Model-written
-  `.gitattributes` + repo-config filter/textconv/fsmonitor/hook entries
-  therefore cannot execute during evidence; `--no-ext-diff` and
-  `--no-textconv` are also passed on the diff itself.
+  enumerated from `git config --list -z --includes`. Every enumerated
+  dangerous key is reset via safe argv (`-c key=`, no shell) regardless
+  of subsection syntax — slashes, spaces and quotes all round-trip
+  through argv; a subsection containing `=` cannot be expressed
+  unambiguously to `-c` (it would silently reset a DIFFERENT key), so
+  evidence refuses with `WorktreeError` before any content-reading git
+  invocation. Model-written `.gitattributes` + repo-config
+  filter/textconv/fsmonitor/hook entries therefore cannot execute during
+  evidence; `--no-ext-diff` and `--no-textconv` are also passed on the
+  diff itself.
 * `Worktree.git_common_dir` recorded at admission pins repository identity
   across receipt reconstruction where the caller supplies it; without it,
   consistency is still proven internally (gitdir under common dir,
@@ -53,10 +59,13 @@ dispatch and resolve call sites). `VerifyResult` gained one optional field
   the gitlink (scope view is strictly more complete — the safe direction).
 * Bounded enumeration fails closed: walk cap 200k paths, git metadata cap
   64 MiB, config enum cap 4 MiB, unparseable `name-status` stream.
-* Exclusions are exactly `.cli-provider-runner.lock` and the documented
-  verifier scratch prefix `.jev-verify/`, applied to BOTH the scope and
-  diff views (pathspec excludes) — the lock can no longer leak into the
-  persisted diff while being hidden from scope. No dist/log/cache bypasses.
+* The ONLY exclusion is the exact filename `.cli-provider-runner.lock`,
+  applied to BOTH the scope and diff views (pathspec exclude) — the lock
+  can no longer leak into the persisted diff while being hidden from
+  scope. There is NO verifier scratch prefix or directory exemption: the
+  supervisor's own scratch (private HOME/TMP, spec file, private index)
+  lives outside the bound root, so an in-tree `.jev-verify/` directory is
+  ordinary worker output like any other. No dist/log/cache bypasses.
 * `validate_prepared_worktree` additionally requires disk inventory ==
   base tree at admission: an ignored file pre-existing in the prepared
   tree is refused (it would be indistinguishable from run output later).
@@ -83,9 +92,13 @@ dispatch and resolve call sites). `VerifyResult` gained one optional field
   at an unrelated process; each signal is preceded by a fresh ancestry
   re-verification of that pid.
 * The helper reports `{leader_exit, timed_out, spawn_error, unsupported,
-  survivors}` over a dedicated inherited fd (never interleaved with child
-  output). `ok=True` requires leader exit 0, no timeout and zero
-  survivors; missing report, survivors, a killed helper or an unsupported
+  survivors, inspection_error}` over a dedicated inherited fd (never
+  interleaved with child output). `ok=True` requires leader exit 0, no
+  timeout and zero survivors; a missing or malformed report, a report
+  with no explicit survivor list, an `inspection_error` (e.g. `/proc`
+  could not be enumerated — an inspectable-but-unreadable stat is never
+  treated as 'gone'; only FileNotFoundError counts as normal
+  disappearance), actual survivors, a killed helper or an unsupported
   host all yield `ok=False` (`cleanup` = `failed`/`unsupported`).
 * Child environment is an explicit minimal allowlist: `PATH`, private
   `HOME`/`TMPDIR` (`mkdtemp` outside the worktree, 0700), `LANG`/`LC_ALL`,
@@ -143,8 +156,8 @@ untouched) on this branch:
   that microsecond window. Fail-closed survivor reporting bounds the
   consequence to evidence rejection, not a wrong signal target.
 * **Admission strictness.** Prepared trees must contain exactly the base
-  tree on disk (operator-managed exceptions: Runner lock,
-  `.jev-verify/`). Trees with legitimately pre-seeded ignored content need
+  tree on disk (single operator-managed exception: the exact Runner lock
+  filename). Trees with legitimately pre-seeded ignored content need
   operator cleanup; this is intentional fail-closed behaviour.
 * **Filter neutralization is global to evidence git.** Legitimate
   repos relying on clean/smudge filters or textconv for real content will
@@ -165,13 +178,21 @@ untouched) on this branch:
 
 ## Test evidence
 
-* `packages/kanban/tests/test_evidence_review.py` — 16 tests:
-  revalidation (5), inventory (8), bounded diff (2), plus one admission
-  fixture in `test_admission.py`.
-* `packages/kanban/tests/test_verification_review.py` — 14 tests: normal /
+* `packages/kanban/tests/test_evidence_review.py` — 21 tests:
+  revalidation (5), inventory (8), dangerous-config neutralization (4:
+  odd subsection names, include directives, clean/process filters,
+  unexpressible `=`-subsection refusal), `_run_capture` inherited-pipe
+  bound (1), bounded diff (2), plus one admission fixture in
+  `test_admission.py`.
+* `packages/kanban/tests/test_verification_review.py` — 24 tests: normal /
   nonzero / timeout / capped output / closed stdin; same-group child on
   success and timeout; setsid double-fork delayed write; pipe-holding
   child; env scrubbing (+ positive control), private HOME, unsupported-host
-  refusal; stale-identity spy + live-descendant positive control.
-* `uv run --all-packages pytest packages/kanban -q -o addopts=''
-  -W error::pytest.PytestUnraisableExceptionWarning` — 407 passed.
+  refusal; stale-identity spy + live-descendant positive control; typed
+  /proc inspection errors (5) and report-channel fail-closed handling
+  via real stub-subprocess reports (5).
+* `packages/kanban/tests/test_evidence_parent_bounds.py` — 3 parent
+  regressions: in-tree `.jev-verify/` visibility, /proc enumeration
+  error, `filter.bad/name.clean` subsection.
+* `uv run --all-packages pytest packages/kanban -q -o addopts=''` —
+  425 passed.

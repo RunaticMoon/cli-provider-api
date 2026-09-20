@@ -60,17 +60,13 @@ _BRANCH_SAFE = re.compile(r"[^A-Za-z0-9_-]")
 # The Runner's cross-process claim record lives inside the bound root; it is
 # infra bookkeeping, not card output, so it never counts as a scope change
 # and never appears in the persisted diff (scope and diff views agree).
+# This is the ONLY infrastructure exemption — one exact filename, never a
+# directory or prefix bypass: any look-alike scratch dir stays ordinary
+# evidence, and the supervisor's own HOME/TMP live outside the tree.
 _RUNNER_LOCK_NAME = ".cli-provider-runner.lock"
-
-# The only other infrastructure exemption: a verifier scratch prefix the
-# supervisor/test harness may use inside the bound root, documented in
-# docs/JEV_EVIDENCE_REPAIR.md. No broad ignore bypass for dist/log/cache —
-# those stay fully visible.
-_VERIFIER_SCRATCH_PREFIX = ".jev-verify/"
-_EVIDENCE_EXCLUDED_PATHS = frozenset({_RUNNER_LOCK_NAME, ".jev-verify"})
+_EVIDENCE_EXCLUDED_PATHS = frozenset({_RUNNER_LOCK_NAME})
 _EVIDENCE_PATHSPEC_EXCLUDES = (
     f":(exclude){_RUNNER_LOCK_NAME}",
-    ":(exclude).jev-verify",
 )
 
 _MAX_ENUM_PATHS = 200_000          # filesystem walk bound — fail closed
@@ -92,7 +88,10 @@ _DANGER_CONFIG_RE = re.compile(
     r"core\.(?:fsmonitor|hooksPath|pager|sshCommand|askpass|excludesFile|"
     r"attributesFile|untrackedCache|gitProxy|sparseCheckout))"
 )
-_CONFIG_KEY_SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*$")
+# `include.path`/`includeIf.<cond>.path` cannot be reset to an empty value
+# via `-c` — git rejects relative includes on the command line. They are
+# pointed at /dev/null instead, which loads nothing.
+_INCLUDE_PATH_RE = re.compile(r"(?i)^include\.path$|^includeif\..+\.path$")
 
 # Mirrors cli_provider_runner.execution_config (kanban cannot import the
 # Runner package — same explicit shape, validated independently).
@@ -201,7 +200,11 @@ def _run_capture(
                     "failing closed"
                 )
             ready, _, _ = select.select([fd], [], [], min(remaining, 0.5))
-            if not ready and proc.poll() is None:
+            # Never os.read on a merely-exited child: a descendant holding
+            # an inherited write end keeps the pipe open with no data and
+            # the read would block past the deadline. Only a READY fd is
+            # drained; the loop deadline bounds the wait.
+            if not ready:
                 continue
             try:
                 chunk = os.read(fd, 65536)
@@ -221,19 +224,32 @@ def _run_capture(
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             pass
-        for stream in (proc.stdout, proc.stderr):
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+        # The stderr drain may be blocked on an inherited write end a
+        # descendant still holds — teardown is bounded by the join, and
+        # the stream is only closed once its reader finished (closing a
+        # stream with an in-flight read would wait on that read).
+        err_thread.join(timeout=5)
+        if not err_thread.is_alive():
             try:
-                stream.close()
+                proc.stderr.close()
             except OSError:
                 pass
-        err_thread.join(timeout=5)
     return proc.returncode, bytes(buf), bytes(err), truncated
 
 
 def _danger_config_keys(repo: Path, env: dict,
                         base_argv: list[str]) -> list[str]:
     """Loaded config keys able to execute commands or redirect IO during
-    evidence git — enumerated so each can be explicitly reset."""
+    evidence git — enumerated so each can be explicitly reset via safe
+    ``-c key=`` argv. Any subsection syntax git itself accepts (slashes,
+    spaces, quotes…) round-trips through argv; the one exception is a
+    key containing ``=``, which ``-c`` would silently split into a
+    DIFFERENT key — that refuses evidence outright, before any
+    content-reading git invocation."""
     rc, out, _err, truncated = _run_capture(
         base_argv + ["config", "--list", "-z", "--includes"],
         env=env, cap=_CONFIG_ENUM_CAP, timeout=30,
@@ -248,8 +264,15 @@ def _danger_config_keys(repo: Path, env: dict,
         if not entry:
             continue
         key = entry.split(b"\n", 1)[0].decode("utf-8", "replace")
-        if _CONFIG_KEY_SAFE.match(key) and _DANGER_CONFIG_RE.match(key):
-            keys.add(key)
+        if not _DANGER_CONFIG_RE.match(key):
+            continue
+        if "=" in key:
+            raise WorktreeError(
+                "dangerous config key cannot be expressed as a safe -c "
+                f"override ({key[:80]!r}) — refusing evidence git before "
+                "any repository content is read"
+            )
+        keys.add(key)
     return sorted(keys)
 
 
@@ -267,7 +290,10 @@ def _safety_git_argv(repo: Path, env: dict) -> list[str]:
         "-c", "diff.external=",
     ]
     for key in _danger_config_keys(repo, env, args):
-        args += ["-c", f"{key}="]
+        if _INCLUDE_PATH_RE.match(key):
+            args += ["-c", f"{key}=/dev/null"]
+        else:
+            args += ["-c", f"{key}="]
     return args
 
 
@@ -422,7 +448,6 @@ def validate_prepared_worktree(
     disk = {
         p for p in _walk_inventory(canonical)
         if p not in _EVIDENCE_EXCLUDED_PATHS
-        and not p.startswith(_VERIFIER_SCRATCH_PREFIX)
     }
     head_paths = _list_tree_paths(canonical, base_revision, _evidence_env())
     if disk != head_paths:
@@ -735,9 +760,8 @@ def _evidence_index(repo: Path, base: str, env: dict):
     never read or written for evidence, so staged trickery plus
     assume-unchanged/skip-worktree flags cannot hide anything and
     ``add -N`` leaves no intent-to-add residue behind. ``-f`` forces intent
-    for ignored/excluded paths too; only the exact Runner lock and the
-    documented verifier scratch prefix are excluded, matching the scope
-    view."""
+    for ignored/excluded paths too; only the exact Runner lock filename is
+    excluded, matching the scope view."""
     tmpdir = tempfile.mkdtemp(prefix="jev-egit-")
     os.chmod(tmpdir, 0o700)
     index = os.path.join(tmpdir, "index")
@@ -823,9 +847,10 @@ def changed_files(wt: Worktree) -> list[str]:
     evidence index PLUS a bounded filesystem walk of the bound root, so
     ignored, info/exclude-ed, assume-unchanged and skip-worktree paths are
     all visible alongside committed, dirty, deleted and untracked changes.
-    The Runner lock and the documented verifier scratch prefix are the only
-    exclusions. Raises WorktreeError (fail closed) whenever bound-tree
-    identity, the pinned base, or enumeration cannot be trusted."""
+    The exact Runner lock filename is the only exclusion — no directory or
+    prefix exemptions. Raises WorktreeError (fail closed) whenever
+    bound-tree identity, the pinned base, or enumeration cannot be
+    trusted."""
     _revalidate_bound_tree(wt)
     env = _evidence_env()
     head = _list_tree_paths(wt.path, wt.base_revision, env)
@@ -834,9 +859,7 @@ def changed_files(wt: Worktree) -> list[str]:
         names = _diff_names(argv, ienv, wt.base_revision)
     changed = names | (disk - head) | (head - disk)
     changed -= _EVIDENCE_EXCLUDED_PATHS
-    return sorted(
-        p for p in changed if not p.startswith(_VERIFIER_SCRATCH_PREFIX)
-    )
+    return sorted(changed)
 
 
 def _scope_entry_enforceable(entry: str) -> bool:
@@ -1164,11 +1187,12 @@ def run_verification(
         rfd = -1
         for t in threads:
             t.join(timeout=10)
-        for stream in (helper.stdout, helper.stderr):
-            try:
-                stream.close()
-            except OSError:
-                pass
+        for t, stream in zip(threads, (helper.stdout, helper.stderr)):
+            if not t.is_alive():
+                try:
+                    stream.close()
+                except OSError:
+                    pass
 
         output = (out_buf + b"\n" + err_buf).decode(
             "utf-8", "replace"
@@ -1191,6 +1215,13 @@ def run_verification(
                                 "report — cleanup unconfirmed]",
                 truncated=truncated, cleanup="failed",
             )
+        if not isinstance(report, dict):
+            return VerifyResult(
+                ok=False, exit_code=None,
+                output=output + "\n[supervision incomplete: malformed "
+                                "supervisor report — cleanup unconfirmed]",
+                truncated=truncated, cleanup="failed",
+            )
         if report.get("unsupported"):
             return VerifyResult(
                 ok=False, exit_code=None,
@@ -1203,7 +1234,28 @@ def run_verification(
                 output=f"spawn failed: {report['spawn_error']}",
                 truncated=truncated, cleanup="failed",
             )
-        survivors = report.get("survivors") or []
+        if report.get("inspection_error"):
+            return VerifyResult(
+                ok=False, exit_code=report.get("leader_exit"),
+                output=output + "\n[supervision failed: descendant "
+                                "inspection could not be trusted — "
+                                f"{report['inspection_error']}]",
+                truncated=truncated, cleanup="failed",
+            )
+        survivors = report.get("survivors")
+        if not isinstance(survivors, list) or any(
+            not isinstance(p, int) for p in survivors
+        ):
+            # A report without an explicit survivor list is NO proof of
+            # cleanup — a missing/malformed field never defaults to
+            # empty-and-confirmed.
+            return VerifyResult(
+                ok=False, exit_code=report.get("leader_exit"),
+                output=output + "\n[supervision incomplete: report "
+                                "carries no survivor proof — cleanup "
+                                "unconfirmed]",
+                truncated=truncated, cleanup="failed",
+            )
         timed_out = bool(report.get("timed_out"))
         if survivors:
             return VerifyResult(

@@ -9,6 +9,8 @@ synthetic processes and scoped cleanup, never broad pkill.
 
 from __future__ import annotations
 
+import io
+import json
 import os
 import subprocess
 import sys
@@ -18,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from cli_provider_kanban import _verify_supervisor as vs
+from cli_provider_kanban import worktree as wmod
 from cli_provider_kanban.worktree import (
     changed_files,
     prepare_worktree,
@@ -299,3 +302,130 @@ class TestStaleIdentitySafety:
             except (ProcessLookupError, PermissionError):
                 pass
         assert _wait_dead(orphan)
+
+
+class TestInspectionErrors:
+    """/proc inspection failures are a typed error — never an empty
+    descendant set that would certify a clean reap."""
+
+    def test_proc_enumeration_failure_raises(self, monkeypatch):
+        def unavailable(path):
+            raise PermissionError("synthetic proc unavailable")
+        monkeypatch.setattr(vs.os, "listdir", unavailable)
+        with pytest.raises(vs.SupervisionInspectionError):
+            vs._descendants(os.getpid())
+        with pytest.raises(vs.SupervisionInspectionError):
+            vs._kill_tree(os.getpid(), 0.1, _kill=lambda *_: None)
+
+    def test_stat_vanished_returns_none(self, monkeypatch):
+        """Normal disappearance — a reaped process — is NOT an error."""
+        def gone(path, *a, **k):
+            raise FileNotFoundError(path)
+        monkeypatch.setattr(vs, "open", gone, raising=False)
+        assert vs._proc_stat(os.getpid()) is None
+
+    def test_stat_access_error_raises_not_vanishes(self, monkeypatch):
+        def denied(path, *a, **k):
+            raise PermissionError(path)
+        monkeypatch.setattr(vs, "open", denied, raising=False)
+        with pytest.raises(vs.SupervisionInspectionError):
+            vs._proc_stat(os.getpid())
+
+    def test_stat_malformed_raises(self, monkeypatch):
+        monkeypatch.setattr(
+            vs, "open",
+            lambda *a, **k: io.BytesIO(b"garbage no comm terminator"),
+            raising=False,
+        )
+        with pytest.raises(vs.SupervisionInspectionError):
+            vs._proc_stat(os.getpid())
+
+    def test_stat_live_positive(self):
+        st = vs._proc_stat(os.getpid())
+        assert st is not None and st["ppid"] > 0 and st["state"] != "Z"
+
+
+def _emit_stub(report) -> str:
+    """A stub supervisor emitting a fixed report on the inherited fd —
+    a REAL subprocess exercising the parent's report channel."""
+    payload = json.dumps(report)
+    return (
+        "import os\n"
+        f"os.write(int(os.environ['_JEV_REPORT_FD']), "
+        f"{payload!r}.encode())\n"
+    )
+
+
+def _run_stubbed(git_repo, tmp_path, monkeypatch, body: str):
+    stub = tmp_path / "stub_supervisor.py"
+    stub.write_text(body)
+    monkeypatch.setattr(wmod, "_SUPERVISOR", stub)
+    repo, wt = _wt(git_repo, tmp_path)
+    try:
+        return _run(wt, [PY, "-c", "print(1)"])
+    finally:
+        remove_worktree(wt, repo)
+
+
+class TestReportHandling:
+    """The supervisor report is the ONLY cleanup proof — a missing,
+    malformed, or inspection-failed report can never default to
+    'zero survivors, confirmed'."""
+
+    def test_inspection_error_report_fails_closed(
+        self, git_repo, tmp_path, monkeypatch
+    ):
+        res = _run_stubbed(
+            git_repo, tmp_path, monkeypatch,
+            _emit_stub({
+                "leader_exit": 0, "timed_out": False, "spawn_error": None,
+                "unsupported": None, "survivors": None, "aborted": False,
+                "inspection_error":
+                    "SupervisionInspectionError: cannot enumerate /proc",
+            }),
+        )
+        assert not res.ok and res.cleanup == "failed"
+        assert "inspection" in res.output
+
+    def test_missing_survivors_field_fails_closed(
+        self, git_repo, tmp_path, monkeypatch
+    ):
+        res = _run_stubbed(
+            git_repo, tmp_path, monkeypatch,
+            _emit_stub({"leader_exit": 0, "timed_out": False}),
+        )
+        assert not res.ok and res.cleanup == "failed"
+        assert "survivor proof" in res.output
+
+    def test_non_dict_report_fails_closed(
+        self, git_repo, tmp_path, monkeypatch
+    ):
+        res = _run_stubbed(
+            git_repo, tmp_path, monkeypatch, _emit_stub([1, 2, 3]),
+        )
+        assert not res.ok and res.cleanup == "failed"
+        assert "malformed" in res.output
+
+    def test_silent_helper_fails_closed(
+        self, git_repo, tmp_path, monkeypatch
+    ):
+        res = _run_stubbed(
+            git_repo, tmp_path, monkeypatch, "import sys\nsys.exit(0)\n",
+        )
+        assert not res.ok and res.cleanup == "failed"
+        assert "no supervisor report" in res.output
+
+    def test_confirmed_report_positive(
+        self, git_repo, tmp_path, monkeypatch
+    ):
+        """A well-formed zero-survivor report still yields ok — the new
+        checks are fail-closed, not deny-everything."""
+        res = _run_stubbed(
+            git_repo, tmp_path, monkeypatch,
+            _emit_stub({
+                "leader_exit": 0, "timed_out": False, "spawn_error": None,
+                "unsupported": None, "survivors": [], "aborted": False,
+                "inspection_error": None,
+            }),
+        )
+        assert res.ok and res.cleanup == "confirmed"

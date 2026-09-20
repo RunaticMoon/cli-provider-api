@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
 
+from cli_provider_kanban import worktree as wmod
 from cli_provider_kanban.worktree import (
     WorktreeError,
     capture_diff,
@@ -245,6 +248,103 @@ class TestCompleteInventory:
         assert _git(wt.path, "ls-files") == before_ls
         assert "untracked.txt" not in before_ls.split()
         remove_worktree(wt, repo)
+
+
+class TestDangerousConfigKeys:
+    """Model-writable repo config can hide executable config behind ANY
+    valid subsection syntax — every enumerated dangerous key is reset via
+    safe argv, or refuses evidence before content git runs. No marker may
+    ever execute."""
+
+    def test_filter_subsection_odd_names_cannot_execute(
+        self, git_repo, tmp_path
+    ):
+        repo, wt = _wt(git_repo, tmp_path, "d_cfg")
+        for i, name in enumerate(
+            ["bad/name", "bad name", 'bad"name', "bad;name", "bad$(id)x"]
+        ):
+            marker = tmp_path / f"marker-{i}"
+            _git(wt.path, "config", f"filter.{name}.clean",
+                 f"touch {marker}; cat")
+            (wt.path / ".gitattributes").write_text(
+                f"*.payload filter={name}\n"
+            )
+            (wt.path / f"f{i}.payload").write_text("sample\n")
+            changed_files(wt)
+            capture_diff(wt, 8192)
+            assert not marker.exists(), name
+        # Positive: ordinary evidence still works on this tree.
+        assert "f0.payload" in changed_files(wt)
+        remove_worktree(wt, repo)
+
+    def test_included_config_filter_cannot_execute(
+        self, git_repo, tmp_path
+    ):
+        repo, wt = _wt(git_repo, tmp_path, "d_inc")
+        marker = tmp_path / "inc-executed"
+        extra = tmp_path / "extra.cfg"
+        extra.write_text(f'[filter "viainc"]\n\tclean = touch {marker}\n')
+        _git(wt.path, "config", "include.path", str(extra))
+        (wt.path / ".gitattributes").write_text("*.payload filter=viainc\n")
+        (wt.path / "x.payload").write_text("p\n")
+        assert "x.payload" in changed_files(wt)
+        capture_diff(wt, 8192)
+        assert not marker.exists()
+        remove_worktree(wt, repo)
+
+    def test_process_filter_cannot_execute(self, git_repo, tmp_path):
+        repo, wt = _wt(git_repo, tmp_path, "d_prc")
+        marker = tmp_path / "proc-executed"
+        _git(wt.path, "config", "filter.evil.process",
+             f"touch {marker}; cat")
+        _git(wt.path, "config", "filter.evil.clean",
+             f"touch {marker}; cat")
+        (wt.path / ".gitattributes").write_text("*.payload filter=evil\n")
+        (wt.path / "x.payload").write_text("p\n")
+        changed_files(wt)
+        capture_diff(wt, 8192)
+        assert not marker.exists()
+        remove_worktree(wt, repo)
+
+    def test_unexpressible_dangerous_key_refuses_before_content(
+        self, git_repo, tmp_path
+    ):
+        """A subsection containing '=' cannot be expressed as a `-c`
+        override (it would silently reset a DIFFERENT key) — evidence
+        must refuse with WorktreeError instead of running unguarded."""
+        repo, wt = _wt(git_repo, tmp_path, "d_feq")
+        marker = tmp_path / "eq-executed"
+        common = Path(_git(wt.path, "rev-parse", "--git-common-dir"))
+        if not common.is_absolute():
+            common = wt.path / common
+        with open(common / "config", "a") as fh:
+            fh.write(f'[filter "bad=name"]\n\tclean = touch {marker}\n')
+        (wt.path / ".gitattributes").write_text("*.payload filter=bad=name\n")
+        (wt.path / "x.payload").write_text("p\n")
+        with pytest.raises(WorktreeError):
+            changed_files(wt)
+        with pytest.raises(WorktreeError):
+            capture_diff(wt, 8192)
+        assert not marker.exists()
+        remove_worktree(wt, repo)
+
+
+class TestRunCaptureBounds:
+    def test_exited_child_holding_inherited_pipe_bounded(self):
+        """A dead leader whose grandchild holds the stdout write end must
+        not turn a not-ready select into a blocking os.read — that would
+        hang past the deadline on an open-but-silent pipe."""
+        argv = [
+            sys.executable, "-c",
+            "import subprocess;subprocess.Popen(['sleep','30'])",
+        ]
+        start = time.monotonic()
+        with pytest.raises(WorktreeError):
+            wmod._run_capture(argv, env={}, cap=4096, timeout=1.5)
+        # The deadline fires at ~1.5s; the bounded stderr-drain join adds
+        # at most 5s. A blocking read would have hung ~30s on the open
+        # pipe and returned normally instead of raising.
+        assert time.monotonic() - start < 10
 
 
 class TestBoundedDiff:

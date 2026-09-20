@@ -13,7 +13,8 @@ them within a bounded reap budget.
 
 The result is a single JSON report written to an inherited fd so it can
 never be interleaved with child stdout/stderr. If the report is missing or
-descendants survive the budget, the caller must fail closed — a claimed
+malformed, descendants survive the budget, or /proc itself could not be
+inspected (``inspection_error``), the caller must fail closed — a claimed
 "verified clean" is only valid when supervision was actually confirmed.
 
 Residual limits (documented, not hidden): this is process supervision, not
@@ -42,6 +43,13 @@ _ANCESTRY_MAX_DEPTH = 64
 _REPORT_CAP = 65536
 
 
+class SupervisionInspectionError(Exception):
+    """/proc enumeration or a relevant process's stat could not be
+    inspected or parsed — supervision can NEVER treat that as 'no
+    descendants' and certify a clean reap; it is reported to the caller
+    as a failed cleanup instead."""
+
+
 def _become_subreaper() -> bool:
     """This process becomes the reaper for orphaned descendants.
 
@@ -57,15 +65,26 @@ def _become_subreaper() -> bool:
 
 def _proc_stat(pid: int) -> dict | None:
     """Parse /proc/<pid>/stat — comm may contain spaces and parens, so
-    fields are taken after the LAST ')'."""
+    fields are taken after the LAST ')'.
+
+    A vanished process (FileNotFoundError) is normal disappearance and
+    returns None. Any OTHER read failure or malformed content raises
+    SupervisionInspectionError — an inspectable-but-unreadable stat can
+    never be read as 'gone'."""
     try:
         with open(f"/proc/{pid}/stat", "rb") as fh:
             data = fh.read()
-    except OSError:
+    except FileNotFoundError:
         return None
+    except OSError as exc:
+        raise SupervisionInspectionError(
+            f"cannot inspect /proc/{pid}/stat: {type(exc).__name__}"
+        ) from exc
     rparen = data.rfind(b")")
     if rparen < 0:
-        return None
+        raise SupervisionInspectionError(
+            f"malformed /proc/{pid}/stat: no comm terminator"
+        )
     try:
         fields = data[rparen + 2:].split()
         return {
@@ -74,8 +93,10 @@ def _proc_stat(pid: int) -> dict | None:
             "pgrp": int(fields[2]),
             "session": int(fields[3]),
         }
-    except (IndexError, ValueError):
-        return None
+    except (IndexError, ValueError) as exc:
+        raise SupervisionInspectionError(
+            f"malformed /proc/{pid}/stat: {exc}"
+        ) from exc
 
 
 def _is_descendant(pid: int, root: int) -> bool:
@@ -104,13 +125,18 @@ def _is_descendant(pid: int, root: int) -> bool:
 
 
 def _descendants(root: int) -> set[int]:
-    """Live (non-zombie) pids whose ppid-ancestry reaches ``root``."""
+    """Live (non-zombie) pids whose ppid-ancestry reaches ``root``.
+
+    Failing to enumerate /proc raises SupervisionInspectionError — never
+    an empty set that would certify 'no descendants'."""
     try:
         pids = [
             int(name) for name in os.listdir("/proc") if name.isdigit()
         ]
-    except OSError:
-        return set()
+    except OSError as exc:
+        raise SupervisionInspectionError(
+            f"cannot enumerate /proc: {type(exc).__name__}"
+        ) from exc
     out = set()
     for pid in pids:
         if pid in (0, root):
@@ -127,7 +153,9 @@ def _kill_tree(root: int, budget_s: float, *, _kill=os.kill,
                _sleep=time.sleep, _now=time.monotonic) -> list[int]:
     """SIGKILL every live descendant of ``root`` until none remain or the
     budget expires. Returns the sorted pids that survived the budget
-    (empty = confirmed cleanup).
+    (empty = confirmed cleanup). Raises SupervisionInspectionError when
+    /proc cannot be enumerated or a relevant process cannot be inspected
+    — the caller reports that as a failed cleanup, never as confirmed.
 
     Identity is re-verified by a fresh ancestry walk immediately before
     each signal — no retained pid list and no process-group signal, so a
@@ -188,6 +216,7 @@ def main(argv: list[str]) -> int:
     report = {
         "leader_exit": None, "timed_out": False, "spawn_error": None,
         "unsupported": None, "survivors": [], "aborted": False,
+        "inspection_error": None,
     }
     try:
         with open(argv[1], "rb") as fh:
@@ -246,10 +275,14 @@ def main(argv: list[str]) -> int:
     report["leader_exit"] = leader.poll()
 
     _reap_children()
-    survivors = _kill_tree(os.getpid(), reap_budget)
+    try:
+        # Post-kill verification pass — only non-zombie live descendants
+        # count, and an inspection failure is reported, never certified.
+        report["survivors"] = _kill_tree(os.getpid(), reap_budget)
+    except SupervisionInspectionError as exc:
+        report["inspection_error"] = f"{type(exc).__name__}: {exc}"
+        report["survivors"] = None
     _reap_children()
-    # Post-kill verification pass — only non-zombie live descendants count.
-    report["survivors"] = survivors
     _emit(report, report_fd)
     return 0
 
