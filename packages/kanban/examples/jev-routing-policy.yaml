@@ -93,7 +93,7 @@ backends:
     kind: bai
     transport: api
     model: deepseek-v4.1-flash            # verified via /v1/models
-    preset: hermes-api/bai-deepseek-v4.1-flash
+    preset: bai/deepseek-v4.1-flash
     driver: hermes-api
     enabled: false
     requires_canary: true
@@ -114,7 +114,7 @@ backends:
     kind: commandcode
     transport: api
     model: deepseek/deepseek-v4.1-flash   # verified via public catalog
-    preset: hermes-api/cc-deepseek-v4.1-flash
+    preset: commandcode/deepseek-v4.1-flash
     driver: hermes-api
     enabled: false
     requires_canary: true

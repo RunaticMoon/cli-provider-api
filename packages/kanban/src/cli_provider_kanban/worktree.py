@@ -266,6 +266,7 @@ def validate_runner_binding(
     prepared_path: str,
     submitted_model: str,
     candidate_models: list[str] | None = None,
+    candidate_presets: list[str] | None = None,
 ) -> dict:
     """Prove the protected Runner config binds ``workspace_id`` to exactly
     the prepared worktree and permits the submitted model.
@@ -318,11 +319,16 @@ def validate_runner_binding(
             "runner binding grants unknown allowed_actions — the Runner "
             "itself would reject this config"
         )
+    # The gateway receives a logical combo, but the Runner receives one of
+    # its concrete candidates. Never widen the Runner to permit combo ids.
+    required_presets = candidate_presets if candidate_presets is not None else [submitted_model]
+    if not required_presets:
+        raise WorktreeError("route has no eligible concrete preset")
     presets = binding.get("allowed_presets")
     if presets is not None:
-        if not isinstance(presets, list) or submitted_model not in presets:
+        if not isinstance(presets, list) or any(p not in presets for p in required_presets):
             raise WorktreeError(
-                f"runner binding does not allow preset {submitted_model!r} "
+                f"runner binding does not allow required presets {required_presets!r} "
                 f"on workspace {workspace_id!r}"
             )
     models = binding.get("allowed_models")

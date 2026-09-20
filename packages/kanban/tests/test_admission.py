@@ -286,8 +286,8 @@ def test_gateway_submit_uses_route_combo(board, tmp_path, dispatch_policy):
             {"ws-alpha": {
                 "root": data["workspaces"]["ws-main"]["prepared_worktree"],
                 "allowed_actions": [],
-                "allowed_presets": ["jev.worker.code.standard"],
-                "allowed_models": None,
+                "allowed_presets": ["devin/swe-2-max"],
+                "allowed_models": ["swe-2-max"],
             }},
         )
     )

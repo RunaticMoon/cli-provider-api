@@ -386,15 +386,28 @@ def _gate_for_approval(kernel, store, policy, task, decision, spec) -> dict:
             "approval_id": approval.approval_id, "reason": decision.reason}
 
 
-def _candidate_models(policy: Policy, route, capability: str) -> list[str]:
-    """``driver:model`` descriptors of the candidates that could actually
-    serve — checked against the Runner binding's ``allowed_models`` pin."""
-    out = []
+def _candidate_bindings(policy: Policy, route, capability: str) -> list[tuple[str, str]]:
+    """Use the compiler's concrete preset/descriptor contract, not combo ids."""
+    from .compiler import CompileError, _descriptor_for, _member_eligibility, _member_model
+
+    bindings = []
     for bid in route.candidates:
         backend = policy.backend_map()[bid]
-        if backend.enabled and backend.capabilities.get(capability) is True:
-            out.append(f"{backend.driver}:{backend.model}")
-    return out
+        if _member_eligibility(backend, capability) is not None:
+            continue
+        try:
+            preset = _member_model(backend)
+        except CompileError as exc:
+            raise WorktreeError(str(exc)) from exc
+        descriptor = _descriptor_for(backend)
+        if descriptor is None:
+            raise WorktreeError("candidate has no verified Runner model descriptor")
+        bindings.append((preset, descriptor))
+    return bindings
+
+
+def _candidate_models(policy: Policy, route, capability: str) -> list[str]:
+    return [model for _, model in _candidate_bindings(policy, route, capability)]
 
 
 def _execute(kernel, store, client, control_client, policy, task, spec,
@@ -635,6 +648,11 @@ def _execute_reserved(kernel, store, client, control_client, policy, task,
                 submitted_model=model,
                 candidate_models=_candidate_models(
                     policy, route, decision.capability
+                ),
+                candidate_presets=(
+                    [preset for preset, _ in _candidate_bindings(
+                        policy, route, decision.capability
+                    )] if policy.execution.mode == "gateway" else None
                 ),
             )
         elif workspace.allow_ephemeral_worktree:
