@@ -1,27 +1,29 @@
-# Central routing policy sample for the Jev shadow classifier (Slice 1).
+# Central routing policy for the Jev kanban path (Slice 5).
 #
-# Logical routes are `role.capability.tier`; candidate order is preserved for
-# the later 9Router combo compiler — the classifier never runs fallback.
+# Jev resolves the *logical* route `role.capability.tier` only — it never
+# selects a backend or an order. The `routes` candidate lists below are the
+# policy compiler's input; the compiled 9Router combo owns fallback order.
 # `enabled: false` keeps a candidate visible-but-unavailable; a route whose
 # candidates are all unavailable classifies as `hold`.
 #
-# Truthful capability notes (2026-09-20 discovery):
-# - devin / swe-2-max: installed, `devin models list` reports cost_tier Free.
-#   Capability mapping verified for `code`/`review` text work only.
-# - bai_code: documented intent only — the BAI direct-API historical policy is
-#   NOT permitted for this integration and no binary exists on ARM64, so the
-#   candidate stays disabled. No invented model id.
-# - devin-opus-review: claude-opus-5-high is installed (High cost) but the
-#   persisted reviewer-fallback policy conflicts with the active conversation
-#   policy, so the reviewer lane stays INACTIVE pending explicit resolution.
+# Transport per the task-2444 correction:
+# - devin / antigravity -> native CLIs (transport: native)
+# - bai / commandcode   -> their official model APIs (transport: api);
+#   api effort wire values are exactly low/high/max and must be mapped.
+#
+# Verified model ids (ops/kanban-jev/ENVIRONMENT.md, 2026-09-20):
+# - devin swe-2-max (cost Free); claude-opus-5-high (cost High)
+# - bai  deepseek-v4.1-flash            @ https://api.b.ai/v1
+# - cc   deepseek/deepseek-v4.1-flash   @ https://api.commandcode.ai/provider/v1
 # - Codex: never a candidate (current Lead + FINAL fallback only).
 
 schema_version: 1
-policy_version: "2026-09-20.1"
+policy_version: "2026-09-20.2"
 
 scope:
   # External lane id; MUST NOT be a Hermes profile (validated at load).
   assignee: jev-native
+  # The dispatcher claims `ready` cards only; `todo` stays for the shadow view.
   statuses: [ready, todo]
 
 # Optional Lead-maintained spec map (task_id -> TaskSpec fields), resolved
@@ -31,11 +33,18 @@ task_map: null
 classifier:
   # Rules-first only. No LLM classifier exists in this slice.
   llm: disabled
+  confidence:
+    body: 0.95        # structured spec found in the card body
+    task_map: 0.8     # spec resolved from the operator task_map
+    no_spec: 0.5      # no contract found (always replans anyway)
+  # Below this confidence a would-be `execute` is replanned instead.
+  min_execute_confidence: 0.6
 
 limits:
   max_cards: 256
   max_body_bytes: 65536
   max_spec_bytes: 32768
+  max_prompt_bytes: 32768
 
 decomposition:
   max_depth: 3
@@ -43,7 +52,9 @@ decomposition:
   replan_cap: 2
 
 approval:
+  # hard/max are floor gates — removing them here changes nothing.
   tiers: [hard, max]
+  # Every known risk flag is a floor gate regardless of this list.
   risk_flags:
     - authn
     - authz
@@ -53,31 +64,79 @@ approval:
     - migration
     - production
     - external_effects
+  # `unknown` cost always gates — never treated as free.
+  cost_tiers: [unknown]
+  expiry_seconds: 86400
+  # Optional: reuse the existing Hermes notify subscription for the Lead
+  # approval handoff. There is no in-process callback pretending to be RPC.
+  notify: null
 
 capabilities: [code, review, research, planning]
 
 backends:
   - id: devin-swe-2-max
     kind: devin
+    transport: native
     model: swe-2-max          # verified via `devin models list` (cost Free)
+    preset: devin/swe-2-max   # wrapper preset alias
+    driver: devin
     enabled: true
     cost_tier: free
+    # devin has no effort flag: 'auto' maps to null implicitly; every other
+    # hint would need an explicit entry here (none are verified).
     capabilities:
       code: true
       review: true
       research: false
       planning: false
-  - id: bai-code
-    kind: bai_code
+  - id: bai-flash
+    kind: bai
+    transport: api
+    model: deepseek-v4.1-flash            # verified via /v1/models
+    preset: hermes-api/bai-deepseek-v4.1-flash
+    driver: hermes-api
     enabled: false
+    requires_canary: true
+    cost_tier: unknown                    # unknown cost gates approval
     disabled_reason: >-
-      BAI direct-API historical policy is not permitted for this integration;
-      the server binary is absent and Linux ARM64 is unsupported. Documented
-      intent only — no invented model id.
-    capabilities: {}
+      Official B.AI API path authorized by correction 2444; kept disabled
+      until a real canary proves the wired path. Verified model id
+      deepseek-v4.1-flash at https://api.b.ai/v1 (read-only catalog check).
+    effort_map:                           # api wire values: low/high/max only
+      auto: low
+      economy: low
+      balanced: high
+      thorough: high
+      maximum: max
+    capabilities:
+      code: true
+  - id: commandcode-flash
+    kind: commandcode
+    transport: api
+    model: deepseek/deepseek-v4.1-flash   # verified via public catalog
+    preset: hermes-api/cc-deepseek-v4.1-flash
+    driver: hermes-api
+    enabled: false
+    requires_canary: true
+    cost_tier: unknown
+    disabled_reason: >-
+      Official CommandCode provider API authorized by correction 2444;
+      disabled pending canary. Verified model id deepseek/deepseek-v4.1-flash
+      at https://api.commandcode.ai/provider/v1.
+    effort_map:
+      auto: low
+      economy: low
+      balanced: high
+      thorough: high
+      maximum: max
+    capabilities:
+      code: true
   - id: devin-opus-review
     kind: devin
+    transport: native
     model: claude-opus-5-high
+    preset: devin/claude-opus-5-high
+    driver: devin
     enabled: false
     cost_tier: high
     disabled_reason: >-
@@ -88,22 +147,71 @@ backends:
       review: true
 
 routes:
-  worker.code.free:
-    candidates: [devin-swe-2-max]
+  # Only routes actually used. Candidate order here is the compiler's input —
+  # easy: BAI -> Devin, standard: Devin -> BAI. Jev emits the route name only.
   worker.code.easy:
-    candidates: [devin-swe-2-max]
+    candidates: [bai-flash, devin-swe-2-max]
   worker.code.standard:
-    # Order matters: the later compiler reads candidates in this order.
-    candidates: [devin-swe-2-max, bai-code]
-  worker.code.hard:
-    candidates: [devin-swe-2-max]
-  worker.code.max:
-    candidates: [devin-swe-2-max]
+    candidates: [devin-swe-2-max, bai-flash]
   reviewer.review.standard:
     # All candidates disabled -> classify `hold` until the reviewer-fallback
     # policy conflict is resolved.
     candidates: [devin-opus-review]
 
 workspaces:
+  # Trusted workspace ids. `repo` is the approved git repository, `worktree_root`
+  # holds per-card worktrees, `wrapper_workspace_id` is the pre-registered
+  # wrapper workspace the run binds to (request-path workspace selection is
+  # never permitted).
   ws-main:
-    path: /home/ubuntu/development/cli-provider-api-jev
+    repo: /home/ubuntu/development/cli-provider-api-jev
+    worktree_root: /home/ubuntu/development/cli-provider-api-jev/.worktrees
+    wrapper_workspace_id: ws-main
+
+# How the dispatcher reaches the installed Hermes kernel. Defaults:
+# HERMES_PYTHON / <repo>/venv/bin/python and HERMES_AGENT_DIR / ~/.hermes/hermes-agent.
+hermes:
+  python: null
+  repo: null
+
+dispatch:
+  claim_ttl_seconds: 900
+  heartbeat_seconds: 60
+  http_timeout_seconds: 120
+  workspace_concurrency: 1     # one in-flight reservation per workspace
+  max_cards_per_tick: 4
+  send_execution_metadata: true
+
+# Where the dispatcher submits the single model request. `direct` posts to the
+# existing wrapper /v1/chat/completions with a fixed preset alias; `gateway`
+# posts to a 9Router base URL with model = compiled combo name (ordering lives
+# in the gateway). credential_file is read at call time — never argv.
+execution:
+  mode: direct
+  base_url: http://127.0.0.1:8080
+  model: devin/swe-2-max
+  credential_file: null
+
+# 9Router compile targets. `disposable` loopback targets only in this slice;
+# `production` is refused. assume_core_guard attests the shared
+# no-post-dispatch-retry guard is integrated — without it mutation combos are
+# compiled non-operational.
+gateway:
+  wrapper_base_url: http://127.0.0.1:8080
+  node_prefix: jevwrap
+  targets: []
+  assume_core_guard: false
+
+# MVP local operator identities allowed to run control operations. This is NOT
+# Telegram auth — a bare --actor string grants nothing by itself.
+control:
+  operators: []
+
+verification:
+  # basename -> absolute executable path; spec argv[0] must be listed here.
+  executables:
+    uv: /home/ubuntu/.local/bin/uv
+    pytest: /home/ubuntu/development/cli-provider-api-jev/.venv/bin/pytest
+  timeout_seconds: 600
+  max_output_bytes: 65536
+  max_diff_bytes: 262144

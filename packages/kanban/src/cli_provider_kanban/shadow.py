@@ -19,9 +19,9 @@ import yaml
 
 from .board import card_fingerprint, list_scope_tasks, open_readonly_board
 from .cache import DecisionCache
-from .classifier import classify
+from .classifier import _WORK_ROLE_CAPABILITY, classify
 from .errors import ShadowError
-from .models import JevDecision, RecommendedAction
+from .models import JevDecision, RecommendedAction, Role
 from .policy import Policy, load_policy
 from .spec import resolve_spec
 
@@ -64,10 +64,13 @@ def _write_json(path: Path, payload: dict) -> None:
 
 
 def _conflict_decision(task, spec, policy: Policy) -> JevDecision:
+    role = spec.role
+    if role is None and spec.work is not None:
+        role = _WORK_ROLE_CAPABILITY[spec.work.kind][0]
     return JevDecision(
         task_id=task.id,
         task_revision=spec.task_revision,
-        role=spec.role,
+        role=role or Role.WORKER,
         capability=spec.capability,
         tier=spec.tier,
         effort_hint=spec.effort_hint,
@@ -81,7 +84,6 @@ def _conflict_decision(task, spec, policy: Policy) -> JevDecision:
             "spec with a new revision"
         ),
         policy_version=policy.policy_version,
-        candidates=[],
     )
 
 

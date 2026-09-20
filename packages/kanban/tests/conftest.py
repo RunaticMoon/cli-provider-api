@@ -136,7 +136,13 @@ def insert_task(
 
 
 def policy_dict(**overrides) -> dict:
-    """A valid central routing policy (standard worker -> devin swe-2-max)."""
+    """A valid central routing policy (standard worker -> devin swe-2-max).
+
+    Backend set mirrors the verified ops/ENVIRONMENT facts: devin swe-2-max
+    (native, free), bai-flash on the official B.AI API (api transport,
+    disabled pending canary, unknown cost), commandcode on its official API
+    (api transport, declared but unrouted), and the disabled opus reviewer.
+    """
     data: dict = {
         "schema_version": 1,
         "policy_version": "2026-09-20.1",
@@ -155,12 +161,17 @@ def policy_dict(**overrides) -> dict:
                 "authn", "authz", "security", "billing", "destruction",
                 "migration", "production", "external_effects",
             ],
+            "cost_tiers": ["unknown"],
+            "expiry_seconds": 3600,
         },
         "backends": [
             {
                 "id": "devin-swe-2-max",
                 "kind": "devin",
+                "transport": "native",
                 "model": "swe-2-max",
+                "preset": "devin/swe-2-max",
+                "driver": "devin",
                 "enabled": True,
                 "cost_tier": "free",
                 "capabilities": {
@@ -169,20 +180,55 @@ def policy_dict(**overrides) -> dict:
                 },
             },
             {
-                "id": "bai-code",
-                "kind": "bai_code",
-                "model": None,
+                "id": "bai-flash",
+                "kind": "bai",
+                "transport": "api",
+                "model": "deepseek-v4.1-flash",
+                "preset": "hermes-api/bai-deepseek-v4.1-flash",
+                "driver": "hermes-api",
                 "enabled": False,
+                "requires_canary": True,
+                "cost_tier": "unknown",
                 "disabled_reason": (
-                    "BAI direct-API historical policy is not permitted; "
-                    "server binary absent on this host (ARM64 unsupported)"
+                    "B.AI official API authorized by correction 2444; kept "
+                    "disabled until a real canary proves the wired path. "
+                    "Verified model id deepseek-v4.1-flash at "
+                    "https://api.b.ai/v1."
                 ),
-                "capabilities": {"code": False},
+                "effort_map": {
+                    "auto": "low", "economy": "low", "balanced": "high",
+                    "thorough": "high", "maximum": "max",
+                },
+                "capabilities": {"code": True},
+            },
+            {
+                "id": "commandcode-flash",
+                "kind": "commandcode",
+                "transport": "api",
+                "model": "deepseek/deepseek-v4.1-flash",
+                "preset": "hermes-api/cc-deepseek-v4.1-flash",
+                "driver": "hermes-api",
+                "enabled": False,
+                "requires_canary": True,
+                "cost_tier": "unknown",
+                "disabled_reason": (
+                    "CommandCode official provider API authorized by "
+                    "correction 2444; disabled pending canary. Verified model "
+                    "id deepseek/deepseek-v4.1-flash."
+                ),
+                "effort_map": {
+                    "auto": "low", "economy": "low", "balanced": "high",
+                    "thorough": "high", "maximum": "max",
+                },
+                "capabilities": {"code": True},
             },
             {
                 "id": "devin-opus-review",
                 "kind": "devin",
+                "transport": "native",
                 "model": "claude-opus-5-high",
+                "preset": "devin/claude-opus-5-high",
+                "driver": "devin",
                 "enabled": False,
                 "cost_tier": "high",
                 "disabled_reason": (
@@ -193,19 +239,27 @@ def policy_dict(**overrides) -> dict:
             },
         ],
         "routes": {
-            "worker.code.free": {"candidates": ["devin-swe-2-max"]},
-            "worker.code.easy": {"candidates": ["devin-swe-2-max"]},
-            "worker.code.standard": {
-                "candidates": ["devin-swe-2-max", "bai-code"],
+            # Only routes actually used. easy orders BAI->Devin, standard
+            # Devin->BAI; order is the compiler's input, never Jev's output.
+            "worker.code.easy": {
+                "candidates": ["bai-flash", "devin-swe-2-max"],
             },
-            "worker.code.hard": {"candidates": ["devin-swe-2-max"]},
-            "worker.code.max": {"candidates": ["devin-swe-2-max"]},
+            "worker.code.standard": {
+                "candidates": ["devin-swe-2-max", "bai-flash"],
+            },
             "reviewer.review.standard": {
                 "candidates": ["devin-opus-review"],
             },
         },
-        "workspaces": {"ws-main": {"path": "/nonexistent-but-trusted"}},
+        "workspaces": {
+            "ws-main": {
+                "repo": "/nonexistent-but-trusted",
+                "worktree_root": "/nonexistent-but-trusted/.worktrees",
+                "wrapper_workspace_id": "ws-alpha",
+            },
+        },
         "task_map": None,
+        "control": {"operators": ["op-test"]},
     }
     data.update(overrides)
     return data
@@ -302,3 +356,259 @@ def run_hermes(tmp_path: Path, script: str, *, timeout: int = 120) -> subprocess
 @pytest.fixture
 def board_db(tmp_path: Path) -> Path:
     return make_board_db(tmp_path / "kanban.db")
+
+
+# --- Dispatch-path fixtures ---------------------------------------------------
+
+
+def make_git_repo(path: Path) -> tuple[Path, str]:
+    """A real git repo with one commit; returns (repo_path, base_commit)."""
+    import subprocess
+
+    path.mkdir(parents=True, exist_ok=True)
+    env = dict(
+        os.environ,
+        GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+        GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t",
+    )
+    for argv in (
+        ["git", "init", "-q"],
+        ["git", "add", "-A"],
+    ):
+        subprocess.run(argv, cwd=path, env=env, check=True, capture_output=True)
+    (path / "seed.txt").write_text("seed\n")
+    subprocess.run(["git", "add", "-A"], cwd=path, env=env, check=True,
+                   capture_output=True)
+    subprocess.run(["git", "commit", "-qm", "seed"], cwd=path, env=env,
+                   check=True, capture_output=True)
+    rev = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=path, env=env, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    return path, rev
+
+
+class FakeWrapper:
+    """RECORDING FAKE — mock-only stand-in for the wrapper client.
+
+    Implements the WrapperClient call surface (submit_chat/get_run/
+    cancel_run/get_artifact) with canned run views. Used to exercise the
+    dispatcher's contract handling without any HTTP. Never asserted as proof
+    of real wrapper behaviour.
+    """
+
+    def __init__(self, *, status: str = "completed", runs: dict | None = None):
+        self.status = status
+        self.calls: list[dict] = []
+        self.cancelled: list[str] = []
+        self._runs = runs or {}
+        self._counter = 0
+
+    def submit_chat(self, *, model, task_id, workspace_id, messages,
+                    execution=None):
+        from cli_provider_kanban.wrapper_client import SubmitOutcome
+
+        self.calls.append({
+            "model": model, "task_id": task_id, "workspace_id": workspace_id,
+            "messages": messages, "execution": execution,
+        })
+        self._counter += 1
+        run_id = f"run_{self._counter:04d}"
+        run = {
+            "run_id": run_id,
+            "task_id": task_id,
+            "attempt_id": f"att_{self._counter:04d}",
+            "status": self.status,
+            "workspace_id": workspace_id,
+            "preset": model,
+            "outcome": "completed" if self.status == "completed" else self.status,
+            "summary": "fake completion" if self.status == "completed" else None,
+            "artifacts": [],
+            "detail": None,
+            "cached": False,
+        }
+        self._runs[run_id] = run
+        return SubmitOutcome(
+            status=self.status, run=run, cached=False,
+            content=run["summary"] or "",
+        )
+
+    def get_run(self, run_id):
+        return self._runs.get(run_id)
+
+    def cancel_run(self, run_id):
+        self.cancelled.append(run_id)
+        if run_id in self._runs:
+            self._runs[run_id]["status"] = "cancelled"
+        return {"run_id": run_id, "status": "cancelled",
+                "requested": True, "confirmed": True, "detail": "fake"}
+
+    def get_artifact(self, artifact_id):
+        return b"fake-artifact"
+
+
+@pytest.fixture
+def git_repo(tmp_path):
+    repo, rev = make_git_repo(tmp_path / "repo")
+    return repo, rev
+
+
+class StubWrapperServer:
+    """A REAL loopback HTTP server (stdlib) standing in for the wrapper.
+
+    Records every request and serves canned run views — the tests exercise
+    the real ``WrapperClient`` over real HTTP; only the wrapper *process* is
+    stubbed.
+    """
+
+    def __init__(self):
+        import http.server
+        import threading
+
+        server = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):  # quiet
+                pass
+
+            def _record(self, body=None):
+                server.requests.append({
+                    "method": self.command, "path": self.path,
+                    "headers": dict(self.headers), "body": body,
+                })
+
+            def _send(self, code, obj, headers=None):
+                raw = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                for k, v in (headers or {}).items():
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length) or b"{}")
+                self._record(body)
+                if self.path == "/v1/chat/completions":
+                    server.submit_count += 1
+                    task_id = (body.get("metadata") or {}).get("task_id")
+                    if server.reuse_run and task_id in server.by_task:
+                        self._send(200, server.by_task[task_id][0],
+                                   {"X-Run-Cached": "true"})
+                        return
+                    if server.submit_status_override is not None:
+                        self._send(*server.submit_status_override)
+                        return
+                    run_id = f"run_{server.submit_count:04d}"
+                    run = {
+                        "run_id": run_id,
+                        "task_id": task_id,
+                        "attempt_id": f"att_{server.submit_count:04d}",
+                        "status": server.run_status,
+                        "workspace_id": (body.get("metadata") or {})
+                        .get("workspace_id"),
+                        "preset": body.get("model"),
+                        "outcome": server.run_status,
+                        "summary": "stub done",
+                        "artifacts": [],
+                        "detail": None,
+                    }
+                    resp = {
+                        "id": "chatcmpl-stub",
+                        "choices": [{"message": {"content": "stub done"}}],
+                        "run": run,
+                    }
+                    server.runs[run_id] = run
+                    server.by_task[task_id] = (resp, run_id)
+                    self._send(200, resp)
+                    return
+                if self.path.endswith("/cancel"):
+                    run_id = self.path.split("/")[-2]
+                    run = server.runs.get(run_id)
+                    if run is None:
+                        self._send(404, {"error": {"message": "not found"}})
+                        return
+                    run["status"] = "cancelled"
+                    self._send(200, {"run_id": run_id, "status": "cancelled",
+                                     "requested": True, "confirmed": True,
+                                     "detail": "stub"})
+                    return
+                self._send(404, {"error": {"message": "no stub route"}})
+
+            def do_GET(self):
+                self._record()
+                if self.path.startswith("/api/v1/runs/"):
+                    run_id = self.path.rsplit("/", 1)[-1]
+                    run = server.runs.get(run_id)
+                    if run is None:
+                        self._send(404, {"error": {"message": "not found"}})
+                    else:
+                        self._send(200, run)
+                    return
+                if self.path.startswith("/api/v1/artifacts/"):
+                    raw = b"artifact-bytes"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
+                self._send(404, {"error": {"message": "no stub route"}})
+
+        self.requests: list[dict] = []
+        self.runs: dict = {}
+        self.by_task: dict = {}
+        self.submit_count = 0
+        self.run_status = "completed"
+        self.reuse_run = False
+        self.submit_status_override = None
+        self._httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self._httpd.server_address[1]
+        self.base_url = f"http://127.0.0.1:{self.port}"
+        self._thread = threading.Thread(target=self._httpd.serve_forever,
+                                        daemon=True)
+        self._thread.start()
+
+    def close(self):
+        self._httpd.shutdown()
+        self._httpd.server_close()
+        self._thread.join(timeout=5)
+
+
+@pytest.fixture
+def stub_wrapper():
+    server = StubWrapperServer()
+    yield server
+    server.close()
+
+
+@pytest.fixture
+def dispatch_policy(tmp_path, git_repo):
+    """Policy wired at the real temp repo + a fake execution target."""
+    repo, rev = git_repo
+    data = policy_dict()
+    data["workspaces"] = {
+        "ws-main": {
+            "repo": str(repo),
+            "worktree_root": str(tmp_path / "worktrees"),
+            "wrapper_workspace_id": "ws-alpha",
+        },
+    }
+    data["execution"] = {
+        "mode": "direct",
+        "base_url": "http://127.0.0.1:9",  # never contacted (fake client)
+        "model": "devin/swe-2-max",
+    }
+    data["verification"] = {
+        "executables": {
+            "true": "/usr/bin/true",
+            "false": "/usr/bin/false",
+            "touch": "/usr/bin/touch",
+            "echo": "/usr/bin/echo",
+        },
+        "timeout_seconds": 30,
+        "max_output_bytes": 8192,
+        "max_diff_bytes": 65536,
+    }
+    data["control"] = {"operators": ["op-test"]}
+    return data, rev

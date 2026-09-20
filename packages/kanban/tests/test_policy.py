@@ -96,9 +96,17 @@ def test_duplicate_backend_id_rejected(tmp_path):
         load_policy(write_policy(tmp_path, data))
 
 
-def test_workspace_path_must_be_absolute(tmp_path):
+@pytest.mark.parametrize("key", ["repo", "worktree_root"])
+def test_workspace_roots_must_be_absolute(tmp_path, key):
     data = policy_dict()
-    data["workspaces"] = {"ws-main": {"path": "relative/dir"}}
+    data["workspaces"] = {
+        "ws-main": {
+            "repo": "/abs/repo",
+            "worktree_root": "/abs/wt",
+            "wrapper_workspace_id": "ws-alpha",
+            key: "relative/dir",
+        }
+    }
     with pytest.raises(ValidationError):
         load_policy(write_policy(tmp_path, data))
 
@@ -112,9 +120,9 @@ def test_scope_status_must_be_real_kanban_status(tmp_path):
 
 def test_candidate_order_preserved_and_disabled_filtered(tmp_path):
     policy = load_policy(write_policy(tmp_path))
-    # worker.code.standard lists [devin-swe-2-max, bai-code]; bai is disabled.
+    # worker.code.standard lists [devin-swe-2-max, bai-flash]; bai is disabled.
     route = policy.routes[route_key("worker", "code", "standard")]
-    assert route.candidates == ["devin-swe-2-max", "bai-code"]
+    assert route.candidates == ["devin-swe-2-max", "bai-flash"]
     available = available_candidates(policy, route, "code")
     assert [b.id for b in available] == ["devin-swe-2-max"]
 
@@ -166,3 +174,142 @@ def test_yaml_load(tmp_path):
     path = tmp_path / "p.yaml"
     path.write_text(yaml.safe_dump(policy_dict()), encoding="utf-8")
     assert isinstance(load_policy(path), Policy)
+
+
+# --- Backend transport / effort maps ----------------------------------------
+
+
+def test_api_backends_declared_with_api_transport(tmp_path):
+    policy = load_policy(write_policy(tmp_path))
+    by_id = {b.id: b for b in policy.backends}
+    assert by_id["bai-flash"].kind == "bai"
+    assert by_id["bai-flash"].transport == "api"
+    assert by_id["commandcode-flash"].transport == "api"
+    assert by_id["devin-swe-2-max"].transport == "native"
+    # Model ids are the verified ops values, not invented.
+    assert by_id["bai-flash"].model == "deepseek-v4.1-flash"
+    assert by_id["commandcode-flash"].model == "deepseek/deepseek-v4.1-flash"
+
+
+def test_transport_must_match_kind(tmp_path):
+    data = policy_dict()
+    data["backends"][0]["transport"] = "api"  # devin is native-only
+    with pytest.raises(ValidationError, match="transport"):
+        load_policy(write_policy(tmp_path, data))
+
+    data = policy_dict()
+    data["backends"][1]["transport"] = "native"  # bai is api-only
+    with pytest.raises(ValidationError, match="transport"):
+        load_policy(write_policy(tmp_path, data))
+
+
+def test_api_backend_requires_preset(tmp_path):
+    data = policy_dict()
+    data["backends"][1]["preset"] = None
+    with pytest.raises(ValidationError, match="preset"):
+        load_policy(write_policy(tmp_path, data))
+
+
+def test_native_backend_rejects_api_only_effort(tmp_path):
+    data = policy_dict()
+    data["backends"][0]["effort_map"] = {"auto": "high"}  # devin wire values
+    with pytest.raises(ValidationError, match="effort"):
+        load_policy(write_policy(tmp_path, data))
+
+
+def test_api_backend_rejects_native_effort_wire(tmp_path):
+    data = policy_dict()
+    data["backends"][1]["effort_map"] = {"auto": "swe-2-fast"}
+    with pytest.raises(ValidationError, match="effort"):
+        load_policy(write_policy(tmp_path, data))
+
+
+def test_effort_map_rejects_unknown_hint(tmp_path):
+    data = policy_dict()
+    data["backends"][0]["effort_map"] = {"turbo": "swe-2-fast"}
+    with pytest.raises(ValidationError, match="effort"):
+        load_policy(write_policy(tmp_path, data))
+
+
+def test_resolve_effort_devin_auto_maps_null(tmp_path):
+    from cli_provider_kanban.models import EffortHint
+    from cli_provider_kanban.policy import resolve_effort
+
+    policy = load_policy(write_policy(tmp_path))
+    route = policy.routes["worker.code.standard"]
+    # bai-flash is disabled -> skipped; devin auto maps to no-flag null.
+    assert resolve_effort(policy, route, "code", EffortHint.AUTO) == {
+        "devin-swe-2-max": None
+    }
+
+
+def test_resolve_effort_api_maps_declared_values(tmp_path):
+    from cli_provider_kanban.models import EffortHint
+    from cli_provider_kanban.policy import resolve_effort
+
+    data = policy_dict()
+    data["backends"][1]["enabled"] = True
+    data["routes"]["worker.code.max"] = {"candidates": ["bai-flash"]}
+    policy = load_policy(write_policy(tmp_path, data))
+    resolved = resolve_effort(
+        policy, policy.routes["worker.code.standard"], "code", EffortHint.AUTO
+    )
+    assert resolved == {"devin-swe-2-max": None, "bai-flash": "low"}
+    resolved = resolve_effort(
+        policy, policy.routes["worker.code.max"], "code", EffortHint.MAXIMUM
+    )
+    assert resolved == {"bai-flash": "max"}
+
+
+def test_resolve_effort_unsupported_hint_raises(tmp_path):
+    from cli_provider_kanban.models import EffortHint
+    from cli_provider_kanban.policy import EffortUnsupported, resolve_effort
+
+    policy = load_policy(write_policy(tmp_path))
+    route = policy.routes["worker.code.standard"]
+    # devin maps 'auto' implicitly; 'economy' has no verified mapping.
+    with pytest.raises(EffortUnsupported):
+        resolve_effort(policy, route, "code", EffortHint.ECONOMY)
+
+
+def test_api_backend_with_empty_effort_map_rejects_any_hint(tmp_path):
+    from cli_provider_kanban.models import EffortHint
+    from cli_provider_kanban.policy import EffortUnsupported, resolve_effort
+
+    data = policy_dict()
+    data["backends"][1]["enabled"] = True
+    data["backends"][1]["effort_map"] = {}
+    policy = load_policy(write_policy(tmp_path, data))
+    # easy route orders bai-flash first; an api backend with no mapping must
+    # fail before claim rather than guess a wire value.
+    with pytest.raises(EffortUnsupported):
+        resolve_effort(
+            policy, policy.routes["worker.code.easy"], "code", EffortHint.AUTO
+        )
+
+
+def test_backend_kind_rejects_unknown(tmp_path):
+    data = policy_dict()
+    data["backends"][0]["kind"] = "openrouter"
+    with pytest.raises(ValidationError):
+        load_policy(write_policy(tmp_path, data))
+
+
+def test_workspace_wrapper_id_pattern(tmp_path):
+    data = policy_dict()
+    data["workspaces"]["ws-main"]["wrapper_workspace_id"] = "bad id!"
+    with pytest.raises(ValidationError):
+        load_policy(write_policy(tmp_path, data))
+
+
+def test_policy_fingerprint_stable(tmp_path):
+    from cli_provider_kanban.policy import policy_fingerprint
+
+    policy = load_policy(write_policy(tmp_path))
+    fp = policy_fingerprint(policy)
+    assert fp.startswith("sha256:")
+    assert fp == policy_fingerprint(policy)
+    changed = policy_dict()
+    changed["policy_version"] = "2026-09-21.1"
+    other = load_policy(write_policy(tmp_path, changed, name="other.yaml"))
+    assert policy_fingerprint(other) != fp

@@ -7,6 +7,7 @@ import pytest
 from cli_provider_kanban.board import BoardTask
 from cli_provider_kanban.classifier import classify
 from cli_provider_kanban.policy import load_policy
+
 from cli_provider_kanban.spec import resolve_spec
 
 from conftest import policy_dict, spec_body, spec_dict, write_policy
@@ -42,14 +43,32 @@ def decide(policy, task, task_map=None):
     return classify(task, resolve_spec(task, task_map), policy)
 
 
+def _spec_with_work(**work_overrides):
+    """A spec that carries only the structured work block (no hints)."""
+    work = {"kind": "implement", "design": "ready", "scope": "medium"}
+    work.update(work_overrides)
+    spec = spec_dict()
+    for key in ("role", "capability", "tier"):
+        del spec[key]
+    spec["work"] = work
+    return spec
+
+
 def test_clean_worker_card_executes(policy):
     d = decide(policy, task_row(body=spec_body()))
     assert d.recommended_action.value == "execute"
     assert d.route == "worker.code.standard"
-    assert d.candidates == ["devin-swe-2-max"]
     assert d.task_revision == "1"
     assert d.policy_version == "2026-09-20.1"
     assert 0.0 <= d.confidence <= 1.0
+
+
+def test_decision_is_route_only_no_candidates(policy):
+    # JevDecision must never select a backend or order — that is the policy
+    # compiler's and 9Router's job.
+    d = decide(policy, task_row(body=spec_body()))
+    assert "candidates" not in d.model_dump(mode="json")
+    assert d.route == "worker.code.standard"
 
 
 def test_missing_spec_replans(policy):
@@ -85,10 +104,72 @@ def test_each_approval_risk_flag(policy, flag):
     ("free", "execute"), ("easy", "execute"), ("standard", "execute"),
     ("hard", "needs_approval"), ("max", "needs_approval"),
 ])
-def test_tier_gating(policy, tier, action):
+def test_tier_gating(tmp_path, tier, action):
+    data = policy_dict()
+    for t in ("free", "hard", "max"):
+        data["routes"][f"worker.code.{t}"] = {"candidates": ["devin-swe-2-max"]}
+    policy = load_policy(write_policy(tmp_path, data))
     d = decide(policy, task_row(body=spec_body(spec_dict(tier=tier))))
     assert d.recommended_action.value == action
     assert d.tier.value == tier
+
+
+def test_hard_and_max_are_floor_gates_even_when_list_omits(tmp_path):
+    # Operator emptied approval.tiers — hard/max must still gate.
+    data = policy_dict()
+    data["approval"]["tiers"] = []
+    for t in ("hard", "max"):
+        data["routes"][f"worker.code.{t}"] = {"candidates": ["devin-swe-2-max"]}
+    policy = load_policy(write_policy(tmp_path, data))
+    for tier in ("hard", "max"):
+        d = decide(policy, task_row(body=spec_body(spec_dict(tier=tier))))
+        assert d.recommended_action.value == "needs_approval", tier
+
+
+def test_risk_flags_are_floor_gates_even_when_list_omits(tmp_path):
+    data = policy_dict()
+    data["approval"]["risk_flags"] = []
+    policy = load_policy(write_policy(tmp_path, data))
+    d = decide(policy, task_row(body=spec_body(spec_dict(risk_flags=["billing"]))))
+    assert d.recommended_action.value == "needs_approval"
+
+
+def test_unknown_cost_candidate_gates_approval(tmp_path):
+    # Enabling the unknown-cost BAI candidate on the standard route means a
+    # possibly-selected backend has unknown cost -> approval, never free.
+    data = policy_dict()
+    data["backends"][1]["enabled"] = True
+    policy = load_policy(write_policy(tmp_path, data))
+    d = decide(policy, task_row(body=spec_body()))
+    assert d.recommended_action.value == "needs_approval"
+    assert "cost" in d.reason.lower()
+
+
+def test_unknown_cost_floor_when_operator_omits(tmp_path):
+    data = policy_dict()
+    data["approval"]["cost_tiers"] = []
+    data["backends"][1]["enabled"] = True
+    policy = load_policy(write_policy(tmp_path, data))
+    d = decide(policy, task_row(body=spec_body()))
+    assert d.recommended_action.value == "needs_approval"
+
+
+def test_confidence_floor_causes_replan(tmp_path):
+    data = policy_dict()
+    data["classifier"]["min_execute_confidence"] = 0.99  # body conf is 0.95
+    policy = load_policy(write_policy(tmp_path, data))
+    d = decide(policy, task_row(body=spec_body()))
+    assert d.recommended_action.value == "replan"
+    assert "confidence" in d.reason.lower()
+
+
+def test_confidence_floor_never_relaxes_approval(tmp_path):
+    data = policy_dict()
+    data["classifier"]["confidence"] = {"body": 1.0}
+    data["classifier"]["min_execute_confidence"] = 0.0
+    policy = load_policy(write_policy(tmp_path, data))
+    d = decide(policy, task_row(body=spec_body(spec_dict(risk_flags=["billing"]))))
+    assert d.recommended_action.value == "needs_approval"
 
 
 def test_route_without_available_candidate_holds(policy):
@@ -96,7 +177,6 @@ def test_route_without_available_candidate_holds(policy):
         role="reviewer", capability="review", tier="standard",
     ))))
     assert d.recommended_action.value == "hold"
-    assert d.candidates == []
     assert d.route == "reviewer.review.standard"
 
 
@@ -212,9 +292,80 @@ def test_task_map_fallback_classifies(policy):
     assert 0.0 <= d.confidence <= 1.0
 
 
-def test_decision_never_executes_with_empty_candidates(policy):
-    # Any non-execute decision must carry no selected candidate order.
+def test_needs_approval_carries_no_candidates(policy):
+    # Non-execute decisions carry only the route — no backend order, ever.
     d = decide(policy, task_row(body=spec_body(spec_dict(risk_flags=["billing"]))))
     assert d.recommended_action.value == "needs_approval"
-    # candidates are still the resolved order for the compiler's visibility
-    assert d.candidates == ["devin-swe-2-max"]
+    assert "candidates" not in d.model_dump(mode="json")
+
+
+# --- Structured work block derivation -------------------------------------
+
+
+def test_work_block_derives_route(policy):
+    spec = _spec_with_work()  # implement/ready/medium
+    d = decide(policy, task_row(body=spec_body(spec)))
+    assert d.recommended_action.value == "execute"
+    assert d.route == "worker.code.standard"
+    assert d.role.value == "worker"
+    assert d.capability == "code"
+    assert d.tier.value == "standard"
+
+
+def test_work_block_small_scope_derives_easy(policy):
+    spec = _spec_with_work(scope="small")
+    d = decide(policy, task_row(body=spec_body(spec)))
+    assert d.recommended_action.value == "execute"
+    assert d.route == "worker.code.easy"
+
+
+@pytest.mark.parametrize("design", ["draft", "unclear"])
+def test_work_block_unready_design_replans(policy, design):
+    spec = _spec_with_work(design=design)
+    d = decide(policy, task_row(body=spec_body(spec)))
+    assert d.recommended_action.value == "replan"
+    assert "design" in d.reason.lower()
+
+
+def test_work_block_large_scope_gated(tmp_path):
+    # scope large -> derived tier hard -> approval gate (route must exist).
+    data = policy_dict()
+    data["routes"]["worker.code.hard"] = {"candidates": ["devin-swe-2-max"]}
+    policy = load_policy(write_policy(tmp_path, data))
+    spec = _spec_with_work(scope="large")
+    d = decide(policy, task_row(body=spec_body(spec)))
+    assert d.recommended_action.value == "needs_approval"
+    assert d.tier.value == "hard"
+
+
+def test_work_kind_reviewer_derives_review(policy):
+    spec = _spec_with_work(kind="review")
+    d = decide(policy, task_row(body=spec_body(spec)))
+    # reviewer.review.standard exists but all candidates disabled -> hold.
+    assert d.recommended_action.value == "hold"
+    assert d.route == "reviewer.review.standard"
+
+
+def test_conflicting_hint_replans(policy):
+    spec = _spec_with_work()
+    spec["tier"] = "easy"  # conflicts with derived medium->standard
+    d = decide(policy, task_row(body=spec_body(spec)))
+    assert d.recommended_action.value == "replan"
+    assert "conflict" in d.reason.lower()
+
+
+def test_conflicting_role_hint_replans(policy):
+    spec = _spec_with_work()
+    spec["role"] = "reviewer"
+    d = decide(policy, task_row(body=spec_body(spec)))
+    assert d.recommended_action.value == "replan"
+
+
+def test_agreeing_hints_execute(policy):
+    spec = _spec_with_work()
+    spec["role"] = "worker"
+    spec["capability"] = "code"
+    spec["tier"] = "standard"
+    d = decide(policy, task_row(body=spec_body(spec)))
+    assert d.recommended_action.value == "execute"
+    assert d.route == "worker.code.standard"

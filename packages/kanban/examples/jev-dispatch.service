@@ -1,0 +1,32 @@
+# DISABLED example — Jev dispatch tick as a systemd oneshot.
+#
+# This unit is intentionally NOT enabled anywhere. It documents the only
+# supported service shape: a single bounded tick per invocation (the real
+# scheduler stays Hermes cron / an operator timer — this unit contains no
+# loop and no scheduling logic of its own).
+#
+# To activate manually (operator opt-in):
+#   cp jev-dispatch.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user start jev-dispatch.service     # one tick per start
+# Deactivate:
+#   systemctl --user stop jev-dispatch.service
+#   rm ~/.config/systemd/user/jev-dispatch.service
+# Rollback: stop the unit and leave dispatch.db + kanban.db untouched —
+# receipts are durable state, never replayed.
+
+[Unit]
+Description=Jev kanban dispatch tick (single bounded pass)
+# Never auto-started: no Install section on purpose.
+
+[Service]
+Type=oneshot
+# One tick, kernel-held singleton lock, then exit.
+ExecStart=/home/ubuntu/.local/bin/uv run --project /home/ubuntu/development/cli-provider-api-jev \
+  cli-provider-kanban dispatch --once \
+  --board-db /home/ubuntu/.hermes/kanban/kanban.db \
+  --policy /home/ubuntu/development/cli-provider-api-jev/packages/kanban/examples/jev-routing-policy.yaml \
+  --store /home/ubuntu/.hermes/kanban/dispatch.db
+# No Restart= — a failed tick is investigated, never retried automatically
+# (an unknown submission must not be replayed).
+TimeoutStartSec=300
