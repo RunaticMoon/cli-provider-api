@@ -1,45 +1,287 @@
 """Policy compiler — renders ONE central policy into 9Router payloads.
 
 The compiler is the only place an ordered candidate list becomes concrete
-configuration: provider-node / provider / combo payloads for 9Router plus an
-advisory wrapper-preset fragment. Jev never sees this; the dispatcher never
+configuration: provider-node / provider / combo payloads for 9Router plus a
+wrapper-preset fragment. Jev never sees this; the dispatcher never
 carries a fallback list — the compiled combo owns the order.
 
-``compile_plan`` is a pure function: dry-run output is secret-free by
-construction. ``apply_plan`` is an explicit opt-in that only targets a
-declared ``disposable`` loopback gateway target, reads the credential from a
-file (never argv), and reads back the created combos to verify exact order.
+Fail closed by construction:
+
+* Combo ``models`` carry ONLY eligible members — enabled, canary-verified,
+  capability-mapped, and inside the compiler-verified driver contract —
+  preserving policy order. A route with no eligible members is *held*
+  (visible in the plan, never applied). An enabled+routed member that
+  violates the verified driver contract is an actionable CompileError,
+  never a silently-registered model.
+* Every compiled route is effectful (native-agent / API tool-loop traffic
+  can mutate at ANY tier), so the shared core no-post-dispatch-retry guard
+  attestation (``gateway.assume_core_guard``) is required for every combo —
+  not a difficulty-tier subset. ``apply_plan`` refuses to write any
+  non-operational combo BEFORE the first HTTP mutating call.
+* ``compile_plan`` is pure: dry-run output is secret-free by construction.
+* ``apply_plan`` is an explicit opt-in that only targets a declared
+  ``disposable`` loopback target (parsed via ``urllib.parse``; the
+  installed service port 20128 is refused even when marked disposable),
+  authenticates over the REAL management contract — ``/api/auth/login`` ->
+  ``auth_token`` cookie session (or a supplied session cookie), never an
+  invented management Bearer — reads credentials from an operator-private
+  file (never argv, never logged), and reads back node/provider/combo/
+  settings to verify exact order before reporting success.
+* Management error bodies are never echoed: a provider response can carry
+  the upstream key itself. Errors carry method + path + HTTP status only.
+
+Effort is intent, never a wire parameter: this MVP applies only the static
+native-agent ``auto`` hint; non-auto hints are refused upstream by the
+dispatch owner (``resolve_effort``/``EffortUnsupported``). 9Router has no
+effort parameter and none is emitted — the policy's verified ``effort_map``
+is preserved in the plan under ``effort.intent`` only.
 """
 
 from __future__ import annotations
 
+import http.cookies
 import json
-import urllib.error
-import urllib.request
+import os
+import stat
 from pathlib import Path
+from typing import Mapping
 
-from .models import Tier
+from cli_provider_sdk import validate_alias
+
+from .models import Tier  # noqa: F401  (re-exported for callers)
 from .policy import Policy, load_policy
+from .wrapper_client import (
+    WrapperError,
+    _bounded_request,
+    _LoopbackBase,
+    _TransportFailure,
+)
 
-# Tiers whose combos are allowed to exist but stay non-operational until the
-# shared core no-post-dispatch-retry guard is verified integrated.
-_MUTATION_TIERS = {Tier.STANDARD, Tier.HARD, Tier.MAX}
+_MAX_CREDENTIAL_BYTES = 64 * 1024
+_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
 
 class CompileError(Exception):
     """Plan/apply failure."""
 
 
+# ---------------------------------------------------------------------------
+# Compiler-verified driver contract.
+#
+# Mirrored from the actual driver sources — an enabled+routed backend outside
+# this table is a CompileError, never a registered combo member:
+#
+# * ``hermes-api`` (drivers/hermes-api): run requests must carry one of the
+#   two pinned ``ProviderPreset`` aliases — ``bai/deepseek-v4.1-flash`` or
+#   ``commandcode/deepseek-v4.1-flash``; anything else fails preflight with
+#   ``unknown_preset``. ``discover_models`` reports ``provider:model-tail``
+#   descriptor ids — those are the ``PresetConfig.model_id`` values the core
+#   registry verifies against.
+# * ``devin`` (drivers/devin): the preset alias is operator-chosen (the
+#   driver never compares it); the pinned supported model is exactly
+#   ``swe-2-max`` and its descriptor id is ``swe-2-max``.
+#
+# The checked-in example policy still uses the invented
+# ``hermes-api/bai-deepseek-v4.1-flash`` / ``hermes-api/cc-deepseek-v4.1-flash``
+# aliases — the driver rejects them; the required example edits are reported
+# to the parent in docs/JEV_ROUTING_CONTRACT.md.
+# ---------------------------------------------------------------------------
+
+DRIVER_CONTRACT = {
+    "hermes-api": {
+        "kinds": frozenset({"bai", "commandcode"}),
+        # kind -> pinned alias -> (wire model id, registry descriptor id)
+        "preset_models": {
+            "bai/deepseek-v4.1-flash": (
+                "deepseek-v4.1-flash", "bai:deepseek-v4.1-flash"),
+            "commandcode/deepseek-v4.1-flash": (
+                "deepseek/deepseek-v4.1-flash",
+                "commandcode:deepseek-v4.1-flash"),
+        },
+        "kind_preset": {
+            "bai": "bai/deepseek-v4.1-flash",
+            "commandcode": "commandcode/deepseek-v4.1-flash",
+        },
+    },
+    "devin": {
+        "kinds": frozenset({"devin"}),
+        "models": frozenset({"swe-2-max"}),
+    },
+}
+
+
 def _combo_name(route: str) -> str:
     return f"jev.{route}"
 
 
-def compile_plan(policy: Policy) -> dict:
-    """Pure rendering — no secrets, no network. Consumed by ``--dry-run`` and
-    by ``apply_plan``."""
+def _member_eligibility(backend, capability: str) -> str | None:
+    """None when the backend may be registered as an active combo member."""
+    if not backend.enabled:
+        reason = "backend disabled"
+        if backend.disabled_reason:
+            reason += f" ({backend.id}: {backend.disabled_reason})"
+        return reason
+    if backend.requires_canary:
+        return "canary verification pending — declared, not yet proven"
+    if backend.capabilities.get(capability) is not True:
+        return f"capability {capability!r} not mapped on backend"
+    return None
+
+
+def _member_model(backend) -> str:
+    """Validate an *eligible* routed backend against the known driver
+    contract; return the upstream model string for the combo member."""
+    driver = backend.driver
+    contract = DRIVER_CONTRACT.get(driver)
+    if contract is None:
+        raise CompileError(
+            f"backend {backend.id!r} is routed+enabled but driver "
+            f"{driver!r} has no compiler-verified contract — refusing to "
+            "register an unverifiable model"
+        )
+    if backend.kind not in contract["kinds"]:
+        raise CompileError(
+            f"backend {backend.id!r}: kind {backend.kind!r} is not served "
+            f"by driver {driver!r}"
+        )
+    member_model = backend.preset or backend.model
+    if not member_model:
+        raise CompileError(
+            f"backend {backend.id!r} carries no preset/model to register")
+    try:
+        validate_alias(member_model)
+    except ValueError as exc:
+        raise CompileError(
+            f"backend {backend.id!r} preset {member_model!r} is not a "
+            f"valid alias: {exc}"
+        ) from exc
+    preset_models = contract.get("preset_models")
+    if preset_models is not None:
+        expected = contract["kind_preset"].get(backend.kind)
+        if expected is not None and member_model != expected:
+            raise CompileError(
+                f"backend {backend.id!r} (kind {backend.kind!r}) must use "
+                f"the driver-pinned preset {expected!r}, got "
+                f"{member_model!r} — the driver would reject it with "
+                "unknown_preset"
+            )
+        pinned = preset_models.get(member_model)
+        if pinned is None:
+            raise CompileError(
+                f"backend {backend.id!r} preset {member_model!r} is not a "
+                f"pinned alias of driver {driver!r} — the driver would "
+                f"reject it with unknown_preset; expected one of "
+                f"{sorted(preset_models)}"
+            )
+        wire_model, _descriptor = pinned
+        if backend.model != wire_model:
+            raise CompileError(
+                f"backend {backend.id!r} model {backend.model!r} does not "
+                f"match the driver-pinned model {wire_model!r} for preset "
+                f"{member_model!r}"
+            )
+    else:
+        supported = contract["models"]
+        if backend.model not in supported:
+            raise CompileError(
+                f"backend {backend.id!r} model {backend.model!r} is not "
+                f"supported by driver {driver!r} — supported models: "
+                f"{sorted(supported)}"
+            )
+    return member_model
+
+
+def _descriptor_for(backend) -> str | None:
+    """Registry model id (driver discover_models descriptor) when the
+    contract can prove it, else None."""
+    contract = DRIVER_CONTRACT.get(backend.driver)
+    if contract is None:
+        return None
+    preset_models = contract.get("preset_models")
+    if preset_models is not None:
+        pinned = preset_models.get(backend.preset or "")
+        return pinned[1] if pinned else None
+    if backend.model in contract["models"]:
+        return backend.model
+    return None
+
+
+def _preset_fragments(policy: Policy, runners: Mapping[str, str]):
+    """Render the operator wrapper preset list.
+
+    Entries are REAL ``PresetConfig`` fields only when the contract pins the
+    model id AND an operator runner mapping resolves the runner_ref;
+    otherwise the entry lands in ``presets_advisory`` marked explicitly NOT
+    loadable configuration.
+    """
+    presets: list[dict] = []
+    advisory: list[dict] = []
+    for backend in policy.backends:
+        alias = backend.preset or backend.model
+        if not alias:
+            continue
+        descriptor = _descriptor_for(backend)
+        runner_ref = (
+            runners.get(backend.id)
+            or runners.get(backend.driver or "")
+        )
+        if runner_ref and descriptor:
+            presets.append({
+                "alias": alias,
+                "runner_ref": runner_ref,
+                "model_id": descriptor,
+                "task_policy": "text",
+                "enabled": backend.enabled,
+            })
+            continue
+        reasons = []
+        if not runner_ref:
+            reasons.append(
+                f"no operator runner mapping for driver {backend.driver!r}")
+        if not descriptor:
+            reasons.append(
+                "model is not in the compiler-verified driver contract")
+        advisory.append({
+            "alias": alias,
+            "model_id": descriptor or backend.model,
+            "enabled": backend.enabled,
+            "advisory": "; ".join(reasons)
+            + " — advisory only, NOT loadable OperatorConfig",
+        })
+    return presets, advisory
+
+
+def _effort_block(policy: Policy) -> dict:
+    return {
+        "applied_hints": ["auto"],
+        "intent": {
+            b.id: dict(b.effort_map)
+            for b in policy.backends
+            if b.effort_map
+        },
+        "note": (
+            "MVP: only the static native-agent 'auto' intent is executable; "
+            "non-auto hints are refused upstream by the dispatch owner "
+            "(EffortUnsupported). 9Router has no effort parameter — none is "
+            "emitted. The verified per-backend effort_map is preserved here "
+            "as intent only."
+        ),
+    }
+
+
+def compile_plan(
+    policy: Policy, *, runner_map: Mapping[str, str] | None = None
+) -> dict:
+    """Pure rendering — no secrets, no network. Consumed by ``--dry-run``
+    and by ``apply_plan``.
+
+    ``runner_map`` is the operator's driver-or-backend -> runner instance
+    mapping; without it the preset fragment is explicitly advisory.
+    """
     prefix = policy.gateway.node_prefix
     wrapper_base = (policy.gateway.wrapper_base_url or "").rstrip("/")
     by_id = policy.backend_map()
+    runners = dict(runner_map or {})
 
     provider_nodes = []
     if wrapper_base:
@@ -59,43 +301,47 @@ def compile_plan(policy: Policy) -> dict:
         })
 
     combos = []
-    presets = []
     for route_name, route in sorted(policy.routes.items()):
-        tier = route_name.split(".")[-1]
-        members = []
-        all_live = True
+        capability = route_name.split(".")[1]
+        members: list[str] = []
+        dropped: list[dict] = []
+        seen: set[str] = set()
         for candidate_id in route.candidates:
             backend = by_id[candidate_id]
-            members.append(f"{prefix}/{backend.preset or backend.model}")
-            if not backend.enabled or backend.requires_canary:
-                all_live = False
-        operational = all_live and (
-            tier not in {t.value for t in _MUTATION_TIERS}
-            or policy.gateway.assume_core_guard
-        )
+            reason = _member_eligibility(backend, capability)
+            if reason is not None:
+                dropped.append({"backend": backend.id, "reason": reason})
+                continue
+            member_model = _member_model(backend)
+            member = f"{prefix}/{member_model}"
+            if member in seen:
+                # No duplicated fallback leg inside the combo.
+                continue
+            seen.add(member)
+            members.append(member)
+        operational = bool(members) and policy.gateway.assume_core_guard
+        held = not members
+        if held:
+            note = "held: no enabled+canary-verified members — never applied"
+        elif not operational:
+            note = (
+                "non-operational: core no-post-dispatch-retry guard "
+                "unattested (gateway.assume_core_guard) — apply refuses "
+                "before any HTTP write"
+            )
+        else:
+            note = "order is the compiled fallback chain; operational"
         combos.append({
             "name": _combo_name(route_name),
             "route": route_name,
             "models": members,
             "operational": operational,
-            "note": (
-                "order is the compiled fallback chain; "
-                + ("operational" if operational else
-                   "non-operational: disabled/canary member or core guard "
-                   "unattested")
-            ),
+            "held": held,
+            "dropped": dropped,
+            "note": note,
         })
-    for backend in policy.backends:
-        presets.append({
-            "alias": backend.preset or backend.model,
-            "driver": backend.driver,
-            "backend_id": backend.id,
-            "transport": backend.transport,
-            "model": backend.model,
-            "effort_map": backend.effort_map,
-            "enabled": backend.enabled,
-            "requires_canary": backend.requires_canary,
-        })
+
+    presets, presets_advisory = _preset_fragments(policy, runners)
     return {
         "schema_version": 1,
         "policy_version": policy.policy_version,
@@ -103,6 +349,8 @@ def compile_plan(policy: Policy) -> dict:
         "providers": providers,
         "combos": combos,
         "presets": presets,
+        "presets_advisory": presets_advisory,
+        "effort": _effort_block(policy),
         "settings": {
             "comboStrategy": "fallback",
             "fallbackStrategy": "fill-first",
@@ -110,7 +358,7 @@ def compile_plan(policy: Policy) -> dict:
     }
 
 
-def _target_for(policy: Policy, name: str):
+def _target_for(policy: Policy, name: str) -> tuple[object, _LoopbackBase]:
     target = next((t for t in policy.gateway.targets if t.name == name), None)
     if target is None:
         raise CompileError(f"no gateway target {name!r} in policy")
@@ -119,39 +367,134 @@ def _target_for(policy: Policy, name: str):
             f"gateway target {name!r} is not disposable — this slice refuses "
             "production targets"
         )
-    url = target.url.rstrip("/")
-    host = url.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
-    if host not in ("127.0.0.1", "localhost", "::1"):
+    try:
+        base = _LoopbackBase(target.url)
+    except WrapperError as exc:
+        raise CompileError(f"gateway target {name!r}: {exc}") from exc
+    return target, base
+
+
+def _read_credentials(credential_file: str) -> dict:
+    """Operator-private JSON credential file — never argv, never logged.
+
+    Contract: ``upstream_key`` (required — the wrapper bearer the provider
+    entry forwards) plus EITHER ``management_password`` (real
+    ``/api/auth/login`` -> auth_token cookie session) OR
+    ``management_cookie`` (an existing auth_token session value). 9Router
+    management auth is the dashboard cookie session — there is no invented
+    management Bearer permission.
+    """
+    path = Path(credential_file)
+    try:
+        st = path.lstat()
+    except OSError as exc:
+        raise CompileError(f"cannot read credential file: {exc}") from exc
+    if stat.S_ISLNK(st.st_mode):
+        raise CompileError("credential file must not be a symlink")
+    if not stat.S_ISREG(st.st_mode):
+        raise CompileError("credential file must be a regular file")
+    if st.st_uid != os.getuid():
         raise CompileError(
-            f"gateway target {name!r} is not loopback ({url}) — refusing"
+            "credential file must be owned by the current user")
+    if st.st_mode & 0o077:
+        raise CompileError(
+            "credential file mode must not allow group/world access "
+            "(chmod 600)"
         )
-    return target
+    if st.st_size > _MAX_CREDENTIAL_BYTES:
+        raise CompileError("credential file is too large")
+    try:
+        creds = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise CompileError(f"credential file is not JSON: {exc}") from exc
+    if not isinstance(creds, dict):
+        raise CompileError("credential file must be a JSON object")
+    if not creds.get("upstream_key"):
+        raise CompileError("credential file must hold 'upstream_key'")
+    if not creds.get("management_password") and not creds.get(
+            "management_cookie"):
+        raise CompileError(
+            "credential file must hold 'management_password' (real "
+            "/api/auth/login) or 'management_cookie' (existing auth_token "
+            "session value)"
+        )
+    return creds
 
 
-def _http(url: str, method: str, body: dict | None, token: str | None,
-          timeout: float) -> tuple[int, dict]:
+def _extract_auth_token(set_cookie: str) -> str | None:
+    for line in set_cookie.split("\n"):
+        jar = http.cookies.SimpleCookie()
+        try:
+            jar.load(line)
+        except http.cookies.CookieError:
+            continue
+        morsel = jar.get("auth_token")
+        if morsel is not None and morsel.value:
+            return morsel.value
+    return None
+
+
+def _http_json(
+    base: _LoopbackBase,
+    method: str,
+    path: str,
+    *,
+    body: dict | None,
+    cookie: str | None,
+    timeout: float,
+) -> tuple[int, dict, dict]:
+    """One management call — returns (status, parsed_body, headers).
+
+    Errors carry method + path + HTTP status ONLY: a management error body
+    can echo the upstream apiKey and is never printed.
+    """
     headers = {"Accept": "application/json"}
+    if cookie:
+        headers["Cookie"] = cookie
     data = None
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, json.loads(resp.read().decode("utf-8") or "{}")
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", "replace")
-        try:
-            parsed = json.loads(raw)
-        except ValueError:
-            parsed = {"raw": raw[:400]}
+        status, resp_headers, raw = _bounded_request(
+            base, method, path,
+            headers=headers, data=data,
+            timeout_seconds=timeout,
+            max_response_bytes=_MAX_RESPONSE_BYTES,
+        )
+    except _TransportFailure as exc:
         raise CompileError(
-            f"{method} {url} -> HTTP {exc.code}: {parsed}"
-        ) from exc
-    except (urllib.error.URLError, OSError) as exc:
-        raise CompileError(f"{method} {url} transport failure: {exc}") from exc
+            f"{method} {path} transport failure: {exc}") from exc
+    if status >= 300:
+        raise CompileError(f"{method} {path} -> HTTP {status}")
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise CompileError(
+            f"{method} {path} -> unparsable response") from exc
+    return status, parsed, resp_headers
+
+
+def _management_session(
+    base: _LoopbackBase, creds: dict, timeout: float
+) -> str:
+    """Real 9Router management auth: /api/auth/login -> auth_token cookie,
+    or an operator-supplied existing session cookie value."""
+    cookie = creds.get("management_cookie")
+    if cookie:
+        if any(ch in cookie for ch in (";", "\r", "\n", " ", "\t")):
+            raise CompileError(
+                "management_cookie is not a valid cookie value")
+        return f"auth_token={cookie}"
+    status, _body, resp_headers = _http_json(
+        base, "POST", "/api/auth/login",
+        body={"password": creds["management_password"]},
+        cookie=None, timeout=timeout,
+    )
+    token = _extract_auth_token(resp_headers.get("set-cookie", ""))
+    if not token:
+        raise CompileError("login response carried no auth_token cookie")
+    return f"auth_token={token}"
 
 
 def apply_plan(
@@ -160,77 +503,149 @@ def apply_plan(
     target_name: str,
     credential_file: str,
     timeout_seconds: float = 30.0,
+    runner_map: Mapping[str, str] | None = None,
 ) -> dict:
     """Apply the compiled plan to a disposable loopback 9Router target.
 
-    The management credential is read from ``credential_file`` at call time.
-    After applying, combos are read back and compared exactly — a drifted
-    order is a hard failure, not a warning.
+    Fail closed: any non-operational combo that carries members aborts the
+    apply BEFORE the first HTTP mutating write. Held routes (no eligible
+    members) are skipped and reported. After applying, combos, the provider
+    node, the provider binding and settings are read back and compared
+    exactly — drift is a hard failure, not a warning.
     """
-    target = _target_for(policy, target_name)
-    # Credential file is JSON: {"management_token": ..., "upstream_key": ...}.
-    # management_token authenticates to 9Router's /api/*; upstream_key is the
-    # wrapper bearer the provider entry forwards. Never argv, never logged.
-    try:
-        creds = json.loads(Path(credential_file).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise CompileError(f"cannot read credential file: {exc}") from exc
-    token = creds.get("management_token")
-    upstream_key = creds.get("upstream_key")
-    if not token or not upstream_key:
+    _target, base = _target_for(policy, target_name)
+    creds = _read_credentials(credential_file)
+    upstream_key = creds["upstream_key"]
+
+    plan = compile_plan(policy, runner_map=runner_map)
+    blocked = [
+        c["name"] for c in plan["combos"]
+        if c["models"] and not c["operational"]
+    ]
+    if blocked:
         raise CompileError(
-            "credential file must hold 'management_token' and 'upstream_key'"
+            f"refusing to apply non-operational combos {blocked} — the "
+            "shared core no-post-dispatch-retry guard is not attested "
+            "(gateway.assume_core_guard); no HTTP write was issued"
         )
 
-    plan = compile_plan(policy)
-    base = target.url.rstrip("/")
-    created = {"provider_nodes": [], "providers": [], "combos": [],
-               "settings": None, "readback": None}
+    session = _management_session(base, creds, timeout_seconds)
+    created: dict = {
+        "provider_nodes": [], "providers": [], "combos": [],
+        "held": [c["name"] for c in plan["combos"] if not c["models"]],
+        "settings": None, "readback": None,
+    }
 
-    status, _ = _http(f"{base}/api/settings", "PATCH", plan["settings"],
-                      token, timeout_seconds)
+    status, _, _ = _http_json(
+        base, "PATCH", "/api/settings",
+        body=plan["settings"], cookie=session, timeout=timeout_seconds,
+    )
     created["settings"] = {"status": status}
 
-    node_ids = {}
+    node_ids: dict[str, str] = {}
     for node in plan["provider_nodes"]:
-        status, body = _http(f"{base}/api/provider-nodes", "POST", node,
-                             token, timeout_seconds)
+        status, body, _ = _http_json(
+            base, "POST", "/api/provider-nodes",
+            body=node, cookie=session, timeout=timeout_seconds,
+        )
         node_id = (body.get("node") or {}).get("id")
+        if not node_id:
+            raise CompileError(
+                "provider-node create returned no node id")
         node_ids[node["name"]] = node_id
-        created["provider_nodes"].append({"name": node["name"], "id": node_id,
-                                          "status": status})
+        created["provider_nodes"].append(
+            {"name": node["name"], "id": node_id, "status": status})
     for provider in plan["providers"]:
         payload = {
             "name": provider["name"],
             "provider": node_ids[provider["name"]],
             "apiKey": upstream_key,
         }
-        status, _ = _http(f"{base}/api/providers", "POST", payload,
-                          token, timeout_seconds)
-        created["providers"].append({"name": provider["name"],
-                                     "status": status})
-    for combo in plan["combos"]:
-        status, _ = _http(
-            f"{base}/api/combos", "POST",
-            {"name": combo["name"], "models": combo["models"]},
-            token, timeout_seconds,
+        status, _, _ = _http_json(
+            base, "POST", "/api/providers",
+            body=payload, cookie=session, timeout=timeout_seconds,
+        )
+        created["providers"].append(
+            {"name": provider["name"], "status": status})
+
+    applicable = [c for c in plan["combos"] if c["models"]]
+    for combo in applicable:
+        status, _, _ = _http_json(
+            base, "POST", "/api/combos",
+            body={"name": combo["name"], "models": combo["models"]},
+            cookie=session, timeout=timeout_seconds,
         )
         created["combos"].append({"name": combo["name"], "status": status})
 
-    # Readback: exact name + ordered models, or the apply failed.
-    _, body = _http(f"{base}/api/combos", "GET", None, token, timeout_seconds)
-    values = body if isinstance(body, list) else body.get("combos", [])
+    # Readback — EXACT verification, secrets never printed.
+    _, combos_body, _ = _http_json(
+        base, "GET", "/api/combos", body=None, cookie=session,
+        timeout=timeout_seconds)
+    values = (
+        combos_body if isinstance(combos_body, list)
+        else combos_body.get("combos", [])
+    )
     by_name = {c.get("name"): c for c in values}
-    mismatched = []
-    for combo in plan["combos"]:
-        got = by_name.get(combo["name"])
-        if got is None or got.get("models") != combo["models"]:
-            mismatched.append(combo["name"])
+    mismatched = [
+        c["name"] for c in applicable
+        if (by_name.get(c["name"]) or {}).get("models") != c["models"]
+    ]
     if mismatched:
         raise CompileError(
             f"combo readback mismatch for {mismatched} — applied order does "
             "not match compiled policy"
         )
+    if plan["provider_nodes"]:
+        _, nodes_body, _ = _http_json(
+            base, "GET", "/api/provider-nodes", body=None, cookie=session,
+            timeout=timeout_seconds)
+        nodes = (
+            nodes_body if isinstance(nodes_body, list)
+            else nodes_body.get("nodes", [])
+        )
+        for node in plan["provider_nodes"]:
+            want_id = node_ids[node["name"]]
+            match = next(
+                (n for n in nodes if n.get("id") == want_id), None)
+            if (
+                match is None
+                or match.get("baseUrl") != node["baseUrl"]
+                or match.get("prefix") != node["prefix"]
+            ):
+                raise CompileError(
+                    f"provider-node readback mismatch for {node['name']!r}")
+    if plan["providers"]:
+        _, providers_body, _ = _http_json(
+            base, "GET", "/api/providers", body=None, cookie=session,
+            timeout=timeout_seconds)
+        connections = (
+            providers_body if isinstance(providers_body, list)
+            else providers_body.get("connections", [])
+        )
+        for provider in plan["providers"]:
+            match = next(
+                (c for c in connections
+                 if c.get("name") == provider["name"]),
+                None,
+            )
+            # The binding is verified against the created node id; the app
+            # never echoes apiKey on GET and it is never printed here.
+            if (
+                match is None
+                or match.get("provider") != node_ids[provider["name"]]
+            ):
+                raise CompileError(
+                    f"provider binding readback mismatch for "
+                    f"{provider['name']!r}")
+    _, settings_body, _ = _http_json(
+        base, "GET", "/api/settings", body=None, cookie=session,
+        timeout=timeout_seconds)
+    for key, want in plan["settings"].items():
+        if settings_body.get(key) != want:
+            raise CompileError(
+                f"settings readback mismatch on {key!r}: "
+                f"{settings_body.get(key)!r} != {want!r}")
+
     created["readback"] = "verified"
     return created
 
