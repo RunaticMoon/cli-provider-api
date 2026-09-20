@@ -95,10 +95,8 @@ class CompileError(Exception):
 #   driver never compares it); the pinned supported model is exactly
 #   ``swe-2-max`` and its descriptor id is ``swe-2-max``.
 #
-# The checked-in example policy still uses the invented
-# ``hermes-api/bai-deepseek-v4.1-flash`` / ``hermes-api/cc-deepseek-v4.1-flash``
-# aliases — the driver rejects them; the required example edits are reported
-# to the parent in docs/JEV_ROUTING_CONTRACT.md.
+# The checked-in example uses these same pinned API aliases. A driver
+# package name is not a provider preset prefix.
 # ---------------------------------------------------------------------------
 
 DRIVER_CONTRACT = {

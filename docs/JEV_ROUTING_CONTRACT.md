@@ -47,11 +47,10 @@ HTTP mutating call.
   `CompileError` — never a registered combo member. Codex is not a backend
   kind and can never appear.
 
-**Required example-policy edits (owned by the parent, not this slice):** the
-checked-in policy fixture uses invented aliases `hermes-api/bai-deepseek-v4.1-flash`
-and `hermes-api/cc-deepseek-v4.1-flash`. They must become
-`bai/deepseek-v4.1-flash` and `commandcode/deepseek-v4.1-flash` — the driver
-rejects the `hermes-api/…` forms.
+The checked-in policy uses `bai/deepseek-v4.1-flash` and
+`commandcode/deepseek-v4.1-flash`. The driver package name `hermes-api`
+is not a preset prefix. API candidates remain disabled pending their
+separate full-path admission gates.
 
 ## Preset fragment
 
