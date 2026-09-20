@@ -230,6 +230,14 @@ def _bounded_request(
         return resp.status, resp_headers, b"".join(chunks)
     except _TransportFailure:
         raise
+    except (ValueError, UnicodeError):
+        # putrequest/putheader reject CR/LF or non-latin-1 values with a
+        # bare ValueError whose text embeds the offending header value —
+        # possibly a token. Map to a fixed typed transport failure and
+        # suppress the chain so the secret never reaches a traceback.
+        message = ("response deadline exceeded" if expired.is_set()
+                   else "request header rejected")
+        raise _TransportFailure(message) from None
     except (OSError, http.client.HTTPException) as exc:
         message = "response deadline exceeded" if expired.is_set() else type(exc).__name__
         raise _TransportFailure(message) from exc

@@ -8,8 +8,13 @@ installed service) fronting the real API + UDS fixture Runner from
 * the compiler emits only eligible members (a disabled/canary candidate is
   dropped, never registered);
 * ``apply_plan`` performs the real ``/api/auth/login`` -> ``auth_token``
-  cookie session, writes node/provider/combo/settings, and verifies exact
-  readback on the live gateway;
+  cookie session, preflights an empty catalog, writes
+  node/provider/combo/settings, and verifies exact readback on the live
+  gateway;
+* the create-only contract refuses EVERY re-apply variant (identical,
+  all-members-disabled, route removed, wrapper URL removed, unrelated
+  occupied namespace) BEFORE the first configuration write, with the live
+  state byte-for-byte unchanged — a stale route is never reported applied;
 * ``WrapperClient`` submits chat through the gateway with the client key and
   reads run control DIRECTLY from the wrapper API with the upstream key —
   task identity, execution metadata, run/attempt ids unchanged;
@@ -342,6 +347,123 @@ def test_compile_apply_chat_and_control_through_real_gateway(
     assert out2.attempt_id == out1.attempt_id
     assert len(system.runs_received()) == 1
     assert len(system.effects()) == 1
+
+
+def _catalog_snapshot(gateway_client) -> dict:
+    """Exact management state for before/after comparison — combos, nodes,
+    connections (by canonical id) and the global settings keys apply owns."""
+    def entries(path, key):
+        body = gateway_client.get(path).json()
+        values = body if isinstance(body, list) else body.get(key)
+        return values or []
+
+    settings = gateway_client.get("/api/settings").json()
+    return {
+        "combos": sorted(
+            json.dumps({k: c.get(k) for k in ("name", "models")},
+                       sort_keys=True)
+            for c in entries("/api/combos", "combos")),
+        "nodes": sorted(
+            json.dumps({k: n.get(k) for k in ("id", "name", "prefix",
+                                              "baseUrl")}, sort_keys=True)
+            for n in entries("/api/provider-nodes", "nodes")),
+        "connections": sorted(
+            json.dumps({k: c.get(k) for k in ("id", "name", "provider")},
+                       sort_keys=True)
+            for c in entries("/api/providers", "connections")),
+        "settings": {
+            k: settings.get(k)
+            for k in ("comboStrategy", "fallbackStrategy")
+        },
+    }
+
+
+def test_reapply_variants_refuse_before_any_write(jev_gateway, tmp_path):
+    """BUG-1/BUG-2 against the real pinned gateway: once a target is
+    configured, EVERY re-apply variant refuses at preflight — identical
+    plan, all members disabled (route became held), route removed, and
+    wrapper URL removed — BEFORE any settings/node/provider/combo write,
+    with the live state byte-for-byte unchanged afterwards. The stale
+    combo is never claimed applied, disabled, or reconciled away."""
+    gateway_client, system, password, api_key = jev_gateway
+    gateway_url = str(gateway_client.base_url).rstrip("/")
+    cred = _write_cred(tmp_path / "gw-cred.json", {
+        "upstream_key": api_key,
+        "management_password": password,
+    })
+    base = _policy_dict(gateway_url, system.base_url, guard=True)
+    policy_path = tmp_path / "policy.yaml"
+    policy_path.write_text(yaml.safe_dump(base), encoding="utf-8")
+    out = apply_plan(load_policy(policy_path), target_name="gw",
+                     credential_file=cred)
+    assert out["readback"] == "verified"
+
+    # Independent dashboard session for state inspection.
+    assert gateway_client.post(
+        "/api/auth/login", json={"password": password}).status_code == 200
+    # Retune a global setting the plan would otherwise overwrite — proves
+    # the refusal happens before PATCH /api/settings, not after it.
+    assert gateway_client.patch(
+        "/api/settings", json={"comboStrategy": "priority"}
+    ).status_code == 200
+    before = _catalog_snapshot(gateway_client)
+    assert before["settings"]["comboStrategy"] == "priority"
+
+    variants = [dict(base)]  # identical re-apply
+    all_disabled = json.loads(json.dumps(base))
+    for backend in all_disabled["backends"]:
+        backend["enabled"] = False          # every route becomes held
+    variants.append(all_disabled)
+    route_removed = json.loads(json.dumps(base))
+    route_removed["routes"].pop("worker.code.standard")
+    variants.append(route_removed)
+    wrapper_removed = json.loads(json.dumps(base))
+    wrapper_removed["gateway"]["wrapper_base_url"] = None
+    variants.append(wrapper_removed)
+
+    for i, variant in enumerate(variants):
+        path = tmp_path / f"policy-v{i}.yaml"
+        path.write_text(yaml.safe_dump(variant), encoding="utf-8")
+        with pytest.raises(CompileError, match="occupied"):
+            apply_plan(load_policy(path), target_name="gw",
+                       credential_file=cred)
+        assert _catalog_snapshot(gateway_client) == before
+    # Exactly one node, one connection, one combo — no duplicates (BUG-2
+    # evidence was 1 -> 2 on re-apply).
+    assert len(before["nodes"]) == 1
+    assert len(before["connections"]) == 1
+    assert any(
+        json.loads(c)["name"] == "jev.worker.code.standard"
+        for c in before["combos"])
+
+
+def test_unrelated_occupied_gateway_refuses_before_writes(
+        jev_gateway, tmp_path):
+    """An unrelated namespace counts too: PATCH /api/settings is global and
+    would silently retune foreign combos, so a NON-empty target is refused
+    wholesale — the disposable contract is 'fresh', not 'jev.*-free'."""
+    gateway_client, system, password, api_key = jev_gateway
+    assert gateway_client.post(
+        "/api/auth/login", json={"password": password}).status_code == 200
+    foreign = gateway_client.post("/api/combos", json={
+        "name": "other.team.combo", "models": ["someone/else"]})
+    assert foreign.status_code in (200, 201)
+    before = _catalog_snapshot(gateway_client)
+
+    gateway_url = str(gateway_client.base_url).rstrip("/")
+    cred = _write_cred(tmp_path / "gw-cred.json", {
+        "upstream_key": api_key,
+        "management_password": password,
+    })
+    policy_path = tmp_path / "policy.yaml"
+    policy_path.write_text(
+        yaml.safe_dump(_policy_dict(gateway_url, system.base_url,
+                                    guard=True)),
+        encoding="utf-8")
+    with pytest.raises(CompileError, match="occupied"):
+        apply_plan(load_policy(policy_path), target_name="gw",
+                   credential_file=cred)
+    assert _catalog_snapshot(gateway_client) == before
 
 
 def test_unsafe_apply_makes_zero_http_calls(jev_gateway, tmp_path):

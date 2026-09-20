@@ -338,7 +338,15 @@ class StubRouter:
 
     ``POST /api/auth/login`` {"password": ...} -> 200 + Set-Cookie
     ``auth_token=<session>``; every other ``/api/*`` requires that cookie.
-    Providers never echo apiKey on GET (like the real app).
+    ``POST /api/provider-nodes`` -> 201 ``{"node": {id, ...}}``;
+    ``POST /api/providers`` -> 201 ``{"connection": {id, ...}}`` with the
+    canonical connection id captured for readback; ``POST /api/combos``
+    -> 201 combo object. Providers never echo apiKey on GET (like the
+    real app). The stub records every call so fail-closed apply tests can
+    prove zero HTTP writes, and models the preflight/readback split:
+    ``readback_override`` answers GET /api/combos only AFTER a mutation,
+    ``malformed_get`` injects a non-catalog response, and
+    ``login_cookie_override`` controls the login Set-Cookie.
     """
 
     PASSWORD = "stub-mgmt-password"
@@ -373,7 +381,10 @@ class StubRouter:
                 body = self._body()
                 if self.path == "/api/auth/login":
                     server.calls.append(("POST", self.path, {"password": "***"}))
-                    if body.get("password") == StubRouter.PASSWORD:
+                    if server.login_cookie_override is not None:
+                        self._send(200, {"ok": True}, {
+                            "Set-Cookie": server.login_cookie_override})
+                    elif body.get("password") == StubRouter.PASSWORD:
                         self._send(200, {"ok": True}, {
                             "Set-Cookie": f"auth_token={StubRouter.COOKIE}; "
                                           "HttpOnly; Path=/"})
@@ -387,19 +398,26 @@ class StubRouter:
                 if self.path == server.error_path:
                     self._send(500, {"error": {"detail": server.error_secret}})
                 elif self.path == "/api/provider-nodes":
+                    server.mutated = True
                     nid = f"node_{len(server.nodes)+1}"
                     server.nodes[body["name"]] = {"id": nid, **body}
                     self._send(201, {"node": server.nodes[body["name"]]})
                 elif self.path == "/api/providers":
+                    server.mutated = True
+                    # Real 0.5.81 shape: {connection: {id, ...}} with apiKey
+                    # never echoed; the id is the canonical binding key.
                     conn = dict(body)
-                    conn.pop("apiKey", None)  # the real app never echoes it
+                    conn.pop("apiKey", None)
+                    conn = {"id": f"conn_{len(server.providers)+1}", **conn}
                     server.providers.append(conn)
                     self._send(201, {"connection": conn})
                 elif self.path == "/api/combos":
+                    server.mutated = True
                     server.combos.append({"name": body["name"],
                                           "models": body["models"]})
-                    self._send(201, {"combo": server.combos[-1]})
+                    self._send(201, dict(server.combos[-1]))
                 elif self.path == "/api/keys":
+                    server.mutated = True
                     self._send(201, {"key": "stub-client-key"})
                 else:
                     self._send(404, {"error": "nope"})
@@ -412,6 +430,7 @@ class StubRouter:
                 body = self._body()
                 server.calls.append(("PATCH", self.path, body))
                 if self.path == "/api/settings":
+                    server.mutated = True
                     server.settings.update(body)
                     self._send(200, dict(server.settings))
                 else:
@@ -422,10 +441,17 @@ class StubRouter:
                 if not self._authed():
                     self._send(401, {"error": "Unauthorized"})
                     return
-                if self.path == "/api/combos":
-                    payload = (server.readback_override
-                               if server.readback_override is not None
-                               else server.combos)
+                if self.path in server.malformed_get:
+                    self._send(200, server.malformed_get[self.path])
+                elif self.path == "/api/combos":
+                    # readback_override simulates drift AFTER mutation;
+                    # preflight GETs still see the seeded/empty truth.
+                    payload = (
+                        server.readback_override
+                        if (server.readback_override is not None
+                            and server.mutated)
+                        else server.combos
+                    )
                     self._send(200, {"combos": payload})
                 elif self.path == "/api/provider-nodes":
                     self._send(200, {"nodes": list(server.nodes.values())})
@@ -440,7 +466,10 @@ class StubRouter:
         self.nodes = {}
         self.providers = []
         self.combos = []
+        self.mutated = False
         self.readback_override = None
+        self.malformed_get = {}
+        self.login_cookie_override = None
         self.error_path = None
         self.error_secret = "SHOULD-NOT-LEAK"
         self.settings = {"comboStrategy": "priority", "fallbackStrategy": "fill-first"}
@@ -707,3 +736,234 @@ class TestApplyPlan:
             assert out["readback"] == "verified"
         finally:
             router.close()
+
+    # -- create-only fresh-target contract (BUG-1 / BUG-2) -----------------
+
+    def test_identical_reapply_refused_before_any_write(self, tmp_path):
+        """BUG-2: a second apply on the same target must refuse at
+        preflight — BEFORE PATCH settings or any POST — leaving nodes,
+        connections and combos exactly as they were (no duplicates)."""
+        router = StubRouter()
+        try:
+            policy = self._policy_at(tmp_path, router.url)
+            cred = self._cred(tmp_path)
+            out = apply_plan(policy, target_name="local",
+                             credential_file=cred)
+            assert out["readback"] == "verified"
+            nodes = dict(router.nodes)
+            providers = [dict(p) for p in router.providers]
+            combos = [dict(c) for c in router.combos]
+            settings = dict(router.settings)
+            mutations = len(router.mutating_calls())
+
+            with pytest.raises(CompileError, match="occupied"):
+                apply_plan(policy, target_name="local",
+                           credential_file=cred)
+            assert len(router.mutating_calls()) == mutations
+            assert router.nodes == nodes
+            assert router.providers == providers
+            assert router.combos == combos
+            assert router.settings == settings
+        finally:
+            router.close()
+
+    def test_held_route_with_stale_combo_refuses(self, tmp_path):
+        """BUG-1: the last eligible member is disabled and wrapper_base_url
+        is dropped — the previously-applied jev.* combo is still live on
+        the gateway. Apply must refuse, never report 'verified' while the
+        stale route still serves the withdrawn backend."""
+        router = StubRouter()
+        try:
+            # State a first apply would have left behind.
+            router.nodes["jevwrap"] = {
+                "id": "node_1", "name": "jevwrap",
+                "type": "openai-compatible", "apiType": "chat",
+                "prefix": "jevwrap", "baseUrl": "http://127.0.0.1:8080/v1",
+            }
+            router.providers.append(
+                {"id": "conn_1", "name": "jevwrap", "provider": "node_1"})
+            router.combos.append({
+                "name": "jev.worker.code.standard",
+                "models": ["jevwrap/devin/swe-2-max"],
+            })
+            data = policy_dict()
+            for backend in data["backends"]:
+                if backend["id"] == "devin-swe-2-max":
+                    backend["enabled"] = False
+            data["gateway"] = {
+                "wrapper_base_url": None,   # dropped, as in the parent repro
+                "node_prefix": "jevwrap",
+                "targets": [{"name": "local", "url": router.url,
+                             "kind": "disposable"}],
+                "assume_core_guard": True,
+            }
+            policy = load_policy(write_policy(tmp_path, data))
+            plan = compile_plan(policy)
+            assert all(c["held"] for c in plan["combos"])
+            with pytest.raises(CompileError, match="occupied") as exc:
+                apply_plan(policy, target_name="local",
+                           credential_file=self._cred(tmp_path))
+            # The refusal is explicit about leaving old state unchanged.
+            assert "unchanged" in str(exc.value)
+            assert router.mutating_calls() == []
+            assert router.combos == [{
+                "name": "jev.worker.code.standard",
+                "models": ["jevwrap/devin/swe-2-max"],
+            }]
+        finally:
+            router.close()
+
+    def test_unrelated_occupied_namespace_refuses(self, tmp_path):
+        """ANY existing config counts, even outside jev.*: PATCH settings is
+        global and would retune unrelated combos on a shared target."""
+        for seed in (
+            {"combos": [{"name": "other.team.combo", "models": ["m"]}]},
+            {"nodes": {"other": {"id": "n_x", "name": "other"}}},
+            {"connections": [{"id": "c_x", "name": "other",
+                              "provider": "n_x"}]},
+        ):
+            router = StubRouter()
+            try:
+                if "combos" in seed:
+                    router.combos.extend(seed["combos"])
+                if "nodes" in seed:
+                    router.nodes.update(seed["nodes"])
+                if "connections" in seed:
+                    router.providers.extend(seed["connections"])
+                policy = self._policy_at(tmp_path, router.url)
+                with pytest.raises(CompileError, match="occupied"):
+                    apply_plan(policy, target_name="local",
+                               credential_file=self._cred(tmp_path))
+                assert router.mutating_calls() == []
+            finally:
+                router.close()
+
+    def test_malformed_preflight_catalog_fails_closed(self, tmp_path):
+        """A missing/unparseable catalog list is NOT empty — refuse closed
+        before any write."""
+        for path, payload in (
+            ("/api/combos", {"unexpected": "shape"}),
+            ("/api/combos", {"combos": {"not": "a list"}}),
+            ("/api/provider-nodes", "a string, not a catalog"),
+            ("/api/providers", {"connections": None}),
+        ):
+            router = StubRouter()
+            try:
+                router.malformed_get[path] = payload
+                policy = self._policy_at(tmp_path, router.url)
+                with pytest.raises(CompileError, match="malformed"):
+                    apply_plan(policy, target_name="local",
+                               credential_file=self._cred(tmp_path))
+                assert router.mutating_calls() == []
+            finally:
+                router.close()
+
+    def test_readback_extra_live_combo_is_hard_failure(self, tmp_path):
+        """Readback covers the WHOLE combo namespace: a stale/foreign combo
+        present after apply fails — no success from expected members
+        alone."""
+        router = StubRouter()
+        try:
+            policy = self._policy_at(tmp_path, router.url)
+            router.readback_override = [
+                {"name": "jev.worker.code.easy",
+                 "models": ["jevwrap/devin/swe-2-max"]},
+                {"name": "jev.worker.code.standard",
+                 "models": ["jevwrap/devin/swe-2-max"]},
+                {"name": "jev.reviewer.review.standard",
+                 "models": ["jevwrap/devin/swe-2-max"]},  # held route live!
+            ]
+            with pytest.raises(CompileError, match="readback"):
+                apply_plan(policy, target_name="local",
+                           credential_file=self._cred(tmp_path))
+        finally:
+            router.close()
+
+    def test_provider_binding_verified_by_connection_id(self, tmp_path):
+        """BUG-3: the readback binds the canonical id the POST returned —
+        a foreign same-name connection can never be the match."""
+        router = StubRouter()
+        try:
+            policy = self._policy_at(tmp_path, router.url)
+            out = apply_plan(policy, target_name="local",
+                             credential_file=self._cred(tmp_path))
+            conn = router.providers[0]
+            assert conn["id"] == "conn_1"
+            assert out["providers"][0]["id"] == "conn_1"
+            assert conn["provider"] == "node_1"
+        finally:
+            router.close()
+
+    # -- SEC-1: one narrow validation for both cookie sources --------------
+
+    def test_malformed_set_cookie_token_is_typed_refusal(self, tmp_path):
+        """A token harvested from the target's own Set-Cookie goes through
+        the same ASCII/control/separator validation as the supplied
+        cookie — a malformed value is a fixed CompileError with zero
+        mutations, never an untyped header error."""
+        for bad in ('auth_token="a;b"; HttpOnly; Path=/',
+                    'auth_token="bad token"; Path=/',
+                    'auth_token="a\tb"; Path=/'):
+            router = StubRouter()
+            try:
+                router.login_cookie_override = bad
+                policy = self._policy_at(tmp_path, router.url)
+                with pytest.raises(CompileError, match="cookie"):
+                    apply_plan(policy, target_name="local",
+                               credential_file=self._cred(tmp_path))
+                assert router.mutating_calls() == []
+            finally:
+                router.close()
+
+    def test_supplied_cookie_same_narrow_validation(self, tmp_path):
+        router = StubRouter()
+        try:
+            policy = self._policy_at(tmp_path, router.url)
+            for bad in ("a;b", "bad token", "a\tb", "tök", 'q"z'):
+                cred = _write_cred(tmp_path, {
+                    "management_cookie": bad, "upstream_key": "uk"},
+                    name="bad.json")
+                with pytest.raises(CompileError, match="cookie"):
+                    apply_plan(policy, target_name="local",
+                               credential_file=cred)
+            # Nothing was sent at all — the cookie never left the file.
+            assert router.calls == []
+            # Positive control: a normal cookie still works.
+            good = _write_cred(tmp_path, {
+                "management_cookie": StubRouter.COOKIE,
+                "upstream_key": "uk"}, name="good.json")
+            out = apply_plan(policy, target_name="local",
+                             credential_file=good)
+            assert out["readback"] == "verified"
+        finally:
+            router.close()
+
+    # -- routing-drop vs direct-preset contract ----------------------------
+
+    def test_canary_enabled_backend_never_enabled_preset(self, tmp_path):
+        """requires_canary is carried into the preset fragment: an enabled
+        but unverified backend is dropped from routing AND its preset is
+        never an enabled loadable OperatorConfig entry."""
+        data = policy_dict()
+        for backend in data["backends"]:
+            if backend["id"] == "bai-flash":
+                backend["enabled"] = True
+                backend["requires_canary"] = True
+        data["gateway"] = {"wrapper_base_url": "http://127.0.0.1:8080",
+                           "node_prefix": "jevwrap", "targets": [],
+                           "assume_core_guard": True}
+        policy = load_policy(write_policy(tmp_path, data))
+        plan = compile_plan(
+            policy,
+            runner_map={"devin": "runner-1", "hermes-api": "runner-1"})
+        # Routing drop: never a combo member.
+        for combo in plan["combos"]:
+            assert all("bai" not in m for m in combo["models"])
+        # Direct preset: loadable shape but DISABLED — not invokable.
+        entry = next(p for p in plan["presets"]
+                     if p["alias"] == "bai/deepseek-v4.1-flash")
+        assert entry["enabled"] is False
+        # Positive control: the eligible backend stays enabled.
+        devin = next(p for p in plan["presets"]
+                     if p["alias"] == "devin/swe-2-max")
+        assert devin["enabled"] is True

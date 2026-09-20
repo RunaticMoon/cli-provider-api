@@ -27,6 +27,20 @@ Fail closed by construction:
   invented management Bearer — reads credentials from an operator-private
   file (never argv, never logged), and reads back node/provider/combo/
   settings to verify exact order before reporting success.
+* ``apply_plan`` is CREATE-ONLY onto a FRESH disposable gateway — never a
+  reconciler. After the management session is established and BEFORE the
+  first configuration write it GETs ``/api/combos``, ``/api/provider-nodes``
+  and ``/api/providers``; if ANY catalog is non-empty — even an unrelated
+  namespace, because ``PATCH /api/settings`` retunes every combo on the
+  target — it refuses with a fixed CompileError, leaves the existing state
+  untouched, and tells the operator to point the target at a NEW isolated
+  disposable instance. A stale ``jev.*`` route is therefore never reported
+  applied while still serving old members, and a re-apply can never
+  duplicate nodes/connections before hitting the combo-name collision.
+  Preflight is not remote atomicity: the contract still requires exclusive
+  operator ownership of the disposable target, and a race or mid-apply
+  network failure can leave partial state — the operator preserves,
+  discards and rebuilds the target; there is no automatic replay.
 * Management error bodies are never echoed: a provider response can carry
   the upstream key itself. Errors carry method + path + HTTP status only.
 
@@ -231,7 +245,10 @@ def _preset_fragments(policy: Policy, runners: Mapping[str, str]):
                 "runner_ref": runner_ref,
                 "model_id": descriptor,
                 "task_policy": "text",
-                "enabled": backend.enabled,
+                # A backend still awaiting canary proof must never become an
+                # ENABLED loadable OperatorConfig entry — routing drops it
+                # and the direct-preset surface stays disabled too.
+                "enabled": backend.enabled and not backend.requires_canary,
             })
             continue
         reasons = []
@@ -434,6 +451,34 @@ def _extract_auth_token(set_cookie: str) -> str | None:
     return None
 
 
+def _is_cookie_octet(ch: str) -> bool:
+    """RFC 6265 cookie-octet: printable ASCII minus ``\"``, ``,``, ``;``,
+    ``\\`` and whitespace — no controls, no non-ASCII bytes."""
+    o = ord(ch)
+    return (
+        o == 0x21
+        or 0x23 <= o <= 0x2B
+        or 0x2D <= o <= 0x3A
+        or 0x3C <= o <= 0x5B
+        or 0x5D <= o <= 0x7E
+    )
+
+
+def _session_cookie_value(value: str | None, source: str) -> str:
+    """ONE narrow validator for the auth_token session value, applied
+    identically to the operator-supplied ``management_cookie`` and to the
+    token harvested from the target's own ``Set-Cookie``: ASCII only, no
+    control characters, no cookie/header separators. The value itself is
+    never echoed — it is a secret."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or not all(_is_cookie_octet(ch) for ch in value)
+    ):
+        raise CompileError(f"{source} is not a valid cookie value")
+    return value
+
+
 def _http_json(
     base: _LoopbackBase,
     method: str,
@@ -482,10 +527,7 @@ def _management_session(
     or an operator-supplied existing session cookie value."""
     cookie = creds.get("management_cookie")
     if cookie:
-        if any(ch in cookie for ch in (";", "\r", "\n", " ", "\t")):
-            raise CompileError(
-                "management_cookie is not a valid cookie value")
-        return f"auth_token={cookie}"
+        return f"auth_token={_session_cookie_value(cookie, 'management_cookie')}"
     status, _body, resp_headers = _http_json(
         base, "POST", "/api/auth/login",
         body={"password": creds["management_password"]},
@@ -494,7 +536,57 @@ def _management_session(
     token = _extract_auth_token(resp_headers.get("set-cookie", ""))
     if not token:
         raise CompileError("login response carried no auth_token cookie")
-    return f"auth_token={token}"
+    # The target's own Set-Cookie is validated through the SAME narrow
+    # contract before it is re-sent — a malformed token is a typed refusal,
+    # never an unchecked header value.
+    return f"auth_token={_session_cookie_value(token, 'login auth_token')}"
+
+
+def _catalog_entries(body, key: str, context: str) -> list:
+    """Extract one management catalog list — fail closed: a missing or
+    non-list catalog is malformed and is NEVER treated as empty."""
+    if isinstance(body, list):
+        entries = body
+    elif isinstance(body, dict) and isinstance(body.get(key), list):
+        entries = body[key]
+    else:
+        raise CompileError(
+            f"{context} returned a malformed catalog — refusing to treat a "
+            "missing/unparseable list as empty"
+        )
+    return entries
+
+
+def _preflight_fresh(
+    base: _LoopbackBase, session: str, timeout: float
+) -> None:
+    """CREATE-ONLY contract: GET every configuration catalog BEFORE the
+    first write and refuse unless the target is a fresh disposable
+    gateway — ANY existing entry counts, including unrelated namespaces,
+    because PATCH /api/settings would retune them all."""
+    occupied = []
+    for path, key in (
+        ("/api/combos", "combos"),
+        ("/api/provider-nodes", "nodes"),
+        ("/api/providers", "connections"),
+    ):
+        _, body, _ = _http_json(
+            base, "GET", path, body=None, cookie=session, timeout=timeout)
+        entries = _catalog_entries(body, key, f"GET {path}")
+        if entries:
+            occupied.append(f"{path} ({len(entries)} existing)")
+    if occupied:
+        raise CompileError(
+            "refusing to apply to an occupied gateway — preflight found "
+            + ", ".join(occupied)
+            + ". apply_plan is create-only onto a FRESH disposable target: "
+            "PATCH /api/settings is global and would silently retune "
+            "unrelated combos, and a stale jev.* route would otherwise be "
+            "reported applied while still serving its old members. No "
+            "configuration write was issued and the existing state was "
+            "left unchanged — point the policy target at a NEW isolated "
+            "disposable 9Router instance."
+        )
 
 
 def apply_plan(
@@ -505,13 +597,24 @@ def apply_plan(
     timeout_seconds: float = 30.0,
     runner_map: Mapping[str, str] | None = None,
 ) -> dict:
-    """Apply the compiled plan to a disposable loopback 9Router target.
+    """Apply the compiled plan to a FRESH disposable loopback 9Router.
 
     Fail closed: any non-operational combo that carries members aborts the
-    apply BEFORE the first HTTP mutating write. Held routes (no eligible
-    members) are skipped and reported. After applying, combos, the provider
-    node, the provider binding and settings are read back and compared
-    exactly — drift is a hard failure, not a warning.
+    apply BEFORE the first HTTP mutating write. After login, a preflight
+    GET of every configuration catalog must find the target EMPTY — this
+    is a create-only contract, not reconciliation: an occupied target
+    (stale jev.* route, duplicated node, or an unrelated namespace the
+    global settings PATCH would retune) is refused before any write and
+    left unchanged; the operator points at a NEW isolated disposable
+    gateway instead. Held routes (no eligible members) are skipped and
+    reported. After applying, the ENTIRE combo namespace, the provider
+    node, the provider binding (by the created connection's canonical id)
+    and settings are read back and compared exactly — drift is a hard
+    failure, never a warning, and partial success is never reported.
+    Preflight is not remote atomicity: a race or mid-apply network
+    failure can leave partial state — preserve/discard/rebuild the
+    disposable target under exclusive operator ownership; nothing here
+    replays automatically.
     """
     _target, base = _target_for(policy, target_name)
     creds = _read_credentials(credential_file)
@@ -530,10 +633,14 @@ def apply_plan(
         )
 
     session = _management_session(base, creds, timeout_seconds)
+    # Authenticated preflight BEFORE the first configuration write —
+    # an occupied namespace refuses here, never after mutations.
+    _preflight_fresh(base, session, timeout_seconds)
     created: dict = {
         "provider_nodes": [], "providers": [], "combos": [],
         "held": [c["name"] for c in plan["combos"] if not c["models"]],
         "settings": None, "readback": None,
+        "preflight": "target catalogs empty (create-only fresh target)",
     }
 
     status, _, _ = _http_json(
@@ -548,25 +655,35 @@ def apply_plan(
             base, "POST", "/api/provider-nodes",
             body=node, cookie=session, timeout=timeout_seconds,
         )
-        node_id = (body.get("node") or {}).get("id")
+        node_body = body.get("node") if isinstance(body, dict) else None
+        node_id = node_body.get("id") if isinstance(node_body, dict) else None
         if not node_id:
             raise CompileError(
                 "provider-node create returned no node id")
         node_ids[node["name"]] = node_id
         created["provider_nodes"].append(
             {"name": node["name"], "id": node_id, "status": status})
+    conn_ids: dict[str, str] = {}
     for provider in plan["providers"]:
         payload = {
             "name": provider["name"],
             "provider": node_ids[provider["name"]],
             "apiKey": upstream_key,
         }
-        status, _, _ = _http_json(
+        status, body, _ = _http_json(
             base, "POST", "/api/providers",
             body=payload, cookie=session, timeout=timeout_seconds,
         )
+        # Capture the created connection's canonical returned id — the
+        # readback binds to THAT object, never to the first same-name row.
+        connection = body.get("connection") if isinstance(body, dict) else None
+        conn_id = connection.get("id") if isinstance(connection, dict) else None
+        if not isinstance(conn_id, str) or not conn_id:
+            raise CompileError(
+                "provider create returned no connection id")
+        conn_ids[provider["name"]] = conn_id
         created["providers"].append(
-            {"name": provider["name"], "status": status})
+            {"name": provider["name"], "id": conn_id, "status": status})
 
     applicable = [c for c in plan["combos"] if c["models"]]
     for combo in applicable:
@@ -577,36 +694,52 @@ def apply_plan(
         )
         created["combos"].append({"name": combo["name"], "status": status})
 
-    # Readback — EXACT verification, secrets never printed.
+    # Readback — EXACT verification over the WHOLE managed namespace,
+    # secrets never printed. On a create-only fresh target the live combo
+    # catalog must equal the compiled applicable set exactly: a stale or
+    # foreign combo (including a held/omitted route that is still live) is
+    # a hard failure — success is never reported from partial members.
     _, combos_body, _ = _http_json(
         base, "GET", "/api/combos", body=None, cookie=session,
         timeout=timeout_seconds)
-    values = (
-        combos_body if isinstance(combos_body, list)
-        else combos_body.get("combos", [])
-    )
-    by_name = {c.get("name"): c for c in values}
-    mismatched = [
-        c["name"] for c in applicable
-        if (by_name.get(c["name"]) or {}).get("models") != c["models"]
-    ]
-    if mismatched:
+    combo_entries = _catalog_entries(
+        combos_body, "combos", "GET /api/combos")
+    live_combos: dict[str, object] = {}
+    for entry in combo_entries:
+        if not isinstance(entry, dict) or not isinstance(
+                entry.get("name"), str):
+            raise CompileError(
+                "combo readback returned a malformed catalog entry")
+        live_combos[entry["name"]] = entry.get("models")
+    expected = {c["name"]: c["models"] for c in applicable}
+    unexpected = sorted(n for n in live_combos if n not in expected)
+    drifted = sorted(
+        n for n in expected if live_combos.get(n) != expected[n])
+    if unexpected or drifted:
         raise CompileError(
-            f"combo readback mismatch for {mismatched} — applied order does "
-            "not match compiled policy"
+            "combo readback mismatch — the live catalog does not equal the "
+            f"compiled set exactly (unexpected present: {unexpected}; "
+            f"mismatched or absent: {drifted})"
         )
     if plan["provider_nodes"]:
         _, nodes_body, _ = _http_json(
             base, "GET", "/api/provider-nodes", body=None, cookie=session,
             timeout=timeout_seconds)
-        nodes = (
-            nodes_body if isinstance(nodes_body, list)
-            else nodes_body.get("nodes", [])
-        )
+        nodes = _catalog_entries(
+            nodes_body, "nodes", "GET /api/provider-nodes")
+        live_nodes = {
+            n["id"]: n for n in nodes
+            if isinstance(n, dict) and isinstance(n.get("id"), str)
+        }
+        foreign = sorted(set(live_nodes) - set(node_ids.values()))
+        if foreign or len(nodes) != len(live_nodes):
+            raise CompileError(
+                "provider-node readback found entries this apply did not "
+                "create — the target is not an exclusively-owned fresh "
+                "disposable gateway"
+            )
         for node in plan["provider_nodes"]:
-            want_id = node_ids[node["name"]]
-            match = next(
-                (n for n in nodes if n.get("id") == want_id), None)
+            match = live_nodes.get(node_ids[node["name"]])
             if (
                 match is None
                 or match.get("baseUrl") != node["baseUrl"]
@@ -618,18 +751,24 @@ def apply_plan(
         _, providers_body, _ = _http_json(
             base, "GET", "/api/providers", body=None, cookie=session,
             timeout=timeout_seconds)
-        connections = (
-            providers_body if isinstance(providers_body, list)
-            else providers_body.get("connections", [])
-        )
-        for provider in plan["providers"]:
-            match = next(
-                (c for c in connections
-                 if c.get("name") == provider["name"]),
-                None,
+        connections = _catalog_entries(
+            providers_body, "connections", "GET /api/providers")
+        live_conns = {
+            c["id"]: c for c in connections
+            if isinstance(c, dict) and isinstance(c.get("id"), str)
+        }
+        foreign = sorted(set(live_conns) - set(conn_ids.values()))
+        if foreign or len(connections) != len(live_conns):
+            raise CompileError(
+                "provider readback found connections this apply did not "
+                "create — the target is not an exclusively-owned fresh "
+                "disposable gateway"
             )
-            # The binding is verified against the created node id; the app
-            # never echoes apiKey on GET and it is never printed here.
+        for provider in plan["providers"]:
+            # The binding is verified by the canonical id the POST
+            # returned plus the created node id; the app never echoes
+            # apiKey on GET and it is never printed here.
+            match = live_conns.get(conn_ids[provider["name"]])
             if (
                 match is None
                 or match.get("provider") != node_ids[provider["name"]]
@@ -640,6 +779,9 @@ def apply_plan(
     _, settings_body, _ = _http_json(
         base, "GET", "/api/settings", body=None, cookie=session,
         timeout=timeout_seconds)
+    if not isinstance(settings_body, dict):
+        raise CompileError(
+            "GET /api/settings returned a malformed catalog")
     for key, want in plan["settings"].items():
         if settings_body.get(key) != want:
             raise CompileError(

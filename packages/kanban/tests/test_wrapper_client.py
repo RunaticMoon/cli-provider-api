@@ -334,6 +334,35 @@ def test_path_ids_are_validated():
             client.cancel_run(bad)
 
 
+def test_header_rejected_value_is_typed_transport_failure(tmp_path):
+    """A bearer token http.client's putheader rejects (non-latin-1) escapes
+    as a bare ValueError otherwise — it must map to a fixed typed
+    WrapperTransportError whose message can never embed the secret, with
+    the exception chain suppressed (``from None``)."""
+    stub = StubWrapperServer()
+    try:
+        cred = _write_cred(tmp_path / "bad-tok", "secret-€token\n")
+        client = WrapperClient(stub.base_url, credential_file=cred)
+        with pytest.raises(WrapperTransportError) as exc:
+            client.submit_chat(model="m", task_id="t_h", workspace_id="w",
+                               messages=[])
+        assert "secret" not in str(exc.value)
+        assert "€" not in str(exc.value)
+        assert exc.value.__suppress_context__ is True
+        # The header was rejected before the request hit the wire.
+        assert stub.requests == []
+        # Positive control: a normal token still works.
+        good = _write_cred(tmp_path / "good-tok", "ok-token\n")
+        ok = WrapperClient(stub.base_url, credential_file=good)
+        out = ok.submit_chat(model="m", task_id="t_ok", workspace_id="w",
+                             messages=[])
+        assert out.run_id
+        assert stub.requests[-1]["headers"]["Authorization"] == \
+            "Bearer ok-token"
+    finally:
+        stub.close()
+
+
 def test_run_view_shape_is_normalized(stub_wrapper):
     """An unknown status string is coerced to 'unknown' — finite known
     statuses only; the upper layer never retries on inconsistency."""
