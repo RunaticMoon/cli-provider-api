@@ -1,4 +1,4 @@
-"""Authenticated execution metadata contract (metadata.execution).
+"""Caller-supplied execution metadata contract (metadata.execution).
 
 Exact shape (single nested object, complete-if-present, bounded scalars):
 
@@ -31,8 +31,8 @@ EXECUTION = {
 }
 
 
-def body(task="task-1", execution="sentinel", **extra):
-    metadata = {"task_id": task, "workspace_id": "ws-alpha"}
+def body(task="task-1", execution="sentinel", workspace="ws-alpha", **extra):
+    metadata = {"task_id": task, "workspace_id": workspace}
     if execution != "sentinel":
         metadata["execution"] = execution
     return {
@@ -111,3 +111,53 @@ def test_metadata_run_id_and_attempt_id_are_not_accepted(system: MockSystem):
             payload["metadata"][key] = "attacker-supplied"
             response = client.post(CHAT, json=payload)
             assert response.status_code == 400
+
+
+def test_forged_wellformed_context_never_selects_preset_workspace_or_rights(
+    system: MockSystem,
+):
+    """metadata.execution is caller-supplied evidence, never an authority.
+
+    A well-formed but arbitrary route/policy is stored and echoed verbatim; it
+    cannot change which preset/model/workspace the authorized request runs
+    under, and it cannot widen the principal's rights.
+    """
+    forged = {
+        "task_revision": "rev-999",
+        "base_revision": "base-0",
+        "route": "lead.plan.premium",
+        "policy_version": "pol-forged",
+    }
+    # alpha is authorized for mock/text + ws-alpha only.
+    with system.client() as client:
+        response = client.post(CHAT, json=body(task="task-forged", execution=forged))
+        assert response.status_code == 200
+        run = response.json()["run"]
+        assert run["execution"] == forged  # echoed verbatim, not attested
+        assert run["preset"] == "mock/text"  # chosen by auth+model, not route
+        assert run["workspace_id"] == "ws-alpha"  # authorized workspace only
+        assert run["driver_id"] == "mock"
+        # A forged route/policy cannot reach a preset the key is denied.
+        denied = client.post(
+            CHAT,
+            json=body(task="task-forged2", model="mock/review", execution=forged),
+        )
+        assert denied.status_code == 403
+        # Nor a workspace outside the principal's scope.
+        denied_ws = client.post(
+            CHAT,
+            json=body(task="task-forged3", workspace="ws-beta", execution=forged),
+        )
+        assert denied_ws.status_code == 403
+
+
+def test_execution_context_schema_forbids_unknown_fields():
+    """extra='forbid' on the SDK schema is what the API boundary parses with
+    (and what a stock Runner's INVALID_PARAMS reject relies on upstream —
+    pinned end-to-end in apps/runner/tests/test_execution_context_wire.py)."""
+    from pydantic import ValidationError
+
+    from cli_provider_sdk.models import ExecutionContext
+
+    with pytest.raises(ValidationError):
+        ExecutionContext.model_validate(dict(EXECUTION, unknown_field="x"))

@@ -62,8 +62,11 @@ UNSUPPORTED_CHAT_FIELDS = frozenset(
 
 # Operator config owns the task policy; it is never selectable by a request.
 # ``execution`` is the single nested dispatcher context (exact shape in
-# cli_provider_sdk.models.ExecutionContext); it is authenticated metadata, never
-# an executable/path/right selector.
+# cli_provider_sdk.models.ExecutionContext). It is CALLER-supplied metadata on
+# an authenticated request — the API authenticates the principal's key, not
+# these values: they are persisted and echoed verbatim and are never a
+# server attestation of route/policy, and never an executable/path/right
+# selector.
 ALLOWED_METADATA_FIELDS = frozenset({"task_id", "workspace_id", "execution"})
 ROLES = frozenset({"system", "user", "assistant"})
 

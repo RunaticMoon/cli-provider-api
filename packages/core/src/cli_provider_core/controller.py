@@ -4,6 +4,13 @@ Reserve+commit happens before any Runner dispatch. Runner RPC ``ok:true`` is
 never treated as run success: only a validated terminal event decides
 status/outcome. Unknown outcomes quarantine the Runner instance so released
 capacity cannot be reused while old work may still be running.
+
+One controller owner per store: ``self._active`` and queued-cancel decisions
+are in-process state, so a process embedding this controller is an API owner
+and must hold the exclusive owner lock for the store's canonical DB path (the
+API takes it at bootstrap before initialize/reconcile; see
+``cli_provider_api.ownerlock``). A second live owner would misread foreign
+queued rows as never-dispatched and reconcile runs it does not own.
 """
 
 from __future__ import annotations
@@ -504,9 +511,11 @@ class RunController:
             "deadline_seconds": deadline_seconds,
         }
         if record.execution is not None:
-            # Authenticated dispatcher context; opaque to the runtime, carried
-            # verbatim to the worker. Runner protocol support for the field is
-            # required for dispatch — a Runner without it rejects pre-execution.
+            # Caller-supplied dispatcher context; opaque to the runtime,
+            # carried verbatim to the worker. It is not server-attested and
+            # never selects preset/model/workspace/rights. Runner protocol
+            # support for the field is required for dispatch — a Runner
+            # without it rejects pre-execution.
             params["execution"] = dict(record.execution)
         chunks: list[str] = []
         output_bytes = 0

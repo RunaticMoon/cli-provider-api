@@ -3,6 +3,13 @@
 Single API instance, synchronous stdlib sqlite3 guarded by an in-process lock.
 Writes are small and local; correctness (atomic reserve, unique logical lock,
 ordered events) matters more than raw throughput here.
+
+"Single API instance" is enforced at the API application boundary by a
+lifetime kernel lock on the canonical DB path (``cli_provider_api.ownerlock``)
+taken before any initialize/reconcile effect — NOT here: plain Store
+connections stay unrestricted so read-only tooling and test concurrency keep
+working. Any other process embedding ``RunController`` is an API owner too
+and must hold that same exclusive lock for the store's DB path.
 """
 
 from __future__ import annotations
@@ -118,9 +125,12 @@ _PREEXECUTION_SAFE_OUTCOMES = (OUTCOME_REJECTED, OUTCOME_QUEUE_TIMEOUT)
 # SQL mirror of proven_pre_execution(): an attempt row is a *blocker* when it is
 # NOT proven pre-execution. Any blocker in a task's history forbids admitting a
 # new attempt, so a retry can never follow an execution that may have had
-# effects — including a failed or cancelled one.
+# effects — including a failed or cancelled one. COALESCE keeps a NULL outcome
+# from making the IN-comparison UNKNOWN (three-valued logic would otherwise let
+# ``NOT UNKNOWN`` filter the row out and fail open); a missing/corrupt outcome
+# is never one of the proven pre-execution values, so it stays a blocker.
 _BLOCKER_PREDICATE = (
-    "NOT ((status='failed' AND outcome IN ('rejected','queue_timeout')) "
+    "NOT ((status='failed' AND COALESCE(outcome,'') IN ('rejected','queue_timeout')) "
     "OR (status='cancelled' AND started_at IS NULL))"
 )
 

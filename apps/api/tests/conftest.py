@@ -51,6 +51,7 @@ class MockSystem:
     runner_proc: subprocess.Popen | None = None
     _log: Any = None
     _config_path: str = ""
+    _extra_apis: list = field(default_factory=list)
 
     @property
     def base_url(self) -> str:
@@ -200,6 +201,50 @@ class MockSystem:
         )
         self._wait_for_ready()
 
+    def spawn_api(self, port: int | None = None) -> tuple[subprocess.Popen, int, str]:
+        """Spawn an EXTRA API process on this system's config (same store).
+
+        Returns ``(process, port, log_path)`` without waiting for readiness —
+        the caller asserts on the exit code or waits via ``wait_api_ready``.
+        Used to prove the single-owner lock: a second API on one database must
+        be refused.
+        """
+        port = port or _free_port()
+        log_path = os.path.join(self.root, f"api-{port}.log")
+        log = open(log_path, "w", encoding="utf-8")
+        env = os.environ.copy()
+        env["CLI_DRIVER_MOCK_BEHAVIOR"] = self.behavior
+        proc = subprocess.Popen(
+            [
+                sys.executable, "-m", "cli_provider_api", "serve",
+                "--config", self._config_path,
+                "--host", "127.0.0.1", "--port", str(port),
+            ],
+            cwd=REPO_ROOT, env=env,
+            stdout=log, stderr=subprocess.STDOUT, text=True,
+        )
+        self._extra_apis.append((proc, log))
+        return proc, port, log_path
+
+    def wait_api_ready(
+        self, port: int, proc: subprocess.Popen, timeout: float = 30.0
+    ) -> None:
+        deadline = time.time() + timeout
+        base = f"http://127.0.0.1:{port}"
+        with httpx.Client(timeout=2.0) as client:
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    raise RuntimeError(f"api exited early: {self._read_log()}")
+                try:
+                    live = client.get(f"{base}/health/live")
+                    ready = client.get(f"{base}/health/ready")
+                    if live.status_code == 200 and ready.status_code == 200:
+                        return
+                except httpx.HTTPError:
+                    pass
+                time.sleep(0.1)
+        raise TimeoutError("api never became ready")
+
     def _wait_for_socket(self, timeout: float = 20.0) -> None:
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -242,6 +287,16 @@ class MockSystem:
         return ""
 
     def stop(self) -> None:
+        for proc, log in self._extra_apis:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+            if not log.closed:
+                log.close()
         for proc in (self.api_proc, self.runner_proc):
             if proc is None:
                 continue

@@ -21,6 +21,7 @@ from cli_provider_core import (
 
 from . import chat, health, models, runs
 from .errors import error_payload, install_handlers
+from .ownerlock import acquire_store_owner_lock, release_store_owner_lock
 
 
 def _header_bytes(request: Request) -> int:
@@ -31,10 +32,21 @@ def _header_bytes(request: Request) -> int:
 
 
 def create_app(config: OperatorConfig) -> FastAPI:
-    store = Store(config.db_path())
-    store.initialize()
-    registry = RunnerRegistry(config)
-    controller = RunController(config=config, store=store, registry=registry)
+    # Exactly one API process may own a store: startup reconciliation rewrites
+    # formerly-active rows and cancellation consults the in-process ``_active``
+    # map, so a second owner would mutate or misread runs it never dispatched.
+    # A lifetime kernel lock on the canonical DB path is taken BEFORE any store
+    # initialize/reconcile or registry effect; a live second owner is refused
+    # here, before it can touch the first owner's rows or its Runner.
+    owner_fd = acquire_store_owner_lock(config.db_path())
+    try:
+        store = Store(config.db_path())
+        store.initialize()
+        registry = RunnerRegistry(config)
+        controller = RunController(config=config, store=store, registry=registry)
+    except BaseException:
+        release_store_owner_lock(owner_fd)
+        raise
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -43,6 +55,9 @@ def create_app(config: OperatorConfig) -> FastAPI:
             yield
         finally:
             store.close()
+            # Kernel lock released by closing the descriptor; the file is never
+            # unlinked, so a recycled inode cannot alias a live owner's lock.
+            release_store_owner_lock(owner_fd)
 
     app = FastAPI(
         title="cli-provider-api",

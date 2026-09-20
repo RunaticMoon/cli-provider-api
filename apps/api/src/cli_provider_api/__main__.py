@@ -26,13 +26,17 @@ import uvicorn
 from cli_provider_core import hash_api_key, load_config
 
 from .app import create_app
+from .ownerlock import ApiOwnerError
 
 
 def _serve(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     host = args.host or config.api.host
     port = args.port if args.port is not None else config.api.port
-    app = create_app(config)
+    try:
+        app = create_app(config)
+    except ApiOwnerError as exc:
+        raise SystemExit(f"cli-provider-api: {exc}") from exc
     uvicorn.run(app, host=host, port=port, log_level=args.log_level)
     return 0
 

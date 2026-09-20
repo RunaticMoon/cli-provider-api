@@ -30,6 +30,16 @@ is proven pre-execution**, where "proven pre-execution" is exactly:
 - `cancelled` with `started_at IS NULL` — cancelled while queued, never
   dispatched.
 
+The predicate is fail-closed on missing data: `COALESCE(outcome,'')` keeps a
+NULL outcome from turning the `NOT (…)` UNKNOWN under SQL three-valued logic,
+so a `failed` row whose outcome was never written — a state no current HTTP
+writer produces, but a hand-repaired/migrated row could — is a permanent
+blocker exactly like `proven_pre_execution()` says. The parity of the SQL
+predicate and the Python contract is pinned for every status × outcome
+(including NULL/empty/corrupt) × dispatch-marker state, both solo and inside
+two-attempt ancestor chains
+(`test_reserve_admission_matches_python_contract`).
+
 `started_at` is the durable dispatch marker: it is persisted atomically in
 `_mark_starting` *before* the run RPC/effect boundary, not after. Everything
 else is a permanent blocker for the task:
@@ -60,6 +70,25 @@ every candidate MUST resolve to the same API principal (same bearer key) and
 the same Store. Per-driver fallback state does not exist and is not permitted.
 Cross-model submissions under the same task hit the identical lock
 (`test_retry_safety.py`, both suites).
+
+## Single API owner per store
+
+The Store's "single API instance" contract is enforced mechanically: at
+bootstrap, before any `Store.initialize()`/restart-reconcile or registry
+effect, the API takes a lifetime kernel lock (`fcntl.flock`, released on
+close/process death, never unlinked) on a dedicated file beside the
+*canonical* DB path (`cli_provider_api.ownerlock`). Aliased config paths to
+the same database resolve to one lock identity; a symlinked or foreign-owned
+lock file is refused, not followed.
+
+A second `cli-provider-api` process on the same DB exits with a clean refusal
+— it never reconciles the first owner's active rows to `unknown` and never
+calls its Runner (`apps/api/tests/test_single_owner.py` proves refusal while
+the owner's in-flight run finishes unchanged, lock release after the first
+owner dies, and that the unknown-restart guard still holds). The lock is at
+the API boundary, not in `Store`: plain/read-only Store connections and test
+concurrency are unaffected. Any library embedding `RunController` is an API
+owner and must hold the same exclusive lock.
 
 ## Execution metadata (`metadata.execution`)
 
@@ -95,6 +124,29 @@ fields required together:
   run view, and preserved through `NormalizedRequest.execution` to the worker.
 - No execution `tool_calls` are returned to Hermes; only `message.delta` is
   answer text.
+
+### Caller-supplied, not server-attested
+
+`metadata.execution` travels on an *authenticated request*, but only the
+principal key is authenticated — the four values are caller-asserted evidence,
+persisted and echoed verbatim. They are **not** a server attestation of which
+route or policy admitted the run, and they never select preset, model,
+workspace, or rights (proven: a well-formed forged `route`/`policy_version`
+runs under exactly the authorized preset/workspace and cannot widen
+principal rights — `test_execution_metadata.py`).
+
+Dispatcher contract: a trusted dispatcher (Lead/Kanban) MUST match a returned
+`run.execution` against its own durable submission receipt plus the canonical
+server-side run/preset/model — it must never derive policy admission from the
+echo alone.
+
+Candidate fallback preserves the EXACT task/revision/base/route/policy
+context across all candidates of one `task_id`: `route` names the logical
+combo, not a per-candidate backend, so it is identical on every candidate.
+Because the context is bound into the request hash, a mutated context is a
+`task_content_conflict`, not a fallback — a new route or policy is a new
+decision and requires a new Lead revision/residual, never a fresh `task_id`
+minted to evade the retry guard.
 
 ### Runner integration
 

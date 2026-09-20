@@ -35,9 +35,12 @@ def request_hash(
             {"role": m.get("role"), "content": m.get("content")} for m in messages
         ],
     }
-    # The authenticated execution context is part of the logical request: a
+    # The caller-supplied execution context is part of the logical request: a
     # replay carrying different context is a content conflict, while a request
-    # without it keeps the legacy digest unchanged.
+    # without it keeps the legacy digest unchanged. Binding it is what holds
+    # the task/revision/base/route/policy context fixed across all candidates
+    # of one task_id — a changed route/policy is not a fallback, it needs a
+    # new Lead revision decision.
     if execution is not None:
         payload["execution"] = dict(execution)
     return "sha256:" + hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()

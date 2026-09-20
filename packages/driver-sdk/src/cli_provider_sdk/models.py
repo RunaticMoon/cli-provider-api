@@ -214,11 +214,14 @@ class Message(_Schema):
 
 
 class ExecutionContext(_Schema):
-    """Authenticated dispatcher-supplied execution identity for one attempt.
+    """Caller-supplied dispatcher execution identity for one attempt.
 
     Complete-if-present: all four bounded scalar fields are required together.
-    The values are opaque to the runtime — they are evidence metadata propagated
-    to the worker and back, never an executable/path/right selector and never
+    The API authenticates the caller's key, NOT these values: they are
+    persisted and echoed verbatim and are not a server attestation of which
+    route/policy admitted the run. They are opaque to the runtime — evidence
+    metadata propagated to the worker and back, never an executable/path/right
+    selector, never preset/model/workspace-selecting, and never
     model-supplied text. Wrapper-generated ``run_id``/``attempt_id`` remain
     canonical and are never part of this context.
     """
@@ -238,7 +241,7 @@ class NormalizedRequest(_Schema):
     model_alias: Alias | None = None
     messages: list[Message] = Field(min_length=1)
     deadline_seconds: float | None = Field(default=None, gt=0)
-    # Optional authenticated execution context (backwards-compatible: absent
+    # Optional caller-supplied execution context (backwards-compatible: absent
     # means a legacy request with no dispatcher metadata).
     execution: ExecutionContext | None = None
 

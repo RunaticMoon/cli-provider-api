@@ -23,15 +23,23 @@ import pytest
 from cli_provider_core import Conflict, Store
 from cli_provider_core.models import (
     CANCELLED,
+    CANCELLING,
     COMPLETED,
     FAILED,
+    LOCK_STATUSES,
     OUTCOME_CANCELLED,
     OUTCOME_PROVIDER_ERROR,
     OUTCOME_REJECTED,
     OUTCOME_SUCCEEDED,
     OUTCOME_QUEUE_TIMEOUT,
+    OUTCOME_UNKNOWN,
     QUEUED,
+    RESERVED,
+    RUNNING,
+    STARTING,
+    UNKNOWN,
 )
+from cli_provider_core.store import proven_pre_execution
 from cli_provider_sdk import (
     CompletionStatus,
     EventKind,
@@ -320,4 +328,145 @@ def test_reserve_rejection_chain_cannot_skip_a_blocking_ancestor(tmp_path):
     with pytest.raises(Conflict) as excinfo:
         _reserve(store, "run_2")
     assert excinfo.value.code == "run_not_retryable"
+    store.close()
+
+
+def test_reserve_blocks_failed_attempt_with_null_outcome(tmp_path):
+    """A failed attempt whose outcome was never written (NULL) is a blocker.
+
+    ``proven_pre_execution('failed', None, ...)`` is False, so the SQL mirror
+    inside ``reserve()`` must agree. ``outcome IN (...)`` evaluates to NULL for
+    a NULL outcome and ``NOT NULL`` is NULL — three-valued logic must never
+    turn a missing outcome into an admission.
+    """
+    store = Store(str(tmp_path / "core.db"))
+    store.initialize()
+    _reserve(store, "run_1")
+    store.set_attempt("run_1", status=FAILED)  # outcome stays NULL
+    record = store.get_attempt("run_1")
+    assert record.outcome is None
+    assert (
+        proven_pre_execution(record.status, record.outcome, record.started_at)
+        is False
+    )
+    with pytest.raises(Conflict) as excinfo:
+        _reserve(store, "run_2")
+    assert excinfo.value.code == "run_not_retryable"
+    store.close()
+
+
+# Every persistable status, outcome shape and dispatch-marker state. Outcomes:
+# None (never written), the two known pre-execution-safe values, known-unsafe
+# values, and unknown/empty corrupt values.
+_ALL_STATUSES = sorted(
+    {
+        RESERVED,
+        QUEUED,
+        STARTING,
+        RUNNING,
+        CANCELLING,
+        COMPLETED,
+        FAILED,
+        CANCELLED,
+        UNKNOWN,
+        # A status outside the taxonomy is corrupt state; it must block too.
+        "bogus-corrupt",
+    }
+)
+_ALL_OUTCOMES = [
+    None,
+    OUTCOME_REJECTED,
+    OUTCOME_QUEUE_TIMEOUT,
+    OUTCOME_PROVIDER_ERROR,
+    OUTCOME_SUCCEEDED,
+    OUTCOME_CANCELLED,
+    OUTCOME_UNKNOWN,
+    "",
+]
+_STARTED_AT = [None, "2026-01-01T00:00:00+00:00"]
+# The reference proven-pre-execution row used to build ancestor chains.
+_SAFE_ROW = (FAILED, OUTCOME_REJECTED, None)
+
+
+def _seed_attempt(
+    store: Store,
+    run_id: str,
+    task: str,
+    *,
+    status: str,
+    outcome: str | None,
+    started_at: str | None,
+) -> None:
+    """Insert a history row directly, including states ``set_attempt`` cannot
+    express (a NULL outcome on a terminal status, corrupt/empty outcomes)."""
+    store._conn.execute(
+        "INSERT INTO attempts(run_id, principal, task_id, attempt_id, preset, "
+        "driver_id, runner_instance, workspace_id, request_hash, status, outcome, "
+        "started_at, synthetic, cached, created_at, updated_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1,0,'2026-01-01T00:00:00+00:00',"
+        "'2026-01-01T00:00:00+00:00')",
+        (
+            run_id,
+            "alpha",
+            task,
+            f"att_{run_id}",
+            "mock/text",
+            "mock",
+            "runner-1",
+            "ws-alpha",
+            "sha256:a",
+            status,
+            outcome,
+            started_at,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "started_at", _STARTED_AT, ids=["no-dispatch-marker", "dispatched"]
+)
+@pytest.mark.parametrize(
+    "outcome",
+    _ALL_OUTCOMES,
+    ids=[str(o) if o else ("null" if o is None else "empty") for o in _ALL_OUTCOMES],
+)
+@pytest.mark.parametrize("status", _ALL_STATUSES)
+def test_reserve_admission_matches_python_contract(
+    tmp_path, status, outcome, started_at
+):
+    """The SQL blocker predicate must agree with ``proven_pre_execution`` for
+    every reachable or corrupt row state — solo, and as either ancestor in a
+    two-attempt chain (a blocker anywhere in the history must still block)."""
+    store = Store(str(tmp_path / "core.db"))
+    store.initialize()
+    expected = proven_pre_execution(status, outcome, started_at)
+    expected_code = (
+        "run_active" if status in LOCK_STATUSES else "run_not_retryable"
+    )
+    histories = {
+        "solo": [(status, outcome, started_at)],
+        "combo_then_safe": [(status, outcome, started_at), _SAFE_ROW],
+        "safe_then_combo": [_SAFE_ROW, (status, outcome, started_at)],
+    }
+    for label, rows in histories.items():
+        task = f"task-{label}"
+        for index, (st, oc, sa) in enumerate(rows):
+            _seed_attempt(
+                store,
+                f"{label}-{index}",
+                task,
+                status=st,
+                outcome=oc,
+                started_at=sa,
+            )
+        if expected:
+            record = _reserve(store, f"new-{label}", task=task)
+            assert record.status == QUEUED, label
+        else:
+            with pytest.raises(Conflict) as excinfo:
+                _reserve(store, f"new-{label}", task=task)
+            assert excinfo.value.code == expected_code, (
+                label,
+                excinfo.value.code,
+            )
     store.close()

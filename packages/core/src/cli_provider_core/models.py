@@ -59,9 +59,11 @@ class AttemptRecord:
     updated_at: str
     started_at: str | None
     finished_at: str | None
-    # Authenticated dispatcher-supplied execution context (task_revision /
-    # base_revision / route / policy_version), persisted verbatim. Never
-    # model-supplied and never execution-selecting.
+    # Caller-supplied dispatcher execution context (task_revision /
+    # base_revision / route / policy_version), persisted verbatim. It is
+    # authenticated only in the sense that the request's principal key was
+    # authenticated — the values are NOT server-attested route/policy proof,
+    # are never model-supplied, and never select execution authority.
     execution: dict[str, Any] | None = None
 
 
@@ -106,7 +108,10 @@ class RunResultView(BaseModel):
     cached: bool = False
     # Truthful provenance: supplied from the persisted attempt, never defaulted.
     synthetic: bool
-    # The exact authenticated execution context the attempt was reserved with.
+    # The exact caller-supplied execution context the attempt was reserved
+    # with, echoed verbatim. It is not a server attestation of route/policy —
+    # a trusted dispatcher must match it against its own durable receipt and
+    # the canonical run/preset/model, never admit policy from the echo.
     execution: dict[str, Any] | None = None
     summary: str | None = None
     verification: dict[str, Any] = Field(default_factory=dict)
