@@ -50,14 +50,15 @@ def create_app(config: OperatorConfig) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        await registry.refresh()
         try:
+            await registry.refresh()
             yield
         finally:
-            store.close()
-            # Kernel lock released by closing the descriptor; the file is never
-            # unlinked, so a recycled inode cannot alias a live owner's lock.
-            release_store_owner_lock(owner_fd)
+            try:
+                store.close()
+            finally:
+                # Startup failures must also release ownership; never unlink.
+                release_store_owner_lock(owner_fd)
 
     app = FastAPI(
         title="cli-provider-api",

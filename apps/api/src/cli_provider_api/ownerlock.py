@@ -61,9 +61,10 @@ def acquire_store_owner_lock(db_path: str) -> int:
         ) from exc
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_nlink != 1):
             raise ApiOwnerError(
-                f"store owner lock {lock_path!r} is not a regular file owned "
+                f"store owner lock {lock_path!r} is not a single-link regular file owned "
                 "by this user; refusing to start"
             )
         os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
