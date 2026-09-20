@@ -19,15 +19,24 @@ import hashlib
 import json
 import os
 import re
+import urllib.parse
 from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    field_validator,
+    model_validator,
+)
 
 from cli_provider_sdk import ID_PATTERN
 
 from .models import EffortHint, RiskFlag, Role, Tier
+from .wrapper_client import _INSTALLED_SERVICE_PORT, _LOOPBACK_HOSTS
 
 DEFAULT_ASSIGNEE = "jev-native"
 
@@ -66,6 +75,11 @@ API_EFFORT_VALUES = frozenset({"low", "high", "max"})
 # be treated as free.
 GATED_TIER_FLOOR = frozenset({Tier.HARD, Tier.MAX})
 GATED_COST_FLOOR = frozenset({"unknown"})
+
+# The single endpoint the reviewed production approval names: the installed
+# 9Router data plane on the standard loopback address. Compared LITERALLY —
+# an alias, a path prefix, or any other host/port is not the approved base.
+INSTALLED_GATEWAY_DATA_BASE = f"http://127.0.0.1:{_INSTALLED_SERVICE_PORT}"
 
 
 class PolicyError(ValueError):
@@ -244,6 +258,14 @@ class ExecutionTarget(_Strict):
     credential_file: str | None = None
     control_base_url: str | None = None
     control_credential_file: str | None = None
+    # Explicit operator opt-in for the installed 9Router production data
+    # plane — the SUBMIT target only. Gateway mode only, and only with
+    # ``base_url`` equal to ``INSTALLED_GATEWAY_DATA_BASE`` literally (no
+    # alias, prefix or other host/port) plus a distinct explicit-http
+    # loopback ``control_base_url`` that is NOT the installed port. Never a
+    # direct target, never a control/management base. StrictBool: a truthy
+    # string is not consent.
+    allow_installed_gateway: StrictBool = False
 
     @field_validator("base_url", "control_base_url")
     @classmethod
@@ -275,6 +297,39 @@ class ExecutionTarget(_Strict):
                 "direct execution requires model — the operator-declared "
                 "preset alias submitted to the wrapper"
             )
+        if self.allow_installed_gateway:
+            if self.mode != "gateway":
+                raise ValueError(
+                    "execution.allow_installed_gateway is a gateway-mode "
+                    "approval only — a direct target can never be the "
+                    "installed service"
+                )
+            if self.base_url != INSTALLED_GATEWAY_DATA_BASE:
+                raise ValueError(
+                    "execution.allow_installed_gateway requires base_url "
+                    f"to be exactly {INSTALLED_GATEWAY_DATA_BASE!r} — the "
+                    "approved data endpoint is a literal loopback base, "
+                    "not an alias, prefix, or other host/port"
+                )
+            parsed = urllib.parse.urlparse(self.control_base_url or "")
+            try:
+                control_port = parsed.port or 80
+            except ValueError as exc:
+                raise ValueError(
+                    f"execution.control_base_url port is invalid: {exc}"
+                ) from exc
+            if (
+                parsed.scheme != "http"
+                or (parsed.hostname or "") not in _LOOPBACK_HOSTS
+                or control_port == _INSTALLED_SERVICE_PORT
+            ):
+                raise ValueError(
+                    "execution.allow_installed_gateway requires a distinct "
+                    "explicit-http loopback control_base_url that is NOT "
+                    f"port {_INSTALLED_SERVICE_PORT} — run control keeps "
+                    "using the separate wrapper base, never the installed "
+                    "data plane"
+                )
         return self
 
 

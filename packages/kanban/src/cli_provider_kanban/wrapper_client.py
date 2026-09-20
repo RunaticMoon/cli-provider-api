@@ -22,7 +22,10 @@ helpers below):
 
 * explicit ``http://`` loopback targets only — 127.0.0.1 / localhost / ::1,
   with ``localhost`` pinned to 127.0.0.1 so no DNS lookup can escape;
-  the installed service port (20128) is refused outright;
+  the installed service port (20128) is refused outright — the ONLY
+  exception is the submit data plane under the explicit
+  ``allow_installed_gateway`` opt-in, which requires a distinct control
+  base and never lifts the refusal for control or management traffic;
 * no redirects — a 3xx is a terminal error, never a re-issue (urllib's
   default handler would forward ``Authorization`` off-host);
 * no environment proxy — ``http.client`` never consults proxy config;
@@ -83,8 +86,11 @@ class _TransportFailure(Exception):
 
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
-# The installed 9Router service listens on 20128 — never a disposable target
-# and never a wrapper boundary, even when an operator marks it so.
+# The installed 9Router service listens on 20128 — never a disposable
+# target, a control base, or a wrapper boundary by default. The single
+# sanctioned exception is the SUBMIT data plane under the explicit
+# ``allow_installed_gateway`` operator opt-in, honoured only as a literal
+# True — the control and management planes keep refusing it regardless.
 _INSTALLED_SERVICE_PORT = 20128
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 _MAX_CREDENTIAL_BYTES = 64 * 1024
@@ -103,9 +109,14 @@ class _LoopbackBase:
 
     ``connect_host`` pins localhost to 127.0.0.1 so no DNS resolution ever
     runs for this boundary; ``netloc`` preserves the original Host header.
+
+    ``allow_installed_port`` lifts the installed-service-port refusal for
+    the approved submit data plane only — honoured exclusively as a
+    literal ``True`` (a truthy string or number can never widen the
+    boundary). The control and management bases never receive it.
     """
 
-    def __init__(self, url: str):
+    def __init__(self, url: str, *, allow_installed_port: bool = False):
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme != "http":
             raise WrapperError(
@@ -125,7 +136,7 @@ class _LoopbackBase:
             port = parsed.port or 80
         except ValueError as exc:
             raise WrapperError(f"wrapper URL port is invalid: {exc}") from exc
-        if port == _INSTALLED_SERVICE_PORT:
+        if port == _INSTALLED_SERVICE_PORT and allow_installed_port is not True:
             raise WrapperError(
                 "refusing the installed service port 20128 — it is never a "
                 "wrapper/gateway boundary"
@@ -351,7 +362,13 @@ def _consistent_run(run: dict, *, task_id: str, workspace_id: str) -> bool:
 class WrapperClient:
     """Submit goes to ``base_url`` (wrapper direct or a gateway); control
     reads go to ``control_base_url`` (default: same base) with
-    ``control_credential_file`` (default: same credential)."""
+    ``control_credential_file`` (default: same credential).
+
+    ``allow_installed_gateway`` is the narrow production approval: a
+    literal ``True`` lets ONLY the submit base target the installed
+    service port, and requires an explicit ``control_base_url`` so run
+    control stays on the separate wrapper base — which keeps the default
+    installed-port refusal regardless."""
 
     def __init__(
         self,
@@ -362,9 +379,18 @@ class WrapperClient:
         control_base_url: str | None = None,
         control_credential_file: str | None = None,
         max_response_bytes: int = _MAX_RESPONSE_BYTES,
+        allow_installed_gateway: bool = False,
     ):
         self.base_url = base_url.rstrip("/")
-        self._submit_base = _LoopbackBase(base_url)
+        if allow_installed_gateway is True and control_base_url is None:
+            raise WrapperError(
+                "allow_installed_gateway requires an explicit "
+                "control_base_url — run control must stay on the separate "
+                "wrapper base, never the installed data-plane port"
+            )
+        self._submit_base = _LoopbackBase(
+            base_url, allow_installed_port=allow_installed_gateway
+        )
         self._control_base = (
             _LoopbackBase(control_base_url)
             if control_base_url is not None

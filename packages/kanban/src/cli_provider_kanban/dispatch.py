@@ -196,6 +196,12 @@ def dispatch_once(
             policy.execution.base_url,
             credential_file=policy.execution.credential_file,
             timeout_seconds=policy.dispatch.http_timeout_seconds,
+            # Split-plane wiring: run control keeps its own base/credential.
+            # The production-gateway opt-in covers the SUBMIT data plane
+            # only — the separate control client below never receives it.
+            control_base_url=policy.execution.control_base_url,
+            control_credential_file=policy.execution.control_credential_file,
+            allow_installed_gateway=policy.execution.allow_installed_gateway,
         )
     # Run-control calls (cancel) go to the CONTROL target — gateway mode
     # separates it from the data POST URL; direct mode defaults to base.

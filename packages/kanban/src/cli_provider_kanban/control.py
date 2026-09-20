@@ -68,7 +68,11 @@ class ControlError(Exception):
 def _control_client(policy: Policy) -> WrapperClient:
     """Run-control calls (get/cancel/artifact) go to the CONTROL target —
     ``execution.control_base_url`` — which direct mode defaults to the data
-    base URL. The data POST URL is never assumed to serve run truth."""
+    base URL. The data POST URL is never assumed to serve run truth. The
+    ``execution.allow_installed_gateway`` opt-in deliberately does NOT
+    propagate here: the control plane keeps refusing the installed
+    service port — the policy already binds it to a distinct loopback
+    wrapper base instead."""
     if policy.execution is None:
         raise ControlError("policy has no execution target configured")
     exe = policy.execution
