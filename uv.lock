@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 members = [
     "cli-driver-antigravity",
     "cli-driver-devin",
+    "cli-driver-hermes-api",
     "cli-driver-mock",
     "cli-provider-api",
     "cli-provider-core",
@@ -75,6 +76,21 @@ requires-dist = [
 name = "cli-driver-devin"
 version = "0.1.0"
 source = { editable = "drivers/devin" }
+dependencies = [
+    { name = "cli-provider-sdk" },
+    { name = "cli-provider-transports" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "cli-provider-sdk", editable = "packages/driver-sdk" },
+    { name = "cli-provider-transports", editable = "packages/transports" },
+]
+
+[[package]]
+name = "cli-driver-hermes-api"
+version = "0.1.0"
+source = { editable = "drivers/hermes-api" }
 dependencies = [
     { name = "cli-provider-sdk" },
     { name = "cli-provider-transports" },
