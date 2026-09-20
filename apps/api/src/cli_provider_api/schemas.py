@@ -19,6 +19,8 @@ from cli_provider_core import (
     UnsupportedCapability,
 )
 from cli_provider_sdk import ID_PATTERN
+from cli_provider_sdk.models import ExecutionContext
+from pydantic import ValidationError
 
 import re
 
@@ -59,7 +61,10 @@ UNSUPPORTED_CHAT_FIELDS = frozenset(
 )
 
 # Operator config owns the task policy; it is never selectable by a request.
-ALLOWED_METADATA_FIELDS = frozenset({"task_id", "workspace_id"})
+# ``execution`` is the single nested dispatcher context (exact shape in
+# cli_provider_sdk.models.ExecutionContext); it is authenticated metadata, never
+# an executable/path/right selector.
+ALLOWED_METADATA_FIELDS = frozenset({"task_id", "workspace_id", "execution"})
 ROLES = frozenset({"system", "user", "assistant"})
 
 # A message is exactly {role, content} in this MVP. Execution-selecting keys
@@ -87,6 +92,7 @@ class ChatRequest:
     stream: bool
     task_id: str
     workspace_id: str
+    execution: dict[str, str] | None = None
 
 
 async def read_bounded_json(
@@ -191,12 +197,26 @@ def parse_chat_request(data: Mapping[str, Any]) -> ChatRequest:
     if not isinstance(workspace_id, str) or _ID.match(workspace_id) is None:
         raise InvalidRequest("metadata.workspace_id is required and must be a valid id")
 
+    execution = metadata.get("execution")
+    if execution is not None:
+        # Complete-if-present, strict bounded scalars, fixed keys only; the SDK
+        # schema is the single source of truth for the shape.
+        try:
+            execution = ExecutionContext.model_validate(execution).model_dump(mode="json")
+        except ValidationError as exc:
+            raise InvalidRequest(
+                "metadata.execution is invalid: expected exactly "
+                "{task_revision, base_revision, route, policy_version} as "
+                "bounded scalars with route in role.capability.tier form"
+            ) from exc
+
     return ChatRequest(
         model=model,
         messages=messages,
         stream=stream,
         task_id=task_id,
         workspace_id=workspace_id,
+        execution=execution,
     )
 
 

@@ -110,6 +110,7 @@ async def _handle(request: Request, driver_id: str | None) -> Any:
         workspace_id=chat_request.workspace_id,
         messages=chat_request.messages,
         deadline_seconds=_effective_deadline(config),
+        execution=chat_request.execution,
     )
 
     # The standard completion id is deterministically bound to the run, so a

@@ -56,6 +56,10 @@ def validate_alias(value: str) -> str:
 
 Alias = Annotated[str, AfterValidator(validate_alias)]
 
+# Dispatcher route in `role.capability.tier` form (e.g. ``worker.code.standard``):
+# exactly three bounded dot-separated segments, never a path or URL.
+ROUTE_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_-]{0,62}(\.[A-Za-z0-9][A-Za-z0-9_-]{0,62}){2}$"
+
 
 class _Schema(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -209,6 +213,22 @@ class Message(_Schema):
     content: str
 
 
+class ExecutionContext(_Schema):
+    """Authenticated dispatcher-supplied execution identity for one attempt.
+
+    Complete-if-present: all four bounded scalar fields are required together.
+    The values are opaque to the runtime — they are evidence metadata propagated
+    to the worker and back, never an executable/path/right selector and never
+    model-supplied text. Wrapper-generated ``run_id``/``attempt_id`` remain
+    canonical and are never part of this context.
+    """
+
+    task_revision: str = Field(pattern=ID_PATTERN)
+    base_revision: str = Field(pattern=ID_PATTERN)
+    route: str = Field(pattern=ROUTE_PATTERN)
+    policy_version: str = Field(pattern=ID_PATTERN)
+
+
 class NormalizedRequest(_Schema):
     run_id: str = Field(pattern=ID_PATTERN)
     task_id: str = Field(pattern=ID_PATTERN)
@@ -218,6 +238,9 @@ class NormalizedRequest(_Schema):
     model_alias: Alias | None = None
     messages: list[Message] = Field(min_length=1)
     deadline_seconds: float | None = Field(default=None, gt=0)
+    # Optional authenticated execution context (backwards-compatible: absent
+    # means a legacy request with no dispatcher metadata).
+    execution: ExecutionContext | None = None
 
 
 class Usage(_Schema):

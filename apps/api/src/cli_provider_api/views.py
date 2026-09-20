@@ -22,6 +22,7 @@ def run_view(
         outcome=record.outcome,
         cached=record.cached,
         synthetic=record.synthetic,
+        execution=record.execution,
         summary=record.summary,
         verification=record.verification or {},
         usage=record.usage or {"provenance": "unknown"},

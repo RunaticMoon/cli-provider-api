@@ -17,7 +17,11 @@ from typing import Any, Sequence
 from .errors import Conflict, UpstreamProtocolError
 from .models import (
     ACTIVE_STATUSES,
+    CANCELLED,
+    FAILED,
     LOCK_STATUSES,
+    OUTCOME_QUEUE_TIMEOUT,
+    OUTCOME_REJECTED,
     AttemptRecord,
     ArtifactRecord,
     EventRecord,
@@ -54,7 +58,8 @@ CREATE TABLE IF NOT EXISTS attempts (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     started_at TEXT,
-    finished_at TEXT
+    finished_at TEXT,
+    execution TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS attempts_logical_lock
     ON attempts(principal, task_id)
@@ -105,6 +110,37 @@ def _lock_placeholders(statuses: Sequence[str]) -> str:
     return ",".join("?" for _ in statuses)
 
 
+# Outcomes that are only ever recorded while a run is provably pre-dispatch:
+# queue-admission timeout, a pre-dispatch rejection, or the Runner's typed
+# pre-execution rejection (attested before the driver could start).
+_PREEXECUTION_SAFE_OUTCOMES = (OUTCOME_REJECTED, OUTCOME_QUEUE_TIMEOUT)
+
+# SQL mirror of proven_pre_execution(): an attempt row is a *blocker* when it is
+# NOT proven pre-execution. Any blocker in a task's history forbids admitting a
+# new attempt, so a retry can never follow an execution that may have had
+# effects — including a failed or cancelled one.
+_BLOCKER_PREDICATE = (
+    "NOT ((status='failed' AND outcome IN ('rejected','queue_timeout')) "
+    "OR (status='cancelled' AND started_at IS NULL))"
+)
+
+
+def proven_pre_execution(
+    status: str, outcome: str | None, started_at: str | None
+) -> bool:
+    """True only when the attempt provably never dispatched to the Runner.
+
+    ``started_at`` is the durable dispatch marker, persisted atomically before
+    the run RPC is issued; a cancelled attempt without it never left the queue.
+    A ``failed``/``rejected`` or ``failed``/``queue_timeout`` attempt never
+    produced Runner-side effects either (the latter is attested by the Runner's
+    typed pre-execution error codes, the former by admission ordering).
+    """
+    if status == FAILED and outcome in _PREEXECUTION_SAFE_OUTCOMES:
+        return True
+    return status == CANCELLED and started_at is None
+
+
 class Store:
     def __init__(self, db_path: str, *, clock=utcnow) -> None:
         self.db_path = db_path
@@ -142,6 +178,10 @@ class Store:
             self._conn.execute(
                 "ALTER TABLE attempts ADD COLUMN synthetic INTEGER NOT NULL DEFAULT 1"
             )
+        if "execution" not in columns:
+            # Nullable dispatcher-supplied execution context (JSON object);
+            # pre-existing rows truthfully have none.
+            self._conn.execute("ALTER TABLE attempts ADD COLUMN execution TEXT")
 
     def _reconcile_restart(self) -> dict[str, Any]:
         """Formerly active attempts become unknown; never re-queued for replay."""
@@ -208,11 +248,14 @@ class Store:
         cached: bool = False,
         synthetic: bool = True,
         finished_at: str | None = None,
+        execution: dict[str, Any] | None = None,
     ) -> AttemptRecord:
         """Atomically reserve a task+attempt before any run dispatch.
 
-        Re-checks the logical lock and content hash inside the transaction so
-        concurrent identical calls cannot both execute.
+        Re-checks the logical lock, the content hash and the retry-safety
+        admission rule inside the transaction so concurrent identical calls
+        cannot both execute: a new attempt is admitted only when every prior
+        attempt for the task is proven pre-execution.
         """
         now = self._clock()
         with self._lock:
@@ -238,6 +281,19 @@ class Store:
                         code="run_active",
                         run_id=locked["run_id"],
                     )
+                blocker = self._conn.execute(
+                    f"SELECT run_id FROM attempts WHERE principal=? AND task_id=? "
+                    f"AND {_BLOCKER_PREDICATE} "
+                    "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    (principal, task_id),
+                ).fetchone()
+                if blocker is not None:
+                    raise Conflict(
+                        "a previous attempt for this task already reached or "
+                        "completed execution; automatic retry is never admitted",
+                        code="run_not_retryable",
+                        run_id=blocker["run_id"],
+                    )
                 if task is None:
                     self._conn.execute(
                         "INSERT INTO tasks(principal, task_id, request_hash, task_policy, "
@@ -247,12 +303,14 @@ class Store:
                 self._conn.execute(
                     "INSERT INTO attempts(run_id, principal, task_id, attempt_id, preset, "
                     "driver_id, runner_instance, workspace_id, request_hash, status, outcome, "
-                    "detail, summary, synthetic, cached, created_at, updated_at, finished_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "detail, summary, synthetic, cached, created_at, updated_at, finished_at, "
+                    "execution) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         run_id, principal, task_id, attempt_id, preset, driver_id,
                         runner_instance, workspace_id, request_hash, status, outcome,
                         detail, summary, int(synthetic), int(cached), now, now, finished_at,
+                        json.dumps(execution, sort_keys=True) if execution is not None else None,
                     ),
                 )
                 self._conn.execute("COMMIT")
@@ -482,6 +540,7 @@ def _attempt(row: sqlite3.Row) -> AttemptRecord:
         usage=json.loads(row["usage"]) if row["usage"] else None,
         synthetic=bool(row["synthetic"]),
         cached=bool(row["cached"]),
+        execution=json.loads(row["execution"]) if row["execution"] else None,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         started_at=row["started_at"],

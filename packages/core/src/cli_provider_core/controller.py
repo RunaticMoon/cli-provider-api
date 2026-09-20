@@ -51,7 +51,7 @@ from .models import (
     EventRecord,
 )
 from .registry import RunnerRegistry
-from .store import Store, utcnow
+from .store import Store, proven_pre_execution, utcnow
 
 _ACTIVE = sorted(ACTIVE_STATUSES)
 # Terminals that are a validated driver outcome (unlike `unknown`, which is a
@@ -163,6 +163,7 @@ class RunController:
         workspace_id: str,
         messages: Sequence[Mapping[str, Any]],
         deadline_seconds: float,
+        execution: Mapping[str, Any] | None = None,
     ) -> Submission:
         instance_id = preset.runner_ref
         # Operator config owns the task policy: it is never caller-selected.
@@ -173,6 +174,7 @@ class RunController:
             workspace_id=workspace_id,
             task_policy=task_policy,
             messages=messages,
+            execution=execution,
         )
 
         existing = self._store.latest_attempt(principal, task_id)
@@ -204,6 +206,20 @@ class RunController:
                         run_id=existing.run_id,
                     )
                 return Submission(cached=True, record=replace(existing, cached=True))
+            # Any other terminal attempt may already have had Runner-side
+            # effects; a new attempt is admitted only when every prior attempt
+            # is proven pre-execution. Store.reserve re-checks the same rule
+            # inside the reservation transaction, so concurrent admissions
+            # cannot race past it.
+            if not proven_pre_execution(
+                existing.status, existing.outcome, existing.started_at
+            ):
+                raise Conflict(
+                    "a previous attempt for this task already reached or "
+                    "completed execution; automatic retry is never admitted",
+                    code="run_not_retryable",
+                    run_id=existing.run_id,
+                )
 
         # Only a *new* execution needs a verified, non-quarantined runner.
         if not self._registry.runner_available(instance_id):
@@ -240,20 +256,45 @@ class RunController:
         normalised_messages = [
             {"role": str(m.get("role")), "content": str(m.get("content"))} for m in messages
         ]
-        record = self._store.reserve(
-            run_id=run_id,
-            attempt_id=attempt_id,
-            principal=principal,
-            task_id=task_id,
-            preset=preset.alias,
-            driver_id=self._registry.runner_config(instance_id).driver_id,
-            runner_instance=instance_id,
-            workspace_id=workspace_id,
-            request_hash=digest,
-            task_policy=task_policy,
-            status=QUEUED,
-            synthetic=self._registry.runner_synthetic(instance_id),
-        )
+        try:
+            record = self._store.reserve(
+                run_id=run_id,
+                attempt_id=attempt_id,
+                principal=principal,
+                task_id=task_id,
+                preset=preset.alias,
+                driver_id=self._registry.runner_config(instance_id).driver_id,
+                runner_instance=instance_id,
+                workspace_id=workspace_id,
+                request_hash=digest,
+                task_policy=task_policy,
+                status=QUEUED,
+                synthetic=self._registry.runner_synthetic(instance_id),
+                execution=dict(execution) if execution is not None else None,
+            )
+        except Conflict as exc:
+            if exc.code != "run_not_retryable":
+                raise
+            # A completion raced the pre-check above: an identical replay under
+            # the same preset still gets the cached result, never a second
+            # execution and never a relabelled model.
+            latest = self._store.latest_attempt(principal, task_id)
+            task = self._store.get_task(principal, task_id)
+            if (
+                latest is None
+                or latest.status != COMPLETED
+                or task is None
+                or task["request_hash"] != digest
+            ):
+                raise
+            if latest.preset != preset.alias:
+                raise Conflict(
+                    "task already completed under a different model; a cached "
+                    "result is not relabelled as a new-model inference",
+                    code="model_conflict",
+                    run_id=latest.run_id,
+                ) from exc
+            return Submission(cached=True, record=replace(latest, cached=True))
         self._runner_outstanding[instance_id] = (
             self._runner_outstanding.get(instance_id, 0) + 1
         )
@@ -462,6 +503,11 @@ class RunController:
             "messages": active.messages,
             "deadline_seconds": deadline_seconds,
         }
+        if record.execution is not None:
+            # Authenticated dispatcher context; opaque to the runtime, carried
+            # verbatim to the worker. Runner protocol support for the field is
+            # required for dispatch — a Runner without it rejects pre-execution.
+            params["execution"] = dict(record.execution)
         chunks: list[str] = []
         output_bytes = 0
         events_seen = 0

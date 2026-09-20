@@ -59,6 +59,10 @@ class AttemptRecord:
     updated_at: str
     started_at: str | None
     finished_at: str | None
+    # Authenticated dispatcher-supplied execution context (task_revision /
+    # base_revision / route / policy_version), persisted verbatim. Never
+    # model-supplied and never execution-selecting.
+    execution: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +106,8 @@ class RunResultView(BaseModel):
     cached: bool = False
     # Truthful provenance: supplied from the persisted attempt, never defaulted.
     synthetic: bool
+    # The exact authenticated execution context the attempt was reserved with.
+    execution: dict[str, Any] | None = None
     summary: str | None = None
     verification: dict[str, Any] = Field(default_factory=dict)
     usage: dict[str, Any] = Field(default_factory=dict)

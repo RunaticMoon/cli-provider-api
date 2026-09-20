@@ -24,6 +24,7 @@ def request_hash(
     workspace_id: str,
     task_policy: str,
     messages: Sequence[Mapping[str, Any]],
+    execution: Mapping[str, Any] | None = None,
 ) -> str:
     payload = {
         "principal": principal,
@@ -34,6 +35,11 @@ def request_hash(
             {"role": m.get("role"), "content": m.get("content")} for m in messages
         ],
     }
+    # The authenticated execution context is part of the logical request: a
+    # replay carrying different context is a content conflict, while a request
+    # without it keeps the legacy digest unchanged.
+    if execution is not None:
+        payload["execution"] = dict(execution)
     return "sha256:" + hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 

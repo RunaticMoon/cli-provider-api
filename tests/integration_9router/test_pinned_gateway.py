@@ -1,4 +1,4 @@
-"""Opt-in, real 9Router 0.5.75 -> HTTP API -> UDS -> synthetic driver.
+"""Opt-in, real 9Router 0.5.81 -> HTTP API -> UDS -> synthetic driver.
 
 Run with NINEROUTER_APP pointing to the trusted npm package's app directory:
     uv run --all-packages pytest tests/integration_9router -v
@@ -43,7 +43,7 @@ def gateway(tmp_path):
     assert configured is not None
     app = Path(configured).resolve()
     package = json.loads((app / "package.json").read_text())
-    assert package["name"] == "9router-app" and package["version"] == "0.5.75"
+    assert package["name"] == "9router-app" and package["version"] == "0.5.81"
     node = os.environ.get("NINEROUTER_NODE") or shutil.which("node")
     assert node, "A trusted Node executable is required"
     with socket.socket() as reservation:
