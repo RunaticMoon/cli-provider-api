@@ -90,12 +90,14 @@ def runner_factory(sock_dir):
         cancel_deadline: float | None = None,
         cancel_detail: str | None = None,
         umask: int | None = None,
+        extra_env: dict[str, str] | None = None,
         wait: bool = True,
     ) -> RunnerProcess:
         socket_path = os.path.join(sock_dir, f"r{counter['n']}.sock")
         counter["n"] += 1
         env = os.environ.copy()
         env["CLI_DRIVER_MOCK_BEHAVIOR"] = behavior
+        env.update(extra_env or {})
         if malformed_mode is not None:
             env["CLI_DRIVER_MOCK_MALFORMED_MODE"] = malformed_mode
         if cancel_detail is not None:

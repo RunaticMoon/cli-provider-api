@@ -5,6 +5,7 @@ requires-python = ">=3.11"
 [manifest]
 members = [
     "cli-driver-antigravity",
+    "cli-driver-devin",
     "cli-driver-mock",
     "cli-provider-api",
     "cli-provider-core",
@@ -59,6 +60,21 @@ wheels = [
 name = "cli-driver-antigravity"
 version = "0.1.0"
 source = { editable = "drivers/antigravity" }
+dependencies = [
+    { name = "cli-provider-sdk" },
+    { name = "cli-provider-transports" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "cli-provider-sdk", editable = "packages/driver-sdk" },
+    { name = "cli-provider-transports", editable = "packages/transports" },
+]
+
+[[package]]
+name = "cli-driver-devin"
+version = "0.1.0"
+source = { editable = "drivers/devin" }
 dependencies = [
     { name = "cli-provider-sdk" },
     { name = "cli-provider-transports" },

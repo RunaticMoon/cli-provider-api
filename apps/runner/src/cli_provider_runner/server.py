@@ -33,6 +33,7 @@ from cli_provider_sdk import (
     EventKind,
     NormalizedRequest,
     Outcome,
+    ProcessExecutor,
     ProviderDriver,
     RunResult,
     RuntimeContext,
@@ -47,6 +48,7 @@ from cli_provider_transports import (
     DEFAULT_MAX_FRAME_BYTES,
     FrameReader,
     FrameTooLarge,
+    LocalProcessExecutor,
     MalformedFrame,
     decode_frame,
     encode_frame,
@@ -92,6 +94,7 @@ class RunnerServer:
         instance_id: str,
         entry: DriverAllowlistEntry | None = None,
         driver: ProviderDriver | None = None,
+        executor: ProcessExecutor | None = None,
         max_queue: int = 8,
         max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
         cancel_deadline_seconds: float = 5.0,
@@ -110,6 +113,12 @@ class RunnerServer:
         self.max_run_seconds = max_run_seconds
 
         self._driver: ProviderDriver | None = driver
+        # The Runner supplies the process executor so drivers never choose how
+        # to spawn; a run request can still not select argv/cwd/env. An
+        # explicitly injected executor wins for embedding/tests.
+        self._executor: ProcessExecutor = (
+            executor if executor is not None else LocalProcessExecutor()
+        )
         self._server: asyncio.AbstractServer | None = None
         self._stop = asyncio.Event()
         self._run_slot = asyncio.Semaphore(1)
@@ -280,12 +289,12 @@ class RunnerServer:
             return True
 
         if method is Method.PROBE:
-            probe = await self.driver.probe(RuntimeContext())
+            probe = await self.driver.probe(self._driver_context())
             await self._send_response(writer, request.id, probe.model_dump(mode="json"))
             return True
 
         if method is Method.DISCOVER_MODELS:
-            models = await self.driver.discover_models(RuntimeContext())
+            models = await self.driver.discover_models(self._driver_context())
             await self._send_response(
                 writer,
                 request.id,
@@ -439,10 +448,16 @@ class RunnerServer:
             reason="execution deadline exceeded; cancellation was not confirmed",
         )
 
+    def _driver_context(self) -> RuntimeContext:
+        """Context for probe/discovery calls (no run-scoped cancellation)."""
+        return RuntimeContext(executor=self._executor)
+
     async def _consume(
         self, active: ActiveRun, writer: asyncio.StreamWriter, request_id: str
     ) -> RunResult:
-        context = RuntimeContext(cancellation=active.cancellation)
+        context = RuntimeContext(
+            cancellation=active.cancellation, executor=self._executor
+        )
         terminal: Any = None
         violation: str | None = None
 
@@ -589,7 +604,7 @@ class RunnerServer:
     async def _bounded_driver_cancel(self, run_id: str) -> tuple[bool, str | None]:
         try:
             result = await asyncio.wait_for(
-                self.driver.cancel(run_id, RuntimeContext()),
+                self.driver.cancel(run_id, self._driver_context()),
                 timeout=self.cancel_deadline_seconds,
             )
             return result.confirmed, result.detail
