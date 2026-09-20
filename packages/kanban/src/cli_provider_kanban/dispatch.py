@@ -279,7 +279,8 @@ def _recover_stale(kernel: KernelBridge, store: DispatchStore, report: dict) -> 
                 "block_owned", task_id=res.task_id, kind="needs_input",
                 run_id=res.kernel_run_id,
                 reason=f"dispatch {res.dispatch_id} unknown after crash — "
-                       "execution may have started; manual resolve required",
+                       "execution may have started; manual resolve required "
+                       f"[dispatch {res.dispatch_id}]",
             )
             report["recovered"].append(
                 {"dispatch_id": res.dispatch_id, "state": "unknown",
@@ -296,9 +297,11 @@ def _record_block(
     racing cancel wins the receipt instead of crashing the tick.
 
     ``block_owned`` fences the mutation: the card is only blocked while
-    the live run is the one ``krun`` claims — never a foreign run."""
+    the live run is the one ``krun`` claims — never a foreign run. The
+    board reason carries the anchored ``[dispatch <id>]`` marker so a
+    later resolve can attribute the block exactly — never by substring."""
     kernel.call("block_owned", task_id=res.task_id, kind=kind, run_id=krun,
-                reason=reason)
+                reason=f"{reason} [dispatch {res.dispatch_id}]")
     if control_client is not None and task is not None:
         _res, cancelled = _transition_guarded(
             store, control_client, kernel, res, task, krun, BLOCKED, {},
@@ -339,8 +342,15 @@ def _dispatch_card(kernel, store, client, control_client,
         return {"task_id": task.id, "action": "hold", "reason": decision.reason}
 
     if action is RecommendedAction.REPLAN:
-        kernel.call("block", task_id=task.id, kind="needs_input",
-                    reason=f"replan: {decision.reason}")
+        # Pre-claim block fenced to "no live run": a card claimed by
+        # another process between the listing and this call is never
+        # blocked out from under it.
+        blk = kernel.call("block_owned", task_id=task.id, kind="needs_input",
+                          run_id=None, reason=f"replan: {decision.reason}")
+        if not blk.get("blocked"):
+            return {"task_id": task.id, "action": "hold",
+                    "reason": f"replan deferred — card changed hands: "
+                              f"{blk.get('reason') or blk.get('status')}"}
         return {"task_id": task.id, "action": "replan",
                 "reason": decision.reason}
 
@@ -381,7 +391,7 @@ def _gate_for_approval(kernel, store, policy, task, decision, spec) -> dict:
         ttl_seconds=policy.approval.expiry_seconds,
     )
     kernel.call(
-        "block", task_id=task.id, kind="needs_input",
+        "block_owned", task_id=task.id, kind="needs_input", run_id=None,
         reason=f"needs_approval ({approval.approval_id}): {decision.reason}",
     )
     if policy.approval.notify is not None:
@@ -420,23 +430,41 @@ def _candidate_models(policy: Policy, route, capability: str) -> list[str]:
     return [model for _, model in _candidate_bindings(policy, route, capability)]
 
 
+_MOCK_FIXTURE_PREFIX = "mock/"
+
+
+def _is_mock_fixture(model) -> bool:
+    """The declared development fixture: the ``mock/`` preset namespace the
+    mock driver binds (e.g. ``mock/text``). The ONLY noncandidate preset a
+    direct dispatch may submit — and even it must still self-report the
+    synthetic lane post-run."""
+    return isinstance(model, str) and model.startswith(_MOCK_FIXTURE_PREFIX)
+
+
 def _execute(kernel, store, client, control_client, policy, task, spec,
              decision, grant=None) -> dict:
-    if decision.route not in policy.routes:
-        kernel.call("block", task_id=task.id, kind="needs_input",
-                    reason=f"classifier produced unroutable route "
-                           f"{decision.route!r} — no policy route binds it")
+    def _fenced_block(reason, action_reason):
+        blk = kernel.call("block_owned", task_id=task.id, kind="needs_input",
+                          run_id=None, reason=reason)
+        if not blk.get("blocked"):
+            return {"task_id": task.id, "action": "skipped",
+                    "reason": f"card changed hands before block: "
+                              f"{blk.get('reason') or blk.get('status')}"}
         return {"task_id": task.id, "action": "blocked",
-                "reason": f"unroutable route {decision.route!r}"}
+                "reason": action_reason}
+
+    if decision.route not in policy.routes:
+        return _fenced_block(
+            f"classifier produced unroutable route {decision.route!r} — "
+            "no policy route binds it",
+            f"unroutable route {decision.route!r}")
     route = policy.routes[decision.route]
     workspace = policy.workspaces.get(spec.workspace_id)
     if workspace is None:
-        kernel.call("block", task_id=task.id, kind="needs_input",
-                    reason=f"spec workspace {spec.workspace_id!r} is not in "
-                           "the policy — refusing to dispatch into an "
-                           "unconfigured root")
-        return {"task_id": task.id, "action": "blocked",
-                "reason": f"unknown workspace {spec.workspace_id!r}"}
+        return _fenced_block(
+            f"spec workspace {spec.workspace_id!r} is not in the policy — "
+            "refusing to dispatch into an unconfigured root",
+            f"unknown workspace {spec.workspace_id!r}")
     fingerprint = policy_fingerprint(policy)
 
     try:
@@ -444,10 +472,8 @@ def _execute(kernel, store, client, control_client, policy, task, spec,
             policy, route, decision.capability, spec.effort_hint
         )
     except EffortUnsupported as exc:
-        kernel.call("block", task_id=task.id, kind="needs_input",
-                    reason=f"unsupported effort mapping: {exc}")
-        return {"task_id": task.id, "action": "blocked",
-                "reason": f"effort_unsupported: {exc}"}
+        return _fenced_block(f"unsupported effort mapping: {exc}",
+                             f"effort_unsupported: {exc}")
 
     # resolve_effort only PROVES a mapping exists; applying it needs the
     # pinned Runner to actually carry the wire value. The operator attests
@@ -458,19 +484,14 @@ def _execute(kernel, store, client, control_client, policy, task, spec,
     if applied:
         pin = workspace.runner_effort_pin
         if pin is None or len(applied) != 1 or pin != next(iter(applied)):
-            kernel.call(
-                "block", task_id=task.id, kind="needs_input",
-                reason=(
-                    f"effort hint {spec.effort_hint.value!r} resolves to "
-                    f"{sorted(applied)} on routed candidates but workspace "
-                    f"{spec.workspace_id!r} has runner_effort_pin={pin!r} — "
-                    "the pinned Runner cannot be proven to carry that "
-                    "effort; refusing rather than running the wrong effort"
-                ),
-            )
-            return {"task_id": task.id, "action": "blocked",
-                    "reason": "effort_pin_missing: resolved effort "
-                              f"{sorted(applied)} not pinned on workspace"}
+            return _fenced_block(
+                f"effort hint {spec.effort_hint.value!r} resolves to "
+                f"{sorted(applied)} on routed candidates but workspace "
+                f"{spec.workspace_id!r} has runner_effort_pin={pin!r} — "
+                "the pinned Runner cannot be proven to carry that effort; "
+                "refusing rather than running the wrong effort",
+                "effort_pin_missing: resolved effort "
+                f"{sorted(applied)} not pinned on workspace")
 
     # 1. Stable reservation BEFORE any claim/HTTP side effect — an applied
     #    grant (when present) is consumed in the same transaction.
@@ -683,6 +704,31 @@ def _execute_reserved(kernel, store, client, control_client, policy, task,
     except WorktreeError as exc:
         return _record_block(kernel, store, res, kind="needs_input",
                              reason=f"workspace admission failed: {exc}")
+
+    # 3b. Direct-mode preset admission BEFORE claim/wire: the submitted
+    #     preset must be a concrete candidate of the classified route. The
+    #     sole exception is the declared development fixture — the ``mock/``
+    #     preset namespace the mock driver binds — which completes only as
+    #     the self-reported synthetic lane. Any other noncandidate preset
+    #     is an unrelated native binding; a post-execution ``synthetic``
+    #     bit is not approval for it, so the refusal lands before submit.
+    if policy.execution.mode == "direct":
+        try:
+            route_presets = [
+                preset for preset, _ in _candidate_bindings(
+                    policy, route, decision.capability)
+            ]
+        except WorktreeError:
+            route_presets = []
+        if model not in route_presets and not _is_mock_fixture(model):
+            return _record_block(
+                kernel, store, res, kind="needs_input",
+                reason=f"direct preset {model!r} is not a candidate of "
+                       f"the classified route {decision.route!r} "
+                       f"(candidates: {sorted(route_presets)}) and is not "
+                       "the declared mock fixture lane — refusing to "
+                       "submit an unverifiable binding",
+            )
 
     # 4. max_retries=1 before claim — stock reclaim must never replay an
     #    external write.

@@ -79,6 +79,19 @@ def _control_client(policy: Policy) -> WrapperClient:
     )
 
 
+def _dispatch_block_marked(reason, dispatch_id: str) -> bool:
+    """Anchored dispatch attribution on a block reason — the marker must sit
+    at a fixed boundary (``resolve <id>:`` prefix or ``[dispatch <id>]``
+    suffix); a floating substring is not attribution. Mirrors the bridge's
+    rule for the ``unblock_owned`` fence."""
+    if not isinstance(reason, str) or not reason:
+        return False
+    return (
+        reason.startswith(f"resolve {dispatch_id}:")
+        or reason.endswith(f"[dispatch {dispatch_id}]")
+    )
+
+
 def _require_operator(policy: Policy, actor: str) -> None:
     """The actor must be a configured operator AND the current OS user —
     a bare string on the CLI is not authentication. When the policy carries
@@ -281,13 +294,22 @@ def cmd_approve(
         except StoreError as exc:
             raise ControlError(str(exc)) from exc
         with KernelBridge(board_db, cfg=policy.hermes) as kernel:
-            kernel.call("unblock", task_id=approval.task_id)
+            # Fenced: unblock only the block THIS approval filed — the
+            # anchored ``needs_approval (<id>):`` marker must still be the
+            # card's latest block reason under the write lock, so a later
+            # foreign block (or a live run) is never silently cleared.
+            ub = kernel.call(
+                "unblock_owned", task_id=approval.task_id, run_id=None,
+                reason_prefix=f"needs_approval ({approval.approval_id}):",
+            )
             task = kernel.call("get_task", task_id=approval.task_id).get("task")
         return {
             "approval_id": approval_id,
             "state": approval.state,
             "task_id": approval.task_id,
             "task_status": task["status"] if task else None,
+            "unblocked": bool(ub.get("unblocked")),
+            **({"card_note": ub.get("reason")} if ub.get("reason") else {}),
         }
     finally:
         store.close()
@@ -556,7 +578,7 @@ def cmd_resolve(
             # Inspection failure fails CLOSED — never a successful review,
             # never swallowed uncertainty.
             reason = (f"quality_failed (resolve): evidence inspection "
-                      f"failed — {exc}")
+                      f"failed — {exc} [dispatch {res.dispatch_id}]")
             with KernelBridge(board_db, cfg=policy.hermes) as kernel:
                 kernel.call(
                     "block_owned", task_id=res.task_id, kind="needs_input",
@@ -601,7 +623,8 @@ def cmd_resolve(
             if violations:
                 reasons.append(
                     f"changed files outside allowed_scope: {violations}")
-            reason = "quality_failed (resolve): " + "; ".join(reasons)
+            reason = ("quality_failed (resolve): " + "; ".join(reasons)
+                      + f" [dispatch {res.dispatch_id}]")
             with KernelBridge(board_db, cfg=policy.hermes) as kernel:
                 kernel.call(
                     "block_owned", task_id=res.task_id, kind="needs_input",
@@ -626,7 +649,12 @@ def cmd_resolve(
             if held is None and task["status"] == "blocked":
                 lb = task.get("last_block") or {}
                 block_reason = lb.get("reason") or ""
-                if res.dispatch_id not in block_reason:
+                block_run = lb.get("run_id")
+                if block_run is None or int(block_run) != int(ours):
+                    held = ("card is blocked on a run this dispatch did "
+                            "not own — never auto-cleared")
+                elif not _dispatch_block_marked(block_reason,
+                                                res.dispatch_id):
                     held = ("card is blocked by a block this dispatch did "
                             "not file — never auto-cleared")
                 elif (task.get("latest_run_id") is not None
@@ -634,9 +662,23 @@ def cmd_resolve(
                     held = ("a newer kernel run owns the card — the stale "
                             "run's resolve cannot promote it")
                 else:
-                    kernel.call("unblock", task_id=res.task_id)
-                    task = kernel.call(
-                        "get_task", task_id=res.task_id).get("task")
+                    # Fenced under the mutator's own write lock: the card
+                    # must still be blocked, still carry no newer/foreign
+                    # run, and still wear the exact block this dispatch
+                    # filed — a changed or foreign block is never cleared.
+                    ub = kernel.call(
+                        "unblock_owned", task_id=res.task_id, run_id=ours,
+                        latest_run_id=task.get("latest_run_id"),
+                        reason_prefix=f"resolve {res.dispatch_id}:",
+                        reason_suffix=f"[dispatch {res.dispatch_id}]",
+                    )
+                    if not ub.get("unblocked"):
+                        held = ("the fenced unblock was refused — card "
+                                "state changed under us: "
+                                f"{ub.get('reason') or 'unknown'}")
+                    else:
+                        task = kernel.call(
+                            "get_task", task_id=res.task_id).get("task")
             expected = None
             if held is None:
                 cur = task.get("current_run_id") if task else None
@@ -654,20 +696,37 @@ def cmd_resolve(
                         held = ("a newer kernel run owns the card — the "
                                 "stale run's resolve cannot promote it")
                     else:
-                        # Re-claim to obtain a live, provable fence: the
-                        # claim CAS is atomic, and the review handoff then
-                        # rides the run this resolve itself owns.
+                        # Re-claim to obtain a live, provable fence. The
+                        # fenced claim re-proves under the kernel's own
+                        # write lock that no run newer than ours exists —
+                        # an interleaved foreign claim cannot be ridden
+                        # over. The NEW run id is recorded on the receipt
+                        # so every later control refers to the real
+                        # handoff run.
                         claim = kernel.call(
                             "claim", task_id=res.task_id,
                             claimer=f"jev-resolve:{dispatch_id}",
                             ttl_seconds=policy.dispatch.claim_ttl_seconds,
+                            expected_run_id=ours,
                         )
                         if claim.get("claimed"):
                             expected = (claim.get("task") or {}).get(
                                 "current_run_id")
+                            try:
+                                store.transition(
+                                    dispatch_id, UNKNOWN,
+                                    kernel_run_id=expected,
+                                    detail=f"resolve {dispatch_id}: "
+                                           f"re-claimed under kernel run "
+                                           f"{expected}")
+                            except StoreError:
+                                held = ("receipt closed while claiming "
+                                        "the resolve run")
                         else:
                             held = ("card could not be claimed for the "
-                                    "resolve handoff")
+                                    "resolve handoff" +
+                                    (f": {claim.get('reason')}"
+                                     if claim.get("reason") else ""))
                 else:
                     held = (f"card status {task['status']!r} cannot accept "
                             "this run's resolve")

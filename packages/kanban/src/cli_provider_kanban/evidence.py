@@ -82,11 +82,24 @@ def evidence_dir(store_path: str | Path) -> Path:
 def _write_private(path: Path, data: bytes) -> None:
     """Write ``data`` to ``path`` 0600, refusing planted links.
 
-    A pre-existing file must be a regular, single-linked file owned by this
-    euid before it is replaced; anything else is an attacker sentinel and is
-    left untouched.
+    Ordering is load-bearing: nothing destructive happens before the opened
+    file descriptor itself is verified.
+
+    - the parent directory is pinned by FD first (``O_DIRECTORY`` +
+      ``O_NOFOLLOW``) and re-verified — an ancestor swapped for a symlink or
+      a foreign dir after ``evidence_dir``'s check cannot redirect the
+      leaf open;
+    - the leaf is opened WITHOUT ``O_TRUNC`` — a hardlink swap between the
+      pre-open ``lstat`` and the open cannot have a shared sentinel inode
+      erased underneath us;
+    - ``fstat`` on the ACTUAL descriptor then requires a regular file owned
+      by this euid, single-linked, and — when a file was inspected
+      pre-open — still the exact same ``(st_dev, st_ino)``;
+    - only then is the verified FD truncated via ``ftruncate`` and written.
     """
     euid = os.geteuid()
+    path = Path(path)
+    prior = None
     if os.path.lexists(path):
         st = _lstat(path)
         if not stat.S_ISREG(st.st_mode) or st.st_uid != euid or st.st_nlink != 1:
@@ -94,17 +107,38 @@ def _write_private(path: Path, data: bytes) -> None:
                 f"refusing to replace {path}: not a singly-linked regular "
                 "file owned by this uid — left untouched"
             )
-    fd = os.open(
-        path,
-        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _NOFOLLOW,
-        0o600,
+        prior = (st.st_dev, st.st_ino)
+    dir_fd = os.open(
+        str(path.parent),
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _NOFOLLOW,
     )
+    try:
+        st = os.fstat(dir_fd)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != euid:
+            raise EvidenceError(
+                f"refusing to write {path}: parent is not an owned real "
+                "directory"
+            )
+        fd = os.open(
+            path.name,
+            os.O_WRONLY | os.O_CREAT | _NOFOLLOW,
+            0o600,
+            dir_fd=dir_fd,
+        )
+    finally:
+        os.close(dir_fd)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_uid != euid or st.st_nlink != 1:
             raise EvidenceError(f"refusing to write {path}: unsafe target")
+        if prior is not None and (st.st_dev, st.st_ino) != prior:
+            raise EvidenceError(
+                f"refusing to write {path}: target inode changed under us — "
+                "left untouched"
+            )
         if st.st_mode & 0o077:
             os.fchmod(fd, 0o600)
+        os.ftruncate(fd, 0)
         view = memoryview(data)
         while view:
             view = view[os.write(fd, view):]
