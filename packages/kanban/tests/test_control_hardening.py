@@ -205,22 +205,36 @@ def test_resolve_wrapper_404_stays_unknown(env, tmp_path):
     store.close()
 
 
-def _crashed_receipt(env, tmp_path, *, tid, run_id, worktree):
+def _crashed_receipt(env, tmp_path, *, tid, run_id, worktree,
+                     attempt_id=None):
     """Simulate a dispatch that crashed after submit: a real claimed card on
-    the board plus an ``unknown`` receipt pointing at ``run_id``."""
+    the board plus an ``unknown`` receipt pointing at ``run_id``.
+
+    The reservation carries the REAL spec_hash/policy_fingerprint — resolve
+    refuses to verify against anything else now."""
+    from cli_provider_kanban.control import _resolve_spec_for
+    from cli_provider_kanban.dispatch import _spec_hash
+    from cli_provider_kanban.policy import load_policy, policy_fingerprint
+
     bridge = env["bridge"]
     bridge.call("set_max_retries", task_id=tid, value=1)
     claim = bridge.call("claim", task_id=tid, claimer="jev:test",
                         ttl_seconds=600)
     krun = claim["task"]["current_run_id"]
+    policy_path = _policy_path(env, tmp_path)
+    policy = load_policy(policy_path)
+    task_dict = bridge.call("get_task", task_id=tid)["task"]
+    spec = _resolve_spec_for(policy, policy_path, task_dict)
     store = DispatchStore(env["store_path"])
     res = store.reserve(task_id=tid, task_revision="1",
-                        spec_hash="sha256:x", policy_fingerprint="sha256:p",
+                        spec_hash=_spec_hash(spec),
+                        policy_fingerprint=policy_fingerprint(policy),
                         workspace_id="ws-main", base_revision=env["rev"],
                         route="worker.code.standard")
     store.transition(res.dispatch_id, "claimed", kernel_run_id=krun,
                      worktree=worktree)
-    store.transition(res.dispatch_id, "submitted", run_id=run_id)
+    store.transition(res.dispatch_id, "submitted", run_id=run_id,
+                     attempt_id=attempt_id)
     store.transition(res.dispatch_id, "unknown", detail="crash after submit")
     store.close()
     return res

@@ -116,12 +116,42 @@ class _Bridge:
         task = get_task(self.conn, args["task_id"])
         data = _task_dict(task)
         if data is not None:
-            data["parents"] = _parents(self.conn, args["task_id"])
+            tid = args["task_id"]
+            data["parents"] = _parents(self.conn, tid)
             row = self.conn.execute(
                 "SELECT metadata FROM task_runs WHERE task_id = ? "
-                "ORDER BY id DESC LIMIT 1", (args["task_id"],),
+                "ORDER BY id DESC LIMIT 1", (tid,),
             ).fetchone()
             data["last_run_metadata"] = row[0] if row else None
+            # Run-ownership provenance (read only) so callers can fence every
+            # mutation to the run that actually produced the card's state.
+            data["latest_run_id"] = self.conn.execute(
+                "SELECT MAX(id) FROM task_runs WHERE task_id = ?", (tid,),
+            ).fetchone()[0]
+            ev = self.conn.execute(
+                "SELECT run_id FROM task_events WHERE task_id = ? "
+                "AND kind = 'review_requested' ORDER BY id DESC LIMIT 1",
+                (tid,),
+            ).fetchone()
+            data["review_run_id"] = ev[0] if ev else None
+            bl = self.conn.execute(
+                "SELECT kind, payload, run_id FROM task_events "
+                "WHERE task_id = ? AND kind IN "
+                "('blocked','block_loop_detected','dependency_wait') "
+                "ORDER BY id DESC LIMIT 1", (tid,),
+            ).fetchone()
+            data["last_block"] = None
+            if bl is not None:
+                reason = None
+                try:
+                    payload = json.loads(bl[1]) if bl[1] else None
+                    if isinstance(payload, dict):
+                        reason = payload.get("reason")
+                except ValueError:
+                    reason = None
+                data["last_block"] = {
+                    "kind": bl[0], "reason": reason, "run_id": bl[2],
+                }
         return {"task": data}
 
     def op_set_max_retries(self, args):
@@ -176,6 +206,71 @@ class _Bridge:
                 kind=args.get("kind"),
                 expected_run_id=args.get("expected_run_id"),
             )
+        }
+
+    def op_block_owned(self, args):
+        """Block fenced to run ownership — the guarded form of ``block``.
+
+        ``run_id`` is the kernel run the CALLER owns. The block fires only
+        when (a) no run is live on the card (blocking a run-less card cannot
+        end a foreign run), or (b) the live ``current_run_id`` equals the
+        caller's run (``expected_run_id`` CAS inside ``block_task``). A card
+        running under a DIFFERENT run is refused untouched — a stale receipt
+        can never demote a newer dispatch's run.
+        """
+        from hermes_cli.kanban_db import block_task, get_task
+
+        task = get_task(self.conn, args["task_id"])
+        if task is None:
+            return {"blocked": False, "reason": "task not found"}
+        if task.status not in ("running", "ready"):
+            return {
+                "blocked": False,
+                "skipped": True,
+                "status": task.status,
+            }
+        ours = args.get("run_id")
+        cur = task.current_run_id
+        if cur is not None:
+            if ours is None or int(cur) != int(ours):
+                return {
+                    "blocked": False,
+                    "reason": "card has a live run owned by another actor",
+                    "current_run_id": int(cur),
+                }
+            expected = int(ours)
+        else:
+            expected = None
+        return {
+            "blocked": block_task(
+                self.conn,
+                args["task_id"],
+                reason=args.get("reason"),
+                kind=args.get("kind"),
+                expected_run_id=expected,
+            )
+        }
+
+    def op_reopen_review_if(self, args):
+        """Reopen a review ONLY when the handoff's run is the caller's own —
+        a stale receipt must never demote a newer dispatch's review."""
+        from hermes_cli.kanban_db import reopen_review_task
+
+        expected = args.get("expected_run_id")
+        row = self.conn.execute(
+            "SELECT run_id FROM task_events WHERE task_id = ? "
+            "AND kind = 'review_requested' ORDER BY id DESC LIMIT 1",
+            (args["task_id"],),
+        ).fetchone()
+        review_run = row[0] if row else None
+        if expected is None or review_run is None or int(review_run) != int(expected):
+            return {
+                "reopened": False,
+                "reason": "review handoff belongs to a different run",
+                "review_run_id": review_run,
+            }
+        return {
+            "reopened": reopen_review_task(self.conn, args["task_id"]),
         }
 
     def op_request_review(self, args):

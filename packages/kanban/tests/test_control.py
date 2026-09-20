@@ -211,10 +211,24 @@ def test_accept_disabled_for_non_review_card(env, tmp_path):
                    integrated_revision=env["rev"])
 
 
+def _reserved_hashes(env, tmp_path, tid):
+    """The spec_hash/policy_fingerprint a REAL reservation would carry —
+    resolve now refuses to verify against anything else."""
+    from cli_provider_kanban.control import _resolve_spec_for
+    from cli_provider_kanban.dispatch import _spec_hash
+    from cli_provider_kanban.policy import load_policy, policy_fingerprint
+
+    policy_path = _policy_path(env, tmp_path)
+    policy = load_policy(policy_path)
+    task_dict = env["bridge"].call("get_task", task_id=tid)["task"]
+    spec = _resolve_spec_for(policy, policy_path, task_dict)
+    return _spec_hash(spec), policy_fingerprint(policy)
+
+
 def test_resolve_unknown_completed_goes_to_review(env, tmp_path):
     """An unknown receipt whose wrapper run completed resolves to review —
     but only after the SAME verification bar (bound worktree + trusted argv
-    + spec) as the normal path."""
+    + spec) as the normal path, under the receipt's own kernel run."""
     data, rev = env["policy_data"], env["rev"]
     tid = env["bridge"].call(
         "create_task", title="c", assignee="jev-native", body="x",
@@ -225,21 +239,34 @@ def test_resolve_unknown_completed_goes_to_review(env, tmp_path):
     tm.write_text(json.dumps({tid: spec}))
     env["policy_data"]["task_map"] = str(tm)
     env["policy_path"] = write_policy(tmp_path, env["policy_data"])
-    # Simulate a crashed-after-submit: run exists, receipt unknown, and the
-    # bound worktree is recorded on the receipt.
+    # Simulate a crashed-after-submit: run exists, receipt unknown, the
+    # bound worktree is recorded, and the card was claimed (run owned by
+    # this dispatch).
     from cli_provider_kanban.wrapper_client import WrapperClient
     client = WrapperClient(env["stub"].base_url)
-    out = client.submit_chat(model="m", task_id=tid, workspace_id="ws-alpha",
-                             messages=[])
+    out = client.submit_chat(
+        model="devin/swe-2-max", task_id=tid, workspace_id="ws-alpha",
+        messages=[],
+        execution={
+            "task_revision": "1",
+            "base_revision": rev,
+            "route": "worker.code.standard",
+            "policy_version": data["policy_version"],
+        },
+    )
     prepared = data["workspaces"]["ws-main"]["prepared_worktree"]
+    claim = env["bridge"].call("claim", task_id=tid, claimer="jev:test")
+    krun = claim["task"]["current_run_id"]
+    spec_hash, fp = _reserved_hashes(env, tmp_path, tid)
     store = DispatchStore(env["store_path"])
     res = store.reserve(task_id=tid, task_revision="1",
-                        spec_hash="sha256:x", policy_fingerprint="sha256:p",
+                        spec_hash=spec_hash, policy_fingerprint=fp,
                         workspace_id="ws-main", base_revision=rev,
                         route="worker.code.standard")
-    store.transition(res.dispatch_id, "submitted", run_id=out.run_id,
-                     attempt_id=out.attempt_id,
+    store.transition(res.dispatch_id, "claimed", kernel_run_id=krun,
                      worktree=prepared, branch="jev/prepared-ws-main")
+    store.transition(res.dispatch_id, "submitted", run_id=out.run_id,
+                     attempt_id=out.attempt_id)
     store.transition(res.dispatch_id, "unknown",
                      detail="crashed after submit")
     store.close()

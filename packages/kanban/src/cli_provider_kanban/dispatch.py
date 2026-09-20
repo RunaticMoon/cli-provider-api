@@ -18,6 +18,7 @@ import threading
 from pathlib import Path
 
 from .classifier import classify
+from .evidence import persist_diff
 from .kernel import KernelBridge, KernelError
 from .models import JevDecision, RecommendedAction, TaskSpec
 from .policy import (
@@ -55,7 +56,6 @@ from .worktree import (
     resolve_repo,
     run_verification,
     sanitize_text,
-    sha256_bytes,
     sha256_file,
     validate_prepared_worktree,
     validate_runner_binding,
@@ -273,13 +273,19 @@ def _recover_stale(kernel: KernelBridge, store: DispatchStore, report: dict) -> 
                                         "flight — never replayed")
             except StoreError:
                 pass  # a racing cancel already closed it
-            kernel.call(
-                "block", task_id=res.task_id, kind="needs_input",
+            # Fenced: only block when the card's live run is the one this
+            # stale receipt owned — a newer dispatch's run is never demoted.
+            blk = kernel.call(
+                "block_owned", task_id=res.task_id, kind="needs_input",
+                run_id=res.kernel_run_id,
                 reason=f"dispatch {res.dispatch_id} unknown after crash — "
                        "execution may have started; manual resolve required",
             )
             report["recovered"].append(
-                {"dispatch_id": res.dispatch_id, "state": "unknown"})
+                {"dispatch_id": res.dispatch_id, "state": "unknown",
+                 "card_blocked": bool(blk.get("blocked")),
+                 **({"card_note": blk.get("reason")}
+                    if blk.get("reason") else {})})
 
 
 def _record_block(
@@ -287,8 +293,12 @@ def _record_block(
     control_client=None, task=None, krun=None,
 ) -> dict:
     """Block the card (typed kernel kind) and close the receipt — a
-    racing cancel wins the receipt instead of crashing the tick."""
-    kernel.call("block", task_id=res.task_id, kind=kind, reason=reason)
+    racing cancel wins the receipt instead of crashing the tick.
+
+    ``block_owned`` fences the mutation: the card is only blocked while
+    the live run is the one ``krun`` claims — never a foreign run."""
+    kernel.call("block_owned", task_id=res.task_id, kind=kind, run_id=krun,
+                reason=reason)
     if control_client is not None and task is not None:
         _res, cancelled = _transition_guarded(
             store, control_client, kernel, res, task, krun, BLOCKED, {},
@@ -542,15 +552,19 @@ def _cancelled_path(kernel, store, client, res, task, krun, reason) -> dict:
     try:
         # A card already handed to review cannot be blocked directly —
         # reopen it to resumable state first, then block it so a cancelled
-        # execution is never silently re-dispatched.
+        # execution is never silently re-dispatched. Both mutations are
+        # fenced to OUR run: a review handed off by a different run is
+        # never demoted by this receipt's cancel.
         cur = kernel.call("get_task", task_id=task.id).get("task")
         if cur and cur["status"] == "review":
-            kernel.call("reopen_review", task_id=task.id)
-            kernel.call("block", task_id=task.id, kind="needs_input",
-                        reason=reason)
+            ro = kernel.call("reopen_review_if", task_id=task.id,
+                             expected_run_id=krun)
+            if ro.get("reopened"):
+                kernel.call("block_owned", task_id=task.id,
+                            kind="needs_input", run_id=krun, reason=reason)
         else:
-            kernel.call("block", task_id=task.id, kind="needs_input",
-                        expected_run_id=krun, reason=reason)
+            kernel.call("block_owned", task_id=task.id, kind="needs_input",
+                        run_id=krun, reason=reason)
     except KernelError:
         pass
     try:
@@ -632,7 +646,9 @@ def _execute_reserved(kernel, store, client, control_client, policy, task,
         else f"jev.{decision.route}"
     )
     submit_ws = workspace.wrapper_workspace_id or spec.workspace_id
-    ephemeral = False
+    ephemeral = bool(
+        not workspace.prepared_worktree and workspace.allow_ephemeral_worktree
+    )
     try:
         if workspace.prepared_worktree:
             wt = validate_prepared_worktree(
@@ -657,7 +673,6 @@ def _execute_reserved(kernel, store, client, control_client, policy, task,
             )
         elif workspace.allow_ephemeral_worktree:
             wt = None  # created after the claim below
-            ephemeral = True
         else:
             raise WorktreeError(
                 f"workspace {spec.workspace_id!r} has no prepared worktree "
@@ -706,6 +721,7 @@ def _execute_reserved(kernel, store, client, control_client, policy, task,
             )
         except WorktreeError as exc:
             return _record_block(kernel, store, res, kind="needs_input",
+                                 krun=krun,
                                  reason=f"worktree setup failed: {exc}")
     try:
         res = store.transition(res.dispatch_id, CLAIMED, kernel_run_id=krun,
@@ -753,10 +769,12 @@ def _execute_reserved(kernel, store, client, control_client, policy, task,
             )
         except WrapperTransportError as exc:
             # Unconfirmed transport: the request may have reached the wrapper.
-            kernel.call("block", task_id=task.id, kind="needs_input",
-                        expected_run_id=krun,
-                        reason=f"transport unconfirmed — run state unknown: "
-                               f"{exc}")
+            kernel.call(
+                "block_owned", task_id=task.id, kind="needs_input",
+                run_id=krun,
+                reason=f"transport unconfirmed — run state unknown: {exc} "
+                       f"[dispatch {res.dispatch_id}]",
+            )
             _res, cancelled = _transition_guarded(
                 store, control_client, kernel, res, task, krun, UNKNOWN, {},
                 detail=str(exc),
@@ -785,9 +803,27 @@ def _execute_reserved(kernel, store, client, control_client, policy, task,
                     wt, run, claimer, krun, execution_meta, submit_ws,
                     ephemeral=ephemeral,
                 )
-            # Rejected before any run existed (auth/validation): no execution.
-            return _record_block(kernel, store, res, kind="needs_input",
-                                 reason=f"wrapper rejected the request: {exc}")
+            # An HTTP refusal WITHOUT an authoritative run view proves
+            # nothing about execution: a 5xx/429 (or a foreign/malformed
+            # body) is emitted exactly when the request may have been
+            # forwarded, and a status-only 4xx is not trustworthy through a
+            # gateway either. Never claim pre-execution rejection — the
+            # receipt goes unknown and permanently blocks re-dispatch until
+            # `control resolve`.
+            reason = (f"wrapper HTTP {exc.status} without a run view — "
+                      "execution state unconfirmed; never replayed "
+                      f"[dispatch {res.dispatch_id}]")
+            kernel.call("block_owned", task_id=task.id, kind="needs_input",
+                        run_id=krun, reason=reason)
+            _res, cancelled = _transition_guarded(
+                store, control_client, kernel, res, task, krun, UNKNOWN, {},
+                detail=reason,
+            )
+            if cancelled:
+                return cancelled
+            return {"task_id": task.id, "dispatch_id": res.dispatch_id,
+                    "action": "unknown",
+                    "reason": f"wrapper HTTP {exc.status} without a run view"}
         try:
             res = store.transition(res.dispatch_id, SUBMITTED,
                                    run_id=outcome.run_id,
@@ -854,9 +890,9 @@ def _handle_run_status(kernel, store, control_client, policy, task, spec,
         anomalies.append("execution metadata echo differs from what was sent")
     if anomalies:
         reason = "run context mismatch — refusing to verify a foreign run: " \
-            + "; ".join(anomalies)
-        kernel.call("block", task_id=task.id, kind="needs_input",
-                    expected_run_id=krun, reason=reason)
+            + "; ".join(anomalies) + f" [dispatch {res.dispatch_id}]"
+        kernel.call("block_owned", task_id=task.id, kind="needs_input",
+                    run_id=krun, reason=reason)
         _res, cancelled = _transition_guarded(
             store, control_client, kernel, res, task, krun, UNKNOWN, {},
             detail=reason,
@@ -868,9 +904,10 @@ def _handle_run_status(kernel, store, control_client, policy, task, spec,
                 "reason": reason}
 
     if status == "cancelled":
-        kernel.call("block", task_id=task.id, kind="needs_input",
-                    expected_run_id=krun,
-                    reason=f"wrapper run {res.run_id} cancelled")
+        kernel.call("block_owned", task_id=task.id, kind="needs_input",
+                    run_id=krun,
+                    reason=f"wrapper run {res.run_id} cancelled "
+                           f"[dispatch {res.dispatch_id}]")
         _res, cancelled = _transition_guarded(
             store, control_client, kernel, res, task, krun, CANCELLED, {},
             detail="run cancelled",
@@ -880,10 +917,11 @@ def _handle_run_status(kernel, store, control_client, policy, task, spec,
         return {"task_id": task.id, "dispatch_id": res.dispatch_id,
                 "action": "cancelled", "run_id": res.run_id}
     if status == "failed":
-        kernel.call("block", task_id=task.id, kind="needs_input",
-                    expected_run_id=krun,
+        kernel.call("block_owned", task_id=task.id, kind="needs_input",
+                    run_id=krun,
                     reason=f"wrapper run {res.run_id} failed: "
-                           f"{(run.get('detail') or '')[:200]}")
+                           f"{(run.get('detail') or '')[:200]} "
+                           f"[dispatch {res.dispatch_id}]")
         _res, cancelled = _transition_guarded(
             store, control_client, kernel, res, task, krun, FAILED, {},
             detail="run failed",
@@ -895,11 +933,12 @@ def _handle_run_status(kernel, store, control_client, policy, task, spec,
     if status != "completed":
         # Live or unrecognized — hold. The receipt stays submitted (live),
         # which permanently blocks blind re-dispatch until `control resolve`.
-        kernel.call("block", task_id=task.id, kind="needs_input",
-                    expected_run_id=krun,
+        kernel.call("block_owned", task_id=task.id, kind="needs_input",
+                    run_id=krun,
                     reason=f"wrapper run {res.run_id} still in flight "
                            f"(status={status!r}) — not a terminal success; "
-                           "resolve via control once it settles")
+                           "resolve via control once it settles "
+                           f"[dispatch {res.dispatch_id}]")
         return {"task_id": task.id, "dispatch_id": res.dispatch_id,
                 "action": "in_flight", "run_id": res.run_id,
                 "dispatched": True}
@@ -907,9 +946,10 @@ def _handle_run_status(kernel, store, control_client, policy, task, spec,
         # completed without a succeeded outcome is a known-terminal failure,
         # never a success candidate.
         reason = (f"wrapper run {res.run_id} completed with outcome "
-                  f"{outcome!r} (need 'succeeded') — not promotable")
-        kernel.call("block", task_id=task.id, kind="needs_input",
-                    expected_run_id=krun, reason=reason)
+                  f"{outcome!r} (need 'succeeded') — not promotable "
+                  f"[dispatch {res.dispatch_id}]")
+        kernel.call("block_owned", task_id=task.id, kind="needs_input",
+                    run_id=krun, reason=reason)
         _res, cancelled = _transition_guarded(
             store, control_client, kernel, res, task, krun, FAILED, {},
             detail=reason,
@@ -930,28 +970,64 @@ def _handle_run_status(kernel, store, control_client, policy, task, spec,
             krun, "cancel requested before verification",
         )
 
+    # Route-binding provenance: a direct preset is "classified" only when
+    # it is a concrete candidate of the classified route. An operator-bound
+    # preset outside the route is the declared synthetic dev lane — allowed
+    # ONLY when the authoritative run view self-reports ``synthetic``.
+    route = policy.routes.get(res.route)
+    try:
+        route_presets = [
+            preset for preset, _ in _candidate_bindings(
+                policy, route, spec.capability
+            )
+        ] if route is not None else []
+    except WorktreeError:
+        route_presets = []
+    submitted_model = (
+        policy.execution.model
+        if policy.execution.mode == "direct"
+        else f"jev.{res.route}"
+    )
+    classified = (
+        policy.execution.mode != "direct"
+        or submitted_model in route_presets
+    )
+    synthetic = bool(ephemeral or run.get("synthetic"))
+
     # Verification: trusted full argv only, bounded capture, committed+dirty
     # diff, declared-scope enforcement, durable sanitized evidence.
+    # Inspection failures fail CLOSED — a worktree the run broke is never a
+    # clean bill; it is a quality_failed handoff, never a review.
     secrets = _known_secret_values(policy)
-    verify = run_verification(
-        wt, spec.verification.argv,
-        executables=policy.verification.executables,
-        commands=policy.verification.commands,
-        timeout_seconds=policy.verification.timeout_seconds,
-        max_output_bytes=policy.verification.max_output_bytes,
-    )
-    artifacts, missing = collect_artifacts(
-        wt, spec.artifacts, max_bytes=policy.limits.max_spec_bytes
-    )
-    changed = changed_files(wt)
-    violations = check_scope(changed, list(spec.allowed_scope))
-    diff = capture_diff(wt, policy.verification.max_diff_bytes)
+    try:
+        verify = run_verification(
+            wt, spec.verification.argv,
+            executables=policy.verification.executables,
+            commands=policy.verification.commands,
+            timeout_seconds=policy.verification.timeout_seconds,
+            max_output_bytes=policy.verification.max_output_bytes,
+        )
+        artifacts, missing = collect_artifacts(
+            wt, spec.artifacts, max_bytes=policy.limits.max_spec_bytes
+        )
+        changed = changed_files(wt)
+        violations = check_scope(changed, list(spec.allowed_scope))
+        diff = capture_diff(wt, policy.verification.max_diff_bytes)
+    except (WorktreeError, OSError) as exc:
+        reason = (f"quality_failed: evidence inspection failed — {exc} "
+                  f"[dispatch {res.dispatch_id}]")
+        kernel.call("block_owned", task_id=task.id, kind="needs_input",
+                    run_id=krun, reason=reason)
+        _res, cancelled = _transition_guarded(
+            store, control_client, kernel, res, task, krun, BLOCKED, {},
+            detail=reason,
+        )
+        if cancelled:
+            return cancelled
+        return {"task_id": task.id, "dispatch_id": res.dispatch_id,
+                "action": "blocked", "reason": reason, "dispatched": True}
 
-    evidence_dir = Path(store.path).resolve().parent / "evidence"
-    evidence_dir.mkdir(parents=True, exist_ok=True)
-    diff_bytes = diff.encode("utf-8", "replace")
-    diff_path = evidence_dir / f"{res.dispatch_id}.diff"
-    diff_path.write_bytes(diff_bytes)
+    diff_info = persist_diff(store.path, res.dispatch_id, diff, secrets)
     artifact_entries = []
     artifact_hash_failed = False
     for artifact in artifacts:
@@ -965,6 +1041,7 @@ def _handle_run_status(kernel, store, control_client, policy, task, spec,
         artifact_entries.append(
             {"path": str(artifact), "sha256": digest, "bytes": size}
         )
+    ws_cfg = policy.workspaces.get(res.workspace_id)
     evidence = {
         "verification": {
             "argv": list(spec.verification.argv),
@@ -974,24 +1051,45 @@ def _handle_run_status(kernel, store, control_client, policy, task, spec,
             "timed_out": verify.timed_out,
         },
         "artifacts": artifact_entries,
-        "diff": {
-            "path": str(diff_path),
-            "sha256": sha256_bytes(diff_bytes),
-            "bytes": len(diff_bytes),
-        },
+        "diff": diff_info,
         "changed_files": changed,
         "scope_violations": violations,
         "base_revision": spec.base_revision,
         "policy_fingerprint": res.policy_fingerprint,
+        # Provenance of what actually went on the wire — the classified
+        # route alone is not proof of the selected backend.
+        "provenance": {
+            "lane": "ephemeral" if ephemeral else policy.execution.mode,
+            "classified_route": res.route,
+            "submitted_model": submitted_model,
+            "server_preset": run.get("preset") or "unreported",
+            "route_binding": (
+                "classified" if classified else "unclassified"
+            ),
+            "synthetic": synthetic,
+            "effort": {
+                "hint": getattr(spec.effort_hint, "value", spec.effort_hint),
+                "runner_pin": getattr(ws_cfg, "runner_effort_pin", None),
+                "observed": "unknown",
+            },
+        },
     }
     store.record_evidence(res.dispatch_id, evidence)
 
-    if not verify.ok or missing or violations or artifact_hash_failed:
+    if (not verify.ok or missing or violations or artifact_hash_failed
+            or (not classified and not synthetic)):
         reasons = []
         if not verify.ok:
             reasons.append(
                 f"verification failed (exit={verify.exit_code}): "
                 f"{sanitize_text(verify.output, secrets)[-400:]}"
+            )
+        if not classified and not synthetic:
+            reasons.append(
+                f"direct preset {submitted_model!r} is not a candidate of "
+                f"the classified route {res.route!r} and the run did not "
+                "self-report the declared synthetic lane — unverifiable "
+                "binding"
             )
         if missing:
             reasons.append(f"missing artifacts: {missing}")
@@ -1001,9 +1099,10 @@ def _handle_run_status(kernel, store, control_client, policy, task, spec,
             reasons.append(
                 f"changed files outside allowed_scope: {violations}"
             )
-        reason = "quality_failed: " + "; ".join(reasons)
-        kernel.call("block", task_id=task.id, kind="needs_input",
-                    expected_run_id=krun, reason=reason)
+        reason = ("quality_failed: " + "; ".join(reasons)
+                  + f" [dispatch {res.dispatch_id}]")
+        kernel.call("block_owned", task_id=task.id, kind="needs_input",
+                    run_id=krun, reason=reason)
         _res, cancelled = _transition_guarded(
             store, control_client, kernel, res, task, krun, BLOCKED, {},
             detail=reason,
@@ -1027,10 +1126,20 @@ def _handle_run_status(kernel, store, control_client, policy, task, spec,
             "wrapper_run_id": res.run_id,
             "wrapper_attempt_id": res.attempt_id,
             "route": res.route,
+            "lane": "ephemeral" if ephemeral else policy.execution.mode,
+            "submitted_model": submitted_model,
+            "server_preset": run.get("preset") or "unreported",
+            "route_binding": (
+                "classified" if classified else "unclassified"
+            ),
+            "synthetic": synthetic,
+            "effort_declared": getattr(
+                spec.effort_hint, "value", spec.effort_hint),
+            "effort_observed": "unknown",
             "artifacts": [a.name for a in artifacts],
-            "diff_path": str(diff_path),
-            "diff_sha256": sha256_bytes(diff_bytes),
-            "diff_bytes": len(diff_bytes),
+            "diff_path": diff_info["path"],
+            "diff_sha256": diff_info["sha256"],
+            "diff_bytes": diff_info["bytes"],
         },
         expected_run_id=krun,
     )
@@ -1071,10 +1180,11 @@ def _handle_run_status(kernel, store, control_client, policy, task, spec,
         )
     result = {"task_id": task.id, "dispatch_id": res.dispatch_id,
               "action": "review", "run_id": res.run_id, "dispatched": True}
-    if ephemeral:
-        # Explicit development lane — the run executed against an
-        # autogenerated worktree, not an operator-bound one. Labeled, never
+    if synthetic:
+        # Declared dev lane — the run self-reported synthetic (or executed
+        # against an autogenerated ephemeral worktree). Labeled, never
         # presented as the production path.
         result["synthetic"] = True
-        result["ephemeral"] = True
+        if ephemeral:
+            result["ephemeral"] = True
     return result

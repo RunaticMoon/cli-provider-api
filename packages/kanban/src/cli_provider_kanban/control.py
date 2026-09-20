@@ -27,10 +27,12 @@ import os
 import pwd
 from pathlib import Path
 
+from .evidence import persist_diff
 from .kernel import KernelBridge, KernelError
-from .policy import Policy, load_policy
+from .policy import Policy, load_policy, policy_fingerprint
 from .spec import resolve_spec
 from .store import (
+    ABORTED,
     BLOCKED,
     CANCELLED,
     FAILED,
@@ -50,7 +52,6 @@ from .worktree import (
     resolve_repo,
     run_verification,
     sanitize_text,
-    sha256_bytes,
     sha256_file,
 )
 from .wrapper_client import (
@@ -178,6 +179,14 @@ def cmd_cancel(
         res = store.get(dispatch_id)
         if res is None:
             raise ControlError(f"no dispatch receipt {dispatch_id!r}")
+        if res.state in (ABORTED, BLOCKED, FAILED, CANCELLED):
+            # A terminal, never-live receipt cancels nothing: it must never
+            # mutate a board that a NEWER dispatch may own, and it must
+            # never signal a run it does not have.
+            raise ControlError(
+                f"receipt {dispatch_id} is already terminal "
+                f"({res.state}) — nothing left to cancel"
+            )
         res = store.request_cancel(dispatch_id)
         result = {"dispatch_id": dispatch_id, "cancel_requested": True,
                   "wrapper": None, "task": None}
@@ -210,26 +219,34 @@ def cmd_cancel(
         with KernelBridge(board_db, cfg=policy.hermes) as kernel:
             task = kernel.call("get_task", task_id=res.task_id).get("task")
             if task and task["status"] in ("running", "ready"):
-                kernel.call(
-                    "block", task_id=res.task_id, kind="needs_input",
-                    expected_run_id=res.kernel_run_id,
+                blk = kernel.call(
+                    "block_owned", task_id=res.task_id, kind="needs_input",
+                    run_id=res.kernel_run_id,
                     reason=f"cancelled by operator {actor} "
                            f"(dispatch {dispatch_id})",
                 )
+                if not blk.get("blocked"):
+                    result["board"] = {"block": blk}
                 task = kernel.call("get_task", task_id=res.task_id).get("task")
             elif task and task["status"] == "review":
                 # A cancel after the review handoff must not leave a
-                # cancelled execution looking promotable — reopen it back
-                # to resumable work state, then block it so the card is NOT
-                # silently re-dispatched (the receipt for the old run is
-                # terminal, so a ready card would get a fresh execution).
-                kernel.call("reopen_review", task_id=res.task_id)
-                kernel.call(
-                    "block", task_id=res.task_id, kind="needs_input",
-                    reason=f"cancelled by operator {actor} after review "
-                           f"handoff (dispatch {dispatch_id}) — unblock "
-                           "explicitly to re-dispatch",
+                # cancelled execution looking promotable — but ONLY when
+                # THIS receipt's run produced that handoff. A review
+                # belonging to a different (newer) run is left untouched.
+                ro = kernel.call(
+                    "reopen_review_if", task_id=res.task_id,
+                    expected_run_id=res.kernel_run_id,
                 )
+                if ro.get("reopened"):
+                    kernel.call(
+                        "block_owned", task_id=res.task_id, kind="needs_input",
+                        run_id=res.kernel_run_id,
+                        reason=f"cancelled by operator {actor} after review "
+                               f"handoff (dispatch {dispatch_id}) — unblock "
+                               "explicitly to re-dispatch",
+                    )
+                else:
+                    result["board"] = {"reopen_review": ro}
                 task = kernel.call("get_task", task_id=res.task_id).get("task")
             result["task"] = task["status"] if task else None
         try:
@@ -387,7 +404,8 @@ def cmd_resolve(
                           "external investigation",
             }
         # Canonical context must equal the receipt's reserved context — a
-        # foreign run view is never verified, never promoted.
+        # foreign run view is never verified, never promoted. Same echo
+        # contract as _handle_run_status, plus the reserved attempt id.
         anomalies = []
         if run.get("task_id") != res.task_id:
             anomalies.append(
@@ -402,6 +420,21 @@ def cmd_resolve(
             anomalies.append(
                 f"workspace_id {run.get('workspace_id')!r} != submitted "
                 f"{submit_ws!r}")
+        if res.attempt_id is not None and run.get("attempt_id") != res.attempt_id:
+            anomalies.append(
+                f"attempt_id {run.get('attempt_id')!r} != reserved "
+                f"{res.attempt_id!r}")
+        if policy.dispatch.send_execution_metadata:
+            expected_execution = {
+                "task_revision": res.task_revision,
+                "base_revision": res.base_revision,
+                "route": res.route,
+                "policy_version": policy.policy_version,
+            }
+            if run.get("execution") != expected_execution:
+                anomalies.append(
+                    "execution metadata echo differs from the reserved "
+                    "context")
         if anomalies:
             raise ControlError(
                 "run context mismatch — refusing to verify a foreign run: "
@@ -444,11 +477,39 @@ def cmd_resolve(
         with KernelBridge(board_db, cfg=policy.hermes) as kernel:
             task_dict = kernel.call(
                 "get_task", task_id=res.task_id).get("task")
+        spec = _resolve_spec_for(policy, policy_path, task_dict or {"id": res.task_id})
+        if spec is None:
+            raise ControlError(
+                f"cannot resolve a spec for {res.task_id} — verification "
+                "cannot run without it; receipt stays unknown"
+            )
+        # The verification contract that gated the run is the RESERVED one:
+        # the card body is an untrusted channel, so the spec it yields now
+        # must hash to exactly what the reservation recorded — and the
+        # policy to the reserved fingerprint. Contract drift refuses; the
+        # run is never re-verified against a weaker, edited contract and
+        # fresh checks are never labelled with the old fingerprint.
+        from .dispatch import _spec_hash
+        current_spec_hash = _spec_hash(spec)
+        if current_spec_hash != res.spec_hash:
+            raise ControlError(
+                f"resolve contract drift: the card's spec now hashes "
+                f"{current_spec_hash} but the receipt reserved "
+                f"{res.spec_hash} — the run stays bound to the reserved "
+                "contract; receipt left unknown for manual review"
+            )
+        current_fp = policy_fingerprint(policy)
+        if current_fp != res.policy_fingerprint:
+            raise ControlError(
+                f"resolve contract drift: policy fingerprint "
+                f"{current_fp} != reserved {res.policy_fingerprint} — "
+                "receipt left unknown for manual review"
+            )
         if not res.worktree or not Path(res.worktree).is_dir():
             with KernelBridge(board_db, cfg=policy.hermes) as kernel:
                 kernel.call(
-                    "block", task_id=res.task_id, kind="needs_input",
-                    expected_run_id=res.kernel_run_id,
+                    "block_owned", task_id=res.task_id, kind="needs_input",
+                    run_id=res.kernel_run_id,
                     reason=f"resolve {dispatch_id}: recorded worktree "
                            f"{res.worktree!r} is gone — cannot verify the "
                            "run's output; left unknown",
@@ -466,12 +527,6 @@ def cmd_resolve(
                 raise WorktreeError("worktree belongs to a different repo")
         except WorktreeError as exc:
             raise ControlError(f"worktree validation failed: {exc}")
-        spec = _resolve_spec_for(policy, policy_path, task_dict or {"id": res.task_id})
-        if spec is None:
-            raise ControlError(
-                f"cannot resolve a spec for {res.task_id} — verification "
-                "cannot run without it; receipt stays unknown"
-            )
         secrets = []
         exe = policy.execution
         for attr in ("credential_file", "control_credential_file"):
@@ -483,24 +538,33 @@ def cmd_resolve(
                     v = None
                 if v:
                     secrets.append(v)
-        verify = run_verification(
-            wt, spec.verification.argv,
-            executables=policy.verification.executables,
-            commands=policy.verification.commands,
-            timeout_seconds=policy.verification.timeout_seconds,
-            max_output_bytes=policy.verification.max_output_bytes,
-        )
-        artifacts, missing = collect_artifacts(
-            wt, spec.artifacts, max_bytes=policy.limits.max_spec_bytes
-        )
-        changed = changed_files(wt)
-        violations = check_scope(changed, list(spec.allowed_scope))
-        diff = capture_diff(wt, policy.verification.max_diff_bytes)
-        evidence_dir = Path(store.path).resolve().parent / "evidence"
-        evidence_dir.mkdir(parents=True, exist_ok=True)
-        diff_bytes = diff.encode("utf-8", "replace")
-        diff_path = evidence_dir / f"{res.dispatch_id}.diff"
-        diff_path.write_bytes(diff_bytes)
+        try:
+            verify = run_verification(
+                wt, spec.verification.argv,
+                executables=policy.verification.executables,
+                commands=policy.verification.commands,
+                timeout_seconds=policy.verification.timeout_seconds,
+                max_output_bytes=policy.verification.max_output_bytes,
+            )
+            artifacts, missing = collect_artifacts(
+                wt, spec.artifacts, max_bytes=policy.limits.max_spec_bytes
+            )
+            changed = changed_files(wt)
+            violations = check_scope(changed, list(spec.allowed_scope))
+            diff = capture_diff(wt, policy.verification.max_diff_bytes)
+        except (WorktreeError, OSError) as exc:
+            # Inspection failure fails CLOSED — never a successful review,
+            # never swallowed uncertainty.
+            reason = (f"quality_failed (resolve): evidence inspection "
+                      f"failed — {exc}")
+            with KernelBridge(board_db, cfg=policy.hermes) as kernel:
+                kernel.call(
+                    "block_owned", task_id=res.task_id, kind="needs_input",
+                    run_id=res.kernel_run_id, reason=reason)
+            store.transition(dispatch_id, BLOCKED, detail=reason)
+            return {"dispatch_id": dispatch_id, "resolved": "blocked",
+                    "run_status": status, "reason": reason}
+        diff_info = persist_diff(store.path, res.dispatch_id, diff, secrets)
         artifact_entries = []
         for artifact in artifacts:
             try:
@@ -519,9 +583,7 @@ def cmd_resolve(
                 "timed_out": verify.timed_out,
             },
             "artifacts": artifact_entries,
-            "diff": {"path": str(diff_path),
-                     "sha256": sha256_bytes(diff_bytes),
-                     "bytes": len(diff_bytes)},
+            "diff": diff_info,
             "changed_files": changed,
             "scope_violations": violations,
             "base_revision": spec.base_revision,
@@ -542,34 +604,90 @@ def cmd_resolve(
             reason = "quality_failed (resolve): " + "; ".join(reasons)
             with KernelBridge(board_db, cfg=policy.hermes) as kernel:
                 kernel.call(
-                    "block", task_id=res.task_id, kind="needs_input",
-                    expected_run_id=res.kernel_run_id, reason=reason)
+                    "block_owned", task_id=res.task_id, kind="needs_input",
+                    run_id=res.kernel_run_id, reason=reason)
             store.transition(dispatch_id, BLOCKED, detail=reason)
             return {"dispatch_id": dispatch_id, "resolved": "blocked",
                     "run_status": status, "reason": reason}
 
+        # Review handoff — every board mutation fenced to THIS receipt's
+        # kernel run. A card whose ownership cannot be proven is an
+        # explicit manual-review hold, never an unfenced promotion and
+        # never a silent unblock of a foreign operator block.
         with KernelBridge(board_db, cfg=policy.hermes) as kernel:
             task = kernel.call("get_task", task_id=res.task_id).get("task")
-            if task and task["status"] == "blocked":
-                kernel.call("unblock", task_id=res.task_id)
-                task = kernel.call("get_task",
-                                   task_id=res.task_id).get("task")
-            if not task or task["status"] not in ("running", "ready"):
-                raise ControlError(
-                    f"card {res.task_id} is {task['status'] if task else 'missing'} "
-                    "— cannot hand a completed run to review"
-                )
+            if task is None:
+                raise ControlError(f"card {res.task_id} is missing")
+            ours = res.kernel_run_id
+            held = None
+            if ours is None:
+                held = ("receipt has no kernel run — card run ownership is "
+                        "unprovable")
+            if held is None and task["status"] == "blocked":
+                lb = task.get("last_block") or {}
+                block_reason = lb.get("reason") or ""
+                if res.dispatch_id not in block_reason:
+                    held = ("card is blocked by a block this dispatch did "
+                            "not file — never auto-cleared")
+                elif (task.get("latest_run_id") is not None
+                      and int(task["latest_run_id"]) != int(ours)):
+                    held = ("a newer kernel run owns the card — the stale "
+                            "run's resolve cannot promote it")
+                else:
+                    kernel.call("unblock", task_id=res.task_id)
+                    task = kernel.call(
+                        "get_task", task_id=res.task_id).get("task")
+            expected = None
+            if held is None:
+                cur = task.get("current_run_id") if task else None
+                latest = task.get("latest_run_id") if task else None
+                if task["status"] == "running":
+                    if cur is None or int(cur) != int(ours):
+                        held = ("card runs under a different kernel run — "
+                                "ownership lost")
+                    else:
+                        expected = ours
+                elif task["status"] in ("ready", "todo"):
+                    if cur is not None and int(cur) != int(ours):
+                        held = "a foreign kernel run is live on the card"
+                    elif latest is not None and int(latest) != int(ours):
+                        held = ("a newer kernel run owns the card — the "
+                                "stale run's resolve cannot promote it")
+                    else:
+                        # Re-claim to obtain a live, provable fence: the
+                        # claim CAS is atomic, and the review handoff then
+                        # rides the run this resolve itself owns.
+                        claim = kernel.call(
+                            "claim", task_id=res.task_id,
+                            claimer=f"jev-resolve:{dispatch_id}",
+                            ttl_seconds=policy.dispatch.claim_ttl_seconds,
+                        )
+                        if claim.get("claimed"):
+                            expected = (claim.get("task") or {}).get(
+                                "current_run_id")
+                        else:
+                            held = ("card could not be claimed for the "
+                                    "resolve handoff")
+                else:
+                    held = (f"card status {task['status']!r} cannot accept "
+                            "this run's resolve")
+            if held is not None:
+                return {
+                    "dispatch_id": dispatch_id, "resolved": "held",
+                    "run_status": status,
+                    "reason": f"{held} — receipt stays unknown pending "
+                              "manual review",
+                }
             resp = kernel.call(
                 "request_review", task_id=res.task_id,
                 summary=f"resolved unknown dispatch {dispatch_id}: run "
                         f"{res.run_id} completed and re-verified",
                 metadata={"dispatch_id": dispatch_id,
                           "wrapper_run_id": res.run_id,
+                          "wrapper_attempt_id": res.attempt_id,
+                          "route": res.route,
                           "resolved_by": actor},
-                expected_run_id=(
-                    res.kernel_run_id
-                    if task["status"] == "running" else None
-                ),
+                expected_run_id=expected,
             )
             if not resp["ok"]:
                 raise ControlError(
@@ -583,7 +701,8 @@ def cmd_resolve(
         except StoreError:
             with KernelBridge(board_db, cfg=policy.hermes) as kernel:
                 try:
-                    kernel.call("reopen_review", task_id=res.task_id)
+                    kernel.call("reopen_review_if", task_id=res.task_id,
+                                expected_run_id=expected)
                 except KernelError:
                     pass
             raise ControlError(
