@@ -1,0 +1,23 @@
+[project]
+name = "cli-provider-kanban"
+version = "0.1.0"
+description = "Hermes Kanban card contract + rules-first Jev classifier + read-only shadow CLI."
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.7,<3",
+    "pyyaml>=6.0,<7",
+    "cli-provider-sdk",
+]
+
+[project.scripts]
+cli-provider-kanban = "cli_provider_kanban.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv.sources]
+cli-provider-sdk = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cli_provider_kanban"]

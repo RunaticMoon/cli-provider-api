@@ -1,0 +1,109 @@
+# Central routing policy sample for the Jev shadow classifier (Slice 1).
+#
+# Logical routes are `role.capability.tier`; candidate order is preserved for
+# the later 9Router combo compiler — the classifier never runs fallback.
+# `enabled: false` keeps a candidate visible-but-unavailable; a route whose
+# candidates are all unavailable classifies as `hold`.
+#
+# Truthful capability notes (2026-09-20 discovery):
+# - devin / swe-2-max: installed, `devin models list` reports cost_tier Free.
+#   Capability mapping verified for `code`/`review` text work only.
+# - bai_code: documented intent only — the BAI direct-API historical policy is
+#   NOT permitted for this integration and no binary exists on ARM64, so the
+#   candidate stays disabled. No invented model id.
+# - devin-opus-review: claude-opus-5-high is installed (High cost) but the
+#   persisted reviewer-fallback policy conflicts with the active conversation
+#   policy, so the reviewer lane stays INACTIVE pending explicit resolution.
+# - Codex: never a candidate (current Lead + FINAL fallback only).
+
+schema_version: 1
+policy_version: "2026-09-20.1"
+
+scope:
+  # External lane id; MUST NOT be a Hermes profile (validated at load).
+  assignee: jev-native
+  statuses: [ready, todo]
+
+# Optional Lead-maintained spec map (task_id -> TaskSpec fields), resolved
+# relative to this file's directory.
+task_map: null
+
+classifier:
+  # Rules-first only. No LLM classifier exists in this slice.
+  llm: disabled
+
+limits:
+  max_cards: 256
+  max_body_bytes: 65536
+  max_spec_bytes: 32768
+
+decomposition:
+  max_depth: 3
+  max_children: 8
+  replan_cap: 2
+
+approval:
+  tiers: [hard, max]
+  risk_flags:
+    - authn
+    - authz
+    - security
+    - billing
+    - destruction
+    - migration
+    - production
+    - external_effects
+
+capabilities: [code, review, research, planning]
+
+backends:
+  - id: devin-swe-2-max
+    kind: devin
+    model: swe-2-max          # verified via `devin models list` (cost Free)
+    enabled: true
+    cost_tier: free
+    capabilities:
+      code: true
+      review: true
+      research: false
+      planning: false
+  - id: bai-code
+    kind: bai_code
+    enabled: false
+    disabled_reason: >-
+      BAI direct-API historical policy is not permitted for this integration;
+      the server binary is absent and Linux ARM64 is unsupported. Documented
+      intent only — no invented model id.
+    capabilities: {}
+  - id: devin-opus-review
+    kind: devin
+    model: claude-opus-5-high
+    enabled: false
+    cost_tier: high
+    disabled_reason: >-
+      Reviewer fallback inactive: persisted reviewer-fallback policy conflicts
+      with the active conversation policy and stays off pending explicit
+      resolution. Would run as a separate immutable read-only session.
+    capabilities:
+      review: true
+
+routes:
+  worker.code.free:
+    candidates: [devin-swe-2-max]
+  worker.code.easy:
+    candidates: [devin-swe-2-max]
+  worker.code.standard:
+    # Order matters: the later compiler reads candidates in this order.
+    candidates: [devin-swe-2-max, bai-code]
+  worker.code.hard:
+    candidates: [devin-swe-2-max]
+  worker.code.max:
+    candidates: [devin-swe-2-max]
+  reviewer.review.standard:
+    # All candidates disabled -> classify `hold` until the reviewer-fallback
+    # policy conflict is resolved.
+    candidates: [devin-opus-review]
+
+workspaces:
+  ws-main:
+    path: /home/ubuntu/development/cli-provider-api-jev

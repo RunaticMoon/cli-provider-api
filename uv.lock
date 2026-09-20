@@ -8,6 +8,7 @@ members = [
     "cli-driver-mock",
     "cli-provider-api",
     "cli-provider-core",
+    "cli-provider-kanban",
     "cli-provider-runner",
     "cli-provider-sdk",
     "cli-provider-transports",
@@ -116,6 +117,23 @@ requires-dist = [
     { name = "cli-provider-runner", editable = "apps/runner" },
     { name = "cli-provider-sdk", editable = "packages/driver-sdk" },
     { name = "cli-provider-transports", editable = "packages/transports" },
+    { name = "pydantic", specifier = ">=2.7,<3" },
+    { name = "pyyaml", specifier = ">=6.0,<7" },
+]
+
+[[package]]
+name = "cli-provider-kanban"
+version = "0.1.0"
+source = { editable = "packages/kanban" }
+dependencies = [
+    { name = "cli-provider-sdk" },
+    { name = "pydantic" },
+    { name = "pyyaml" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "cli-provider-sdk", editable = "packages/driver-sdk" },
     { name = "pydantic", specifier = ">=2.7,<3" },
     { name = "pyyaml", specifier = ">=6.0,<7" },
 ]
