@@ -44,32 +44,28 @@ def body(task="task-1", execution="sentinel", **extra):
 
 
 def test_execution_context_is_persisted_and_echoed(system: MockSystem):
-    """A stock Runner rejects the unknown `execution` run param pre-execution
-    (INVALID_PARAMS) — the context still reaches the durable attempt record and
-    the normalized run view, and the failure is a proven pre-execution
-    rejection, never a retried execution."""
+    """The real Runner accepts typed context and completed retries reuse it."""
     with system.client() as client:
         response = client.post(CHAT, json=body(execution=EXECUTION))
-        assert response.status_code == 502
+        assert response.status_code == 200
         payload = response.json()
-        assert payload["error"]["code"] == "run_rejected"
         run = payload["run"]
-        assert run["status"] == "failed" and run["outcome"] == "rejected"
+        assert run["status"] == "completed" and run["outcome"] == "succeeded"
         assert run["execution"] == EXECUTION
         # Readback through the management route returns the same context.
         again = client.get(f"/api/v1/runs/{run['run_id']}").json()
         assert again["execution"] == EXECUTION
 
-        # Same task + same context replays the rejection admission path: the
-        # new attempt is admitted (proven pre-execution) and rejected again.
+        # Same task + same context reuses the durable completed attempt.
         retry = client.post(CHAT, json=body(execution=EXECUTION))
-        assert retry.status_code == 502
-        assert retry.json()["run"]["run_id"] != run["run_id"]
+        assert retry.status_code == 200
+        assert retry.json()["run"]["run_id"] == run["run_id"]
+        assert retry.json()["run"]["cached"] is True
 
 
 def test_execution_context_binds_into_request_hash(system: MockSystem):
     with system.client() as client:
-        assert client.post(CHAT, json=body(execution=EXECUTION)).status_code == 502
+        assert client.post(CHAT, json=body(execution=EXECUTION)).status_code == 200
         # Same task id with mutated context is a content conflict.
         mutated = dict(EXECUTION, task_revision="rev-8")
         conflict = client.post(CHAT, json=body(execution=mutated))

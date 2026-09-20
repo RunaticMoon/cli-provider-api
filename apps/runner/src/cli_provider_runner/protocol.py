@@ -58,6 +58,8 @@ from cli_provider_sdk import (
     WorkspaceRef,
 )
 
+from cli_provider_sdk.models import ExecutionContext
+
 PROTOCOL_VERSION = 1
 
 
@@ -155,6 +157,7 @@ class RunParams(BaseModel):
     model_alias: Alias | None = None
     messages: list[Message] = Field(min_length=1)
     deadline_seconds: float | None = Field(default=None, gt=0)
+    execution: ExecutionContext | None = None
 
     def to_driver_request(self) -> NormalizedRequest:
         return NormalizedRequest(
@@ -166,6 +169,7 @@ class RunParams(BaseModel):
             model_alias=self.model_alias,
             messages=self.messages,
             deadline_seconds=self.deadline_seconds,
+            execution=self.execution,
         )
 
 

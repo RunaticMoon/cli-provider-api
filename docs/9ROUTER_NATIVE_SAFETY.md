@@ -96,18 +96,19 @@ fields required together:
 - No execution `tool_calls` are returned to Hermes; only `message.delta` is
   answer text.
 
-### Known boundary (runner-owner dependency)
+### Runner integration
 
-Stock `cli_provider_runner.protocol.RunParams` is `extra="forbid"` and has no
-`execution` field, so a run carrying context is rejected `INVALID_PARAMS`
-(pre-execution, `FAILED/rejected`) by an unmodified Runner. That is safe — it
-can never execute with unvalidated metadata — but end-to-end propagation
-through the *stock* Runner awaits the runner-owner slice adding `execution`
-to `RunParams`/`to_driver_request` (SDK type already exists:
-`cli_provider_sdk.models.ExecutionContext`, `NormalizedRequest.execution`).
-This slice proves the full path with `tests/integration_9router/
-fixture_runner.py`, a real UDS/NDJSON protocol-v1 stand-in that validates
-`NormalizedRequest` including `execution` and records it on disk.
+`cli_provider_runner.protocol.RunParams` now accepts the SDK's optional typed
+`ExecutionContext` and preserves it in `to_driver_request`. All other unknown
+fields remain rejected. `apps/runner/tests/test_execution_context_wire.py`
+proves both typed driver-request propagation and the real Runner UDS acceptance;
+`apps/api/tests/test_execution_metadata.py` proves HTTP/control readback and
+same-run cached replay. Before integration these positive tests failed because
+`execution` was rejected as an unknown field (recorded RED).
+
+`tests/integration_9router/fixture_runner.py` remains a separate real UDS/NDJSON
+stand-in recording context on disk. Those fixture tests prove the actual
+9Router metadata and effectful retry boundaries, not native model inference.
 
 ## 9Router realities
 
