@@ -4,12 +4,12 @@ A common runtime for official CLI agents: a typed Driver SDK, a standalone
 Runner, a SQLite run controller and an authenticated OpenAI-compatible HTTP API.
 
 **This is a fixture-only executable alpha.** The `mock` driver is synthetic and
-the Antigravity driver is exercised only against synthetic fixtures: no real
-CLI/account is called anywhere in the code or the tests, and no Antigravity
-preset is enabled. Real OS isolation, remote mTLS, sessions/Fusion/resume, the
-Devin (ACP) driver and PTY support are later milestones and are disabled. See
-`M1B.md` (runtime/API) and `M2A.md` (transport + Antigravity driver) for what is
-actually verified.
+the Antigravity and Devin drivers are exercised only against synthetic fixtures:
+no real CLI/account is called anywhere in the code or the tests, and no native
+preset is enabled by default. Real OS isolation, remote mTLS,
+sessions/Fusion/resume and PTY support are later milestones. See `M1B.md`
+(runtime/API), `M2A.md` (transport + Antigravity driver) and the Devin driver
+docs for what is actually verified.
 
 ## Components
 
@@ -177,7 +177,8 @@ The standalone Runner takes an optional operator-only
 directory, owner-read/write or group-read at most, no symlink, validated on
 startup). It maps each request `workspace_id` to an absolute, existing,
 non-symlinked workspace root plus an allow-list of permission actions
-(`hermes.yolo`, `devin.acp.session_mode.bypass` — empty means deny
+(`hermes.yolo`, `devin.acp.session_mode.bypass`,
+`antigravity.dangerously_skip_permissions` — empty means deny
 everything) and optional exact `allowed_presets`/`allowed_models`.
 
 - Requests carry only the workspace *id* — never a path or runtime
@@ -204,13 +205,12 @@ NINEROUTER_APP=/path/to/9router-0.5.75/package/app \
   uv run --all-packages pytest tests/integration_9router -v
 ```
 
-Latest local verification: **315 default tests + 2 opt-in gateway tests passed**
-on Linux/aarch64, Python 3.11 and 3.12. The latter exercise pre-execution
-fallback, task identity, artifacts/cache, and early streaming run
-identification.
+Latest local verification: **1245 default tests passed** on Linux/aarch64,
+Python 3.11, including real Runner→synthetic-agy and real API→Runner→fixture
+coverage for the Antigravity driver.
 
 ```bash
-uv run pytest                     # 315 passed (fixture-only, no real CLI)
+uv run pytest                     # 1245 passed (fixture-only, no real CLI)
 uv run pytest apps/api            # real API subprocess + real Runner subprocess
 ```
 
@@ -222,11 +222,13 @@ subprocess over a Unix socket and an HTTP port) with a generated local key.
 
 - The `mock` driver is synthetic and every run it produces is labelled
   `synthetic`; that is not proof of native compatibility. The Antigravity driver
-  exists but is fixture-tested only, no Antigravity preset is enabled, and the
-  Runner does not yet inject a process executor, so it currently fails closed
-  through the Runner rather than executing the real CLI.
-- No Devin (ACP) driver, no ACP/PTY transports, no sessions/Fusion/resume, no
-  remote/mTLS Runners, no OS sandbox claims.
+  runs through the Runner with real process-group teardown, pinned CLI-version +
+  authenticated-catalog verification and init-level model/permission checks —
+  but only against the synthetic `agy` fixture: no real Antigravity account has
+  executed a task under this driver yet (the CLI's Google auth owns credentials;
+  no real canary is claimed here).
+- The Devin (ACP) driver is likewise fixture-tested only. No PTY transports,
+  no sessions/Fusion/resume, no remote/mTLS Runners, no OS sandbox claims.
 - No provider/model fallback or retry: one enabled preset per request, and only
   pre-execution errors could ever be eligible for upstream fallback.
 - Single API instance over SQLite; no Redis/Celery/Kubernetes.

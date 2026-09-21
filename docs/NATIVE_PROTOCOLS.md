@@ -4,16 +4,19 @@ Verified 2026-09-17 on Linux/aarch64. These are interface observations, not prod
 
 ## Antigravity
 
-- Installed CLI: `1.2.5`.
-- Installed help advertises `--input-format stream-json`, `--output-format stream-json`, `--model`, `--effort`, `--print-timeout`, `--sandbox`.
-- Actual subprocess started with `agy --input-format stream-json --output-format stream-json` (no `-p`) and emitted a valid `init` event before any prompt. Process was then closed. **No inference performed.**
-- Official input frame is `{"event":"user","message":{"content":"..."}}`, not a guessed `type:user` envelope. Text-block lists are also documented; non-text blocks must not be silently discarded.
-- Output: `init`, `step_update`, one `result` per turn. Only `agent_response.text_delta` is an answer delta; planning/tool/checkpoint content is not automatically user-visible answer text.
-- A result's `response` belongs to the current turn; `usage`, `num_turns` and `duration_seconds` in persistent sessions are cumulative. Stateless first version avoids silently summing cumulative usage twice.
-- Documented headless soft-denied tools can coexist with process exit 0. Tests/permissions must be reported separately from turn completion.
-- Global help does not establish effort support for a specific model. Exact backend models and supported reasoning settings require authenticated validation before preset activation.
+- Installed CLI: `1.2.7` (pinned via `AGY_EXPECTED_VERSION`; an earlier read-only observation recorded `1.2.5`).
+- Invocation: `agy --input-format stream-json --output-format stream-json --model <exact-id>` — no `-p` in stream-json mode. `--dangerously-skip-permissions` is supported invocation-locally and is emitted only when the operator enables it (`AGY_ALLOW_SKIP_PERMISSIONS`) AND the bound workspace's execution config grants `antigravity.dangerously_skip_permissions`.
+- `agy models` prints a `Fetching available models...` preamble then tab-separated `<model-id>\t<label>` rows; there is no JSON mode. Discovery matches whole ids only — no prefix/suffix/fuzzy promotion.
+- Input frame: `{"event":"user","message":{"content":"..."}}`.
+- Output envelopes carry their payload nested under a key matching the event name: `{"event":"init","init":{...}}`, `{"event":"step_update","step_update":{...}}`, `{"event":"result","result":{...}}`.
+- `init` is emitted before any prompt is read and carries `cwd`, `model`, `permission_mode`, `tools`. Observed 2026-09-21: `init.model=gemini-3.8-flash-high`, `init.permission_mode=always-proceed` under `--dangerously-skip-permissions`; the process exited 0 when stdin closed without a task. The driver verifies `init.model`/`permission_mode`/`cwd` against the admitted request and the operator permission decision before sending the prompt; mismatch fails the run before any task text is sent.
+- `step_update.step_type` values observed/documented: `user_input`, `checkpoint`, `agent_response`, `tool`, plus planning kinds. Only `step_type == "agent_response"` `text_delta` is answer text — every other step type is consumed and dropped.
+- Tool steps carry `tool_name` and `tool_info` (`name`/`parameters`/`output`/`error`). A `tool_info.error` (including soft permission denials) marks the tool event failed and downgrades the run outcome to `partial` — it can still coexist with `result.status == "SUCCESS"` and process exit 0.
+- `result.status`: `SUCCESS` is the only status that completes a run. `ERROR`, `CANCELED`, `INTERRUPTED`, `INVALID`, `WAITING`, `RUNNING`, a missing/malformed status, or a stream that ends without `result` all fail or cancel the run — never complete it.
+- `result.usage` (`input_tokens`/`output_tokens`/...) is cumulative in persistent sessions; this driver is stateless (one process per run), so a valid non-zero observation is reported as first-turn usage and absent/zero usage is `unknown` — never a fabricated zero.
+- Catalog membership is not evidence of inference, quota or billing: `agy models` proves the account lists the id only.
 
-Source: https://antigravity.google/docs/cli/headless/ (live page and installed help).
+Sources: https://antigravity.google/docs/cli/headless/ (live page fetched by parent 2026-09) and the parent's no-inference handshake observation (`init` before prompt, exit 0).
 
 ## Devin
 

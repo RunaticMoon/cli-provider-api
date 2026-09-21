@@ -35,7 +35,7 @@ This is a new public project, not a claim that the SDK/config syntax already exi
 
 ## Milestones and acceptance
 1. SDK + Mock Driver + real API/Runner boundary: success/failure/timeout/cancel/idempotency/ownership/unsupported-capability tests. Must actually run, not scaffolding only.
-2. Antigravity NDJSON: official live protocol, auth/model validation, errors/permission denial/process cleanup. Fixtures don't prove account execution.
+2. Antigravity NDJSON: official live protocol, auth/model validation, errors/permission denial/process cleanup. Implemented + fixture-tested (bounded `agy --version`/`agy models` catalog verification against exact pins, nested init/step_update/result envelopes, init model/permission/cwd verification before prompt, strict `SUCCESS`-only terminal, answer-only streaming, soft-denial → partial, Runner→synthetic-agy and API→Runner→fixture coverage). **Native account execution still not run** — fixtures don't prove account execution, inference, quota or billing.
 3. Devin ACP: initialization, sessions, prompt/update/permissions/cancel; one native task, optional capability negotiation.
 4. Actual pinned 9Router integration in isolated DB/auth: slash aliases, provider scopes, SSE/errors/deadline and task/idempotency preservation; pre-execution fallback first. Do not modify the existing production gateway.
 5. Workspace/patch/evidence and real OS isolation: original unchanged, no residual processes, filesystem/network negative controls.

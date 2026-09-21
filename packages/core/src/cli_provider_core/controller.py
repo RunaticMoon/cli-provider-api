@@ -506,6 +506,10 @@ class RunController:
             "task_id": record.task_id,
             "attempt_id": record.attempt_id,
             "preset": preset.alias,
+            # The admitted model binding: the preset's operator-pinned model_id
+            # is forwarded verbatim so a driver binds the exact model that was
+            # admitted, never a driver-side default.
+            "model_alias": preset.model_id,
             "workspace": {"workspace_id": record.workspace_id},
             "messages": active.messages,
             "deadline_seconds": deadline_seconds,

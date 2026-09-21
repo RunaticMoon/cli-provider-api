@@ -72,6 +72,25 @@ def test_loads_a_valid_config(tmp_path):
     assert config.binding_for("ws-other") is None
 
 
+def test_antigravity_skip_permissions_action_is_known(tmp_path):
+    root = make_root(tmp_path)
+    conf = write_config(
+        tmp_path,
+        {
+            "ws-1": {
+                "root": str(root),
+                "allowed_actions": ["antigravity.dangerously_skip_permissions"],
+            }
+        },
+    )
+    binding = load_execution_config(str(conf)).binding_for("ws-1")
+    assert binding is not None
+    assert BoundPermissions("ws-1", binding.allowed_actions).allows(
+        "antigravity.dangerously_skip_permissions"
+    )
+    assert not BoundPermissions("ws-1", binding.allowed_actions).allows("hermes.yolo")
+
+
 def test_group_readable_config_is_accepted_and_documented(tmp_path):
     root = make_root(tmp_path)
     conf = write_config(tmp_path, {"ws-1": {"root": str(root)}}, file_mode=0o640)

@@ -44,7 +44,13 @@ from cli_provider_sdk import ID_PATTERN, validate_alias
 #: Named runtime actions an operator may grant per workspace. Unknown values
 #: are rejected at config load so a typo never silently widens a grant. An
 #: absent/empty list grants nothing — deny by default.
-KNOWN_ACTIONS = frozenset({"hermes.yolo", "devin.acp.session_mode.bypass"})
+KNOWN_ACTIONS = frozenset(
+    {
+        "hermes.yolo",
+        "devin.acp.session_mode.bypass",
+        "antigravity.dangerously_skip_permissions",
+    }
+)
 
 CONFIG_MAX_BYTES = 65536
 WORKSPACE_LOCK_NAME = ".cli-provider-runner.lock"

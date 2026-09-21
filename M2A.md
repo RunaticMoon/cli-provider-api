@@ -1,5 +1,12 @@
 # M2A — reusable stdio process transport + Antigravity driver (fixtures only)
 
+> **Historical.** This documents the original M2A slice. The Antigravity driver
+> has since been updated to the current official nested protocol
+> (`init`/`step_update`/`result` payloads nested under the event name), exact
+> `agy models` catalog + pinned-version verification, request-bound model
+> selection, and init-level model/permission/cwd checks before the prompt. See
+> `docs/NATIVE_PROTOCOLS.md` for the current contract.
+
 This slice adds the first native driver package. It is **fixture-tested only**:
 no test starts the real `agy` binary, contacts an account, or performs
 inference, and **no preset is enabled**. Nothing here is evidence that
