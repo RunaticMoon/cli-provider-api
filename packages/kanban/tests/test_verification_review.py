@@ -179,6 +179,13 @@ class TestDescendantCleanup:
             "sleep 3; "
             f"echo late > {marker}"
             "' </dev/null >/dev/null 2>&1 & "
+            # Bounded handshake: the leader must not report success (and
+            # trigger supervisor cleanup) until the setsid child has
+            # actually spawned and recorded its pid — otherwise a correct
+            # cleanup can kill the child before its first write, and the
+            # test races the fixture instead of the supervisor.
+            f"i=0; while [ ! -s {pid_file} ] && [ $i -lt 200 ]; do "
+            "i=$((i+1)); sleep 0.05; done; "
             "echo leader-done; exit 0",
         ]
         start = time.time()
