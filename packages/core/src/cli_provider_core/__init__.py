@@ -4,8 +4,18 @@ This package never imports or loads a driver package. It reaches Runners only
 through the validated UDS client session.
 """
 
+from .catalog import (
+    ModelBinding,
+    catalog_view,
+    dynamic_model_entries,
+    principal_may_execute,
+    principal_may_read,
+    resolve_model,
+    source_admits,
+)
 from .config import (
     ApiSettings,
+    CatalogSourceConfig,
     Concurrency,
     Limits,
     OperatorConfig,
@@ -51,6 +61,7 @@ __all__ = [
     "BodyTimeout",
     "BodyTooLarge",
     "CancelView",
+    "CatalogSourceConfig",
     "Concurrency",
     "chat_id_for_run",
     "Conflict",
@@ -59,6 +70,7 @@ __all__ = [
     "HeadersTooLarge",
     "InvalidRequest",
     "Limits",
+    "ModelBinding",
     "NotFound",
     "OperatorConfig",
     "PresetConfig",
@@ -81,11 +93,17 @@ __all__ = [
     "UnsupportedCapability",
     "UpstreamProtocolError",
     "WorkspaceConfig",
+    "catalog_view",
+    "dynamic_model_entries",
     "hash_api_key",
     "load_config",
     "new_artifact_id",
     "new_attempt_id",
     "new_run_id",
+    "principal_may_execute",
+    "principal_may_read",
     "request_hash",
+    "resolve_model",
+    "source_admits",
     "verify_api_key",
 ]

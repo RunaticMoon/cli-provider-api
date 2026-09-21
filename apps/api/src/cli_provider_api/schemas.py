@@ -18,7 +18,7 @@ from cli_provider_core import (
     InvalidRequest,
     UnsupportedCapability,
 )
-from cli_provider_sdk import ID_PATTERN
+from cli_provider_sdk import EFFORT_PATTERN, ID_PATTERN
 from cli_provider_sdk.models import ExecutionContext
 from pydantic import ValidationError
 
@@ -26,7 +26,9 @@ import re
 
 _ID = re.compile(ID_PATTERN)
 
-ALLOWED_CHAT_FIELDS = frozenset({"model", "messages", "stream", "metadata"})
+ALLOWED_CHAT_FIELDS = frozenset(
+    {"model", "messages", "stream", "metadata", "reasoning_effort"}
+)
 
 # Present but explicitly not implemented: report as unsupported capability.
 UNSUPPORTED_CHAT_FIELDS = frozenset(
@@ -54,7 +56,6 @@ UNSUPPORTED_CHAT_FIELDS = frozenset(
         "parallel_tool_calls",
         "prediction",
         "store",
-        "reasoning_effort",
         "input",
         "instructions",
     }
@@ -67,8 +68,31 @@ UNSUPPORTED_CHAT_FIELDS = frozenset(
 # these values: they are persisted and echoed verbatim and are never a
 # server attestation of route/policy, and never an executable/path/right
 # selector.
-ALLOWED_METADATA_FIELDS = frozenset({"task_id", "workspace_id", "execution"})
+# ``metadata.reasoning_effort`` is the typed gateway-compatible carrier: some
+# OpenAI-compatible gateways strip the top-level field for unknown models but
+# preserve the metadata object. Both normalize to the same validated field and
+# must agree exactly when both are present — there is no silent precedence.
+ALLOWED_METADATA_FIELDS = frozenset(
+    {"task_id", "workspace_id", "execution", "reasoning_effort"}
+)
 ROLES = frozenset({"system", "user", "assistant"})
+
+_EFFORT = re.compile(EFFORT_PATTERN)
+
+
+def _parse_effort(value: Any, field: str) -> str | None:
+    """Strictly type-check a reasoning_effort token before any model lookup."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise InvalidRequest(f"{field} must be a string effort token")
+    if _EFFORT.match(value) is None:
+        raise InvalidRequest(
+            f"{field} must be a short lowercase effort token such as "
+            "'low', 'medium' or 'high'; flags, paths and free-form strings "
+            "are rejected"
+        )
+    return value
 
 # A message is exactly {role, content} in this MVP. Execution-selecting keys
 # (tools/functions/name) are reported as unsupported capability; any other key
@@ -96,6 +120,7 @@ class ChatRequest:
     task_id: str
     workspace_id: str
     execution: dict[str, str] | None = None
+    reasoning_effort: str | None = None
 
 
 async def read_bounded_json(
@@ -213,6 +238,21 @@ def parse_chat_request(data: Mapping[str, Any]) -> ChatRequest:
                 "bounded scalars with route in role.capability.tier form"
             ) from exc
 
+    top_effort = _parse_effort(data.get("reasoning_effort"), "reasoning_effort")
+    meta_effort = _parse_effort(
+        metadata.get("reasoning_effort"), "metadata.reasoning_effort"
+    )
+    if (
+        top_effort is not None
+        and meta_effort is not None
+        and top_effort != meta_effort
+    ):
+        raise InvalidRequest(
+            "reasoning_effort and metadata.reasoning_effort disagree; send the "
+            "same value in both or only one"
+        )
+    reasoning_effort = top_effort if top_effort is not None else meta_effort
+
     return ChatRequest(
         model=model,
         messages=messages,
@@ -220,6 +260,7 @@ def parse_chat_request(data: Mapping[str, Any]) -> ChatRequest:
         task_id=task_id,
         workspace_id=workspace_id,
         execution=execution,
+        reasoning_effort=reasoning_effort,
     )
 
 

@@ -25,6 +25,7 @@ def request_hash(
     task_policy: str,
     messages: Sequence[Mapping[str, Any]],
     execution: Mapping[str, Any] | None = None,
+    reasoning_effort: str | None = None,
 ) -> str:
     payload = {
         "principal": principal,
@@ -43,6 +44,13 @@ def request_hash(
     # new Lead revision decision.
     if execution is not None:
         payload["execution"] = dict(execution)
+    # An explicit reasoning-effort request is part of the logical request too:
+    # replaying the same task under a different effort is a content conflict,
+    # never a silent cached answer from a differently-efforted run. When the
+    # field is absent the digest is identical to the legacy shape, preserving
+    # the pre-effort cross-provider retry semantics.
+    if reasoning_effort is not None:
+        payload["reasoning_effort"] = reasoning_effort
     return "sha256:" + hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 

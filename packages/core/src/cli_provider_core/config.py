@@ -15,7 +15,7 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from cli_provider_sdk import Alias, ID_PATTERN
+from cli_provider_sdk import Alias, ID_PATTERN, validate_alias
 
 _KEY_HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
@@ -55,6 +55,10 @@ class ApiSettings(_Strict):
     # A single, fixed deadline for reading a whole request body. Byte caps alone
     # do not bound a slow drip feed; this is never renewed per chunk.
     request_body_timeout_seconds: float = Field(default=10.0, gt=0)
+    # Minimum interval between driver catalog refreshes triggered by read or
+    # resolve paths. Refresh is singleflight: concurrent callers share one
+    # pass, so a request burst cannot spawn a process-per-request storm.
+    catalog_refresh_seconds: float = Field(default=30.0, gt=0)
     limits: Limits = Field(default_factory=Limits)
     concurrency: Concurrency = Field(default_factory=Concurrency)
 
@@ -87,6 +91,48 @@ class PresetConfig(_Strict):
     allow_synthetic_unverified: bool = False
 
 
+class CatalogSourceConfig(_Strict):
+    """Opt-in discovery source owned by the operator, not by requests.
+
+    Models a runner's driver reports in its native catalog become visible as
+    ``<alias_prefix><exact model_id>`` and — only when separately granted —
+    runnable without a per-model preset. ``models=None`` is a provider-level
+    grant over every verified+executable catalog entry; a list restricts the
+    source to those exact ids. ``cost_tiers`` restricts admission to the
+    descriptor's observed cost class (absent tier never matches).
+    """
+
+    name: str = Field(pattern=ID_PATTERN)
+    runner_ref: str = Field(min_length=1)
+    alias_prefix: str = Field(min_length=2, max_length=200)
+    task_policy: str = Field(default="text", min_length=1)
+    enabled: bool = True
+    models: list[str] | None = Field(default=None, max_length=512)
+    cost_tiers: list[str] | None = Field(default=None, max_length=16)
+    # Same opt-in semantics as PresetConfig.allow_synthetic_unverified.
+    allow_synthetic_unverified: bool = False
+
+    @model_validator(mode="after")
+    def _prefix_and_filters(self) -> "CatalogSourceConfig":
+        if not self.alias_prefix.endswith("/"):
+            raise ValueError("alias_prefix must end with '/'")
+        try:
+            validate_alias(self.alias_prefix + "x")
+        except ValueError as exc:
+            raise ValueError(f"alias_prefix {self.alias_prefix!r} is invalid: {exc}")
+        if self.models is not None:
+            for model in self.models:
+                if re.match(ID_PATTERN, model) is None:
+                    raise ValueError(f"catalog model {model!r} is not a model id")
+            if len(set(self.models)) != len(self.models):
+                raise ValueError("duplicate catalog model id")
+        if self.cost_tiers is not None:
+            for tier in self.cost_tiers:
+                if not tier or len(tier) > 64:
+                    raise ValueError("cost_tier entries must be bounded strings")
+        return self
+
+
 class WorkspaceConfig(_Strict):
     workspace_id: str = Field(pattern=ID_PATTERN)
     description: str | None = None
@@ -95,7 +141,15 @@ class WorkspaceConfig(_Strict):
 class PrincipalConfig(_Strict):
     name: str = Field(pattern=ID_PATTERN)
     key_hash: str
+    # Static preset aliases AND exact concrete catalog aliases
+    # ("<alias_prefix><model_id>") a principal may run.
     allowed_presets: list[Alias] = Field(min_length=1)
+    # Read-only discovery grants: catalog sources visible in /api/v1/catalog.
+    # A read-only grant never executes anything.
+    allowed_catalogs: list[str] = Field(default_factory=list)
+    # Execution grants: dynamic aliases admitted by these sources may run.
+    # allowed_catalogs is metadata only; executable_catalogs is the run gate.
+    executable_catalogs: list[str] = Field(default_factory=list)
     allowed_workspaces: list[str] = Field(min_length=1)
     max_concurrency: int = Field(default=2, ge=1)
 
@@ -115,6 +169,9 @@ class OperatorConfig(_Strict):
     api: ApiSettings = Field(default_factory=ApiSettings)
     runners: list[RunnerConfig] = Field(min_length=1)
     presets: list[PresetConfig] = Field(min_length=1)
+    # Opt-in dynamic discovery sources. Empty means the deployment behaves
+    # exactly like a static-presets-only configuration.
+    catalogs: list[CatalogSourceConfig] = Field(default_factory=list)
     workspaces: list[WorkspaceConfig] = Field(min_length=1)
     principals: list[PrincipalConfig] = Field(min_length=1)
 
@@ -140,13 +197,41 @@ class OperatorConfig(_Strict):
                     f"preset {preset.alias!r} references unknown runner "
                     f"{preset.runner_ref!r}"
                 )
+
+        catalog_names = [c.name for c in self.catalogs]
+        if len(set(catalog_names)) != len(catalog_names):
+            raise ValueError("duplicate catalog source name")
+        for source in self.catalogs:
+            if source.runner_ref not in runners:
+                raise ValueError(
+                    f"catalog {source.name!r} references unknown runner "
+                    f"{source.runner_ref!r}"
+                )
+        prefixes = [c.alias_prefix for c in self.catalogs if c.enabled]
+        for index, prefix in enumerate(prefixes):
+            for other in prefixes[index + 1 :]:
+                if prefix.startswith(other) or other.startswith(prefix):
+                    raise ValueError(
+                        f"catalog alias prefixes {prefix!r} and {other!r} overlap"
+                    )
+
         preset_set = set(presets)
         for principal in self.principals:
-            unknown = [p for p in principal.allowed_presets if p not in preset_set]
+            unknown = [
+                p
+                for p in principal.allowed_presets
+                if p not in preset_set and not self._catalog_alias(p)
+            ]
             if unknown:
                 raise ValueError(
                     f"principal {principal.name!r} allows unknown presets {unknown!r}"
                 )
+            for grant in principal.allowed_catalogs + principal.executable_catalogs:
+                if grant not in catalog_names:
+                    raise ValueError(
+                        f"principal {principal.name!r} grants unknown catalog "
+                        f"{grant!r}"
+                    )
             unknown_ws = [
                 w for w in principal.allowed_workspaces if w not in workspaces
             ]
@@ -157,11 +242,25 @@ class OperatorConfig(_Strict):
                 )
         return self
 
+    def _catalog_alias(self, alias: str) -> bool:
+        """A principal grant shaped like ``<source prefix><model id>``."""
+
+        for source in self.catalogs:
+            if not source.enabled or not alias.startswith(source.alias_prefix):
+                continue
+            tail = alias[len(source.alias_prefix) :]
+            if re.match(ID_PATTERN, tail) is not None:
+                return True
+        return False
+
     def runner_map(self) -> dict[str, RunnerConfig]:
         return {r.instance_id: r for r in self.runners}
 
     def preset_map(self) -> dict[str, PresetConfig]:
         return {p.alias: p for p in self.presets}
+
+    def catalog_map(self) -> dict[str, CatalogSourceConfig]:
+        return {c.name: c for c in self.catalogs}
 
     def principal_map(self) -> dict[str, PrincipalConfig]:
         return {p.name: p for p in self.principals}

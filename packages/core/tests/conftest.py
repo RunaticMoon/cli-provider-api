@@ -115,6 +115,11 @@ class FakeControl:
     max_queue: int = 8
     # Runner-owned cancellation cleanup budget, declared over the runtime RPC.
     cancel_cleanup_seconds: float = 2.0
+    # Catalog fixture control: descriptor dicts the fake reports, plus a call
+    # counter so tests can prove refresh is singleflight/TTL-bounded.
+    models: list[dict[str, Any]] | None = None
+    discovery_calls: int = 0
+    discovery_fail: bool = False
 
 
 class FakeSession:
@@ -161,6 +166,11 @@ class FakeSession:
         }
 
     async def discover_models(self) -> list[dict[str, Any]]:
+        self.control.discovery_calls += 1
+        if self.control.discovery_fail:
+            raise RuntimeError("fake catalog read failed")
+        if self.control.models is not None:
+            return self.control.models
         return [
             {
                 "model_id": "mock-model",

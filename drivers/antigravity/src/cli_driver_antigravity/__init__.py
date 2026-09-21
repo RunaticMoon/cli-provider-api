@@ -31,9 +31,11 @@ fabricates usage, success or verification.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import time
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
@@ -43,6 +45,7 @@ from cli_provider_sdk import (
     CancelResult,
     Capabilities,
     DriverManifest,
+    EffortSupport,
     MessageDeltaEvent,
     MessageDeltaPayload,
     ModelDescriptor,
@@ -72,6 +75,7 @@ from cli_provider_sdk import (
     UsageProvenance,
     Verification,
     VerificationStatus,
+    resolve_effort,
 )
 from cli_provider_transports import (
     DEFAULT_MAX_FRAME_BYTES,
@@ -87,6 +91,11 @@ MODELS_ENV = "AGY_MODELS"
 EXPECTED_VERSION_ENV = "AGY_EXPECTED_VERSION"
 ALLOW_SKIP_ENV = "AGY_ALLOW_SKIP_PERMISSIONS"
 CATALOG_TTL_ENV = "AGY_CATALOG_TTL_SECONDS"
+# Fixture-only hook (tests): a JSON file mapping exact model_id -> declared
+# effort metadata, e.g. {"m1": {"effort": "selectable", "effort_options":
+# ["low","high"]}}. The native `agy models` output carries no per-model effort
+# evidence, so without this file every descriptor honestly reports `unknown`.
+EFFORT_FIXTURE_ENV = "AGY_EFFORT_FIXTURE"
 
 # Runner execution-config action that authorizes ``--dangerously-skip-permissions``
 # for a run. It is a named operator action (not a request field): the flag is
@@ -117,6 +126,7 @@ SANITIZED_ENV = (
     EXPECTED_VERSION_ENV,
     ALLOW_SKIP_ENV,
     CATALOG_TTL_ENV,
+    EFFORT_FIXTURE_ENV,
 )
 
 
@@ -149,6 +159,7 @@ class AntigravityDriver(BaseDriver):
         handshake_timeout_seconds: float = HANDSHAKE_TIMEOUT_SECONDS,
         max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
         grace_seconds: float = DEFAULT_TERMINATION_GRACE_SECONDS,
+        effort_fixture: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self._cli = cli_command or os.environ.get(CLI_ENV) or DEFAULT_CLI
         raw_models = (
@@ -156,10 +167,15 @@ class AntigravityDriver(BaseDriver):
             if models is not None
             else _split_models(os.environ.get(MODELS_ENV))
         )
+        # ``*`` is the explicit operator opt-in: every verified catalog member
+        # becomes executable. Otherwise AGY_MODELS remains the exact allowlist.
+        self._allow_all_models = "*" in raw_models
         # Only IDs that can ever be advertised as a ModelDescriptor are kept:
         # an allowlist entry that violates the schema ID pattern is dropped
         # rather than promoted into a descriptor that cannot validate.
-        self._models = [m for m in raw_models if _ID_RE.match(m)]
+        self._models = [
+            m for m in raw_models if m != "*" and _ID_RE.match(m)
+        ]
         self._expected_version = (
             expected_version
             if expected_version is not None
@@ -182,6 +198,27 @@ class AntigravityDriver(BaseDriver):
         self._active: dict[str, NdjsonProcessTransport] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
         self._catalog_cache: tuple[float, list[ModelDescriptor]] | None = None
+        self._effort_fixture = (
+            effort_fixture
+            if effort_fixture is not None
+            else self._load_effort_fixture()
+        )
+
+    @staticmethod
+    def _load_effort_fixture() -> dict[str, dict[str, Any]]:
+        """Test-only declared effort metadata; absent -> every model unknown."""
+        path = os.environ.get(EFFORT_FIXTURE_ENV)
+        if not path:
+            return {}
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _model_allowed(self, model_id: str) -> bool:
+        """Execution allowlist — strictly separate from catalog discovery."""
+        return self._allow_all_models or model_id in self._models
 
     # ------------------------------------------------------------- manifest
 
@@ -227,7 +264,9 @@ class AntigravityDriver(BaseDriver):
             argv += ["-u", name]
         return argv + [self._cli] + tail
 
-    def _session_argv(self, model: str, skip_permissions: bool) -> list[str]:
+    def _session_argv(
+        self, model: str, skip_permissions: bool, effort: str | None = None
+    ) -> list[str]:
         argv = self._sanitized_argv(
             [
                 "--input-format",
@@ -238,6 +277,10 @@ class AntigravityDriver(BaseDriver):
                 model,
             ]
         )
+        if effort is not None:
+            # Emitted only for descriptors that declared `selectable` support;
+            # the token is a bounded enum value, never a free-form string.
+            argv += ["--effort", effort]
         if skip_permissions:
             argv.append("--dangerously-skip-permissions")
         return argv
@@ -361,12 +404,13 @@ class AntigravityDriver(BaseDriver):
 
     async def _read_catalog(
         self, ctx: RuntimeContext
-    ) -> tuple[set[str] | None, str]:
-        """Run bounded ``agy models`` and return the exact observed ID set.
+    ) -> tuple[dict[str, str] | None, str]:
+        """Run bounded ``agy models`` and return exact id -> display label.
 
         Returns ``(None, reason)`` when the catalog cannot be trusted at all:
-        spawn failure, timeout, nonzero exit, or zero parseable rows. Stdout and
-        stderr text are never propagated - only the outcome classification is.
+        spawn failure, timeout, unconfirmed termination, nonzero exit, or zero
+        parseable rows. Stdout and stderr text are never propagated - only the
+        outcome classification is.
         """
         try:
             output, transport = await self._spawned_stdout(
@@ -377,102 +421,122 @@ class AntigravityDriver(BaseDriver):
             )
         except ProcessStartError:
             return None, "catalog CLI not startable"
-        await transport.aclose()
+        confirmed = await transport.aclose()
+        if not confirmed:
+            return None, "catalog process termination was not confirmed"
         if output is None:
             return None, "catalog read timed out or failed"
         if transport.returncode not in (0, None):
             return None, "catalog command exited non-zero"
-        ids: set[str] = set()
+        rows: dict[str, str] = {}
         for line in output.decode("utf-8", "replace").splitlines():
             if "\t" not in line:
                 continue  # documented "Fetching available models..." preamble
-            model_id = line.split("\t", 1)[0].strip()
-            if model_id:
-                ids.add(model_id)
-        if not ids:
+            model_id, _, label = line.partition("\t")
+            model_id = model_id.strip()
+            if model_id and _ID_RE.match(model_id):
+                rows[model_id] = label.strip()
+        if not rows:
             return None, "catalog output parsed to zero model rows"
-        return ids, "catalog read"
+        return rows, "catalog read"
 
     def _descriptor(
-        self, model_id: str, status: VerificationStatus, reason: str, label: str | None = None
+        self,
+        model_id: str,
+        status: VerificationStatus,
+        reason: str,
+        label: str | None = None,
+        executable: bool = False,
     ) -> ModelDescriptor:
+        # Effort metadata comes only from the declared fixture map; the native
+        # `agy models` output carries no per-model effort evidence, so the
+        # truthful default is `unknown`.
+        fixture = self._effort_fixture.get(model_id) or {}
         return ModelDescriptor(
             model_id=model_id,
             display_name=label or model_id,
             verification=Verification(
                 status=status, source=_CATALOG_SOURCE, reason=reason
             ),
+            effort=fixture.get("effort", "unknown"),
+            effort_options=list(fixture.get("effort_options") or []),
+            effort_variants=dict(fixture.get("effort_variants") or {}),
+            executable=executable,
         )
 
     async def _catalog_descriptors(self, ctx: RuntimeContext) -> list[ModelDescriptor]:
+        """Enumerate the real catalog; the operator allowlist gates execution."""
+        configured = [m for m in self._models]
+
+        def fallback(status: VerificationStatus, reason: str):
+            return [
+                self._descriptor(m, status, reason)
+                for m in configured
+            ]
+
         if ctx.executor is None:
-            return [
-                self._descriptor(
-                    m, VerificationStatus.UNKNOWN, "no process executor supplied; catalog not read"
-                )
-                for m in self._models
-            ]
+            return fallback(
+                VerificationStatus.UNKNOWN,
+                "no process executor supplied; catalog not read",
+            )
         if not self._expected_version:
-            return [
-                self._descriptor(
-                    m, VerificationStatus.UNKNOWN, "no pinned CLI version configured (AGY_EXPECTED_VERSION)"
-                )
-                for m in self._models
-            ]
+            return fallback(
+                VerificationStatus.UNKNOWN,
+                "no pinned CLI version configured (AGY_EXPECTED_VERSION)",
+            )
         cli_version, transport = await self._cli_version(ctx)
         if transport is not None:
             await transport.aclose()
         if cli_version is None:
-            return [
-                self._descriptor(
-                    m, VerificationStatus.UNKNOWN, "CLI version could not be read or parsed"
-                )
-                for m in self._models
-            ]
+            return fallback(
+                VerificationStatus.UNKNOWN,
+                "CLI version could not be read or parsed",
+            )
         if cli_version != self._expected_version:
-            return [
-                self._descriptor(
-                    m,
-                    VerificationStatus.FAILED,
-                    f"CLI version {cli_version} does not match pinned {self._expected_version}",
-                )
-                for m in self._models
-            ]
+            return fallback(
+                VerificationStatus.FAILED,
+                f"CLI version {cli_version} does not match pinned "
+                f"{self._expected_version}",
+            )
         catalog, reason = await self._read_catalog(ctx)
         if catalog is None:
-            return [
-                self._descriptor(m, VerificationStatus.UNKNOWN, reason)
-                for m in self._models
-            ]
-        descriptors = []
-        for model_id in self._models:
-            if model_id in catalog:
-                descriptors.append(
-                    self._descriptor(
-                        model_id,
-                        VerificationStatus.PASSED,
-                        f"exact id observed in authenticated catalog; CLI {cli_version} "
-                        "matches the pinned version; valid for "
-                        f"{self._catalog_ttl:.0f}s (membership only - not an inference or quota claim)",
-                    )
-                )
-            else:
+            return fallback(VerificationStatus.UNKNOWN, reason)
+        descriptors = [
+            self._descriptor(
+                model_id,
+                VerificationStatus.PASSED,
+                f"exact id observed in authenticated catalog; CLI {cli_version} "
+                "matches the pinned version; valid for "
+                f"{self._catalog_ttl:.0f}s (membership only - not an inference "
+                "or quota claim)",
+                label=label or None,
+                executable=self._model_allowed(model_id),
+            )
+            for model_id, label in sorted(catalog.items())
+        ]
+        # An allowlisted id absent from the fresh catalog is a verification
+        # failure, never a silent skip: the operator sees it explicitly.
+        for model_id in configured:
+            if model_id not in catalog:
                 descriptors.append(
                     self._descriptor(
                         model_id,
                         VerificationStatus.FAILED,
-                        "exact id not present in the authenticated catalog (no fuzzy match)",
+                        "exact id not present in the authenticated catalog "
+                        "(no fuzzy match)",
                     )
                 )
         return descriptors
 
     async def discover_models(self, ctx: RuntimeContext) -> list[ModelDescriptor]:
-        """Verify each operator-pinned exact model id against the CLI catalog.
+        """List every catalog row with truthful per-model verification.
 
         A descriptor is PASSED only when the pinned CLI version matches and the
-        exact id was observed in the authenticated ``agy models`` output. A
-        parsed catalog without the exact id is FAILED; anything unreadable is
-        UNKNOWN. Results are cached for the operator-configured TTL.
+        exact id was observed in the authenticated ``agy models`` output. The
+        descriptor ``executable`` flag is the operator allowlist decision —
+        discovery alone never authorizes a run. Anything unreadable is UNKNOWN
+        for the configured ids and authorizes nothing. Results are cached for
+        the operator-configured TTL.
         """
         if (
             self._catalog_cache is not None
@@ -512,7 +576,7 @@ class AntigravityDriver(BaseDriver):
                 "unknown_preset",
                 "preset must be antigravity/<exact model id> or carry a model_alias",
             )
-        if resolved not in self._models:
+        if not self._model_allowed(resolved):
             return None, (
                 "unsupported_model",
                 f"model {resolved!r} is not in the operator allowlist",
@@ -557,12 +621,54 @@ class AntigravityDriver(BaseDriver):
 
         # Reuse the (TTL-cached) catalog verification so a run never launches a
         # model that is not a PASSED catalog member.
-        if not self._catalog_allows(model, await self.discover_models(ctx)):
+        descriptors = await self.discover_models(ctx)
+        if not self._catalog_allows(model, descriptors):
             yield failed(
                 "catalog_not_verified",
                 f"model {model!r} is not a verified catalog member; refusing to run",
             )
             return
+
+        # Effort resolves against the descriptor's declared capabilities only —
+        # never a suffix guess. A variant target is independently re-checked
+        # against the allowlist and the fresh catalog.
+        effort_flag: str | None = None
+        if request.reasoning_effort is not None:
+            descriptor = next(
+                (d for d in descriptors if d.model_id == model), None
+            )
+            resolved, rejection = resolve_effort(descriptor, request.reasoning_effort)
+            if rejection is not None or resolved is None:
+                yield failed(
+                    "unsupported_effort",
+                    rejection or "effort could not be resolved",
+                )
+                return
+            if (
+                request.resolved_model is not None
+                and request.resolved_model != resolved
+            ):
+                yield failed(
+                    "resolved_model_mismatch",
+                    f"admitted resolved model {request.resolved_model!r} does "
+                    f"not match the catalog resolution {resolved!r}",
+                )
+                return
+            if not self._model_allowed(resolved) or not self._catalog_allows(
+                resolved, descriptors
+            ):
+                yield failed(
+                    "unsupported_effort",
+                    f"effort resolves to {resolved!r}, which is not a verified "
+                    "operator-admitted catalog member",
+                )
+                return
+            if (
+                descriptor is not None
+                and descriptor.effort == EffortSupport.SELECTABLE
+            ):
+                effort_flag = request.reasoning_effort
+            model = resolved
 
         skip_permissions = bool(
             self._allow_skip_permissions
@@ -575,14 +681,18 @@ class AntigravityDriver(BaseDriver):
         yield RunStartedEvent(
             **self._event_kwargs(request, sequence),
             payload=RunStartedPayload(
-                preset=request.preset, model_alias=model
+                preset=request.preset,
+                model_alias=model,
+                reasoning_effort=request.reasoning_effort,
+                resolved_model=model if request.reasoning_effort else None,
             ),
         )
         sequence += 1
 
         try:
             process = await ctx.executor.spawn(
-                self._session_argv(model, skip_permissions), cwd=workspace_root
+                self._session_argv(model, skip_permissions, effort_flag),
+                cwd=workspace_root,
             )
         except ProcessStartError as exc:
             yield failed("cli_not_startable", str(exc))

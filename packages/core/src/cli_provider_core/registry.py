@@ -10,7 +10,9 @@ calls ``entry_point.load()`` and never imports a driver package.
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from cli_provider_sdk import (
@@ -57,6 +59,11 @@ class RunnerHealth:
     # Runner-owned bounded cancellation cleanup budget, also verified over the
     # `runtime` RPC. The controller derives its finite outer run budget from it.
     cancel_cleanup_seconds: float = _FALLBACK_CANCEL_CLEANUP_SECONDS
+    # Last successful verify timestamp (wall ISO + monotonic): the catalog
+    # snapshot's provenance and the basis of staleness reporting. A failed
+    # refresh keeps the previous snapshot but leaves ``ok`` False.
+    observed_at: str | None = None
+    observed_monotonic: float | None = None
 
 
 @dataclass
@@ -111,6 +118,8 @@ class RunnerRegistry:
             for p in config.presets
         }
         self._lock = asyncio.Lock()
+        self._refresh_guard = asyncio.Lock()
+        self._last_refresh_monotonic: float | None = None
 
     # ------------------------------------------------------------- snapshot
 
@@ -179,6 +188,27 @@ class RunnerRegistry:
             if preset.enabled and preset.verified
         ]
 
+    @property
+    def catalog_refresh_seconds(self) -> float:
+        return self._config.api.catalog_refresh_seconds
+
+    def catalog_stale(self, instance_id: str) -> bool:
+        """True when the runner's catalog snapshot is absent, failed, or older
+        than the configured refresh interval."""
+        health = self._runners.get(instance_id)
+        if health is None or health.observed_monotonic is None:
+            return True
+        ttl = self._config.api.catalog_refresh_seconds
+        return (time.monotonic() - health.observed_monotonic) > ttl
+
+    def model_descriptor(
+        self, instance_id: str, model_id: str
+    ) -> dict[str, Any] | None:
+        health = self._runners.get(instance_id)
+        if health is None:
+            return None
+        return health.model_descriptors.get(model_id)
+
     # ------------------------------------------------------------ verifying
 
     async def refresh(self) -> dict[str, RunnerHealth]:
@@ -193,7 +223,31 @@ class RunnerRegistry:
                 await self._verify_runner(runner, health)
             for preset in self._config.presets:
                 self._verify_preset(preset)
+            self._last_refresh_monotonic = time.monotonic()
         return self._runners
+
+    async def ensure_fresh(self, *, force: bool = False) -> None:
+        """Bounded singleflight TTL refresh for catalog-aware read paths.
+
+        At most one refresh pass runs per ``api.catalog_refresh_seconds``
+        interval; concurrent callers queue on the guard and the first
+        completed refresh satisfies them all, so a burst of reads or dynamic
+        alias resolutions can never spawn a discovery storm.
+        """
+        ttl = self._config.api.catalog_refresh_seconds
+        fresh = (
+            self._last_refresh_monotonic is not None
+            and (time.monotonic() - self._last_refresh_monotonic) < ttl
+        )
+        if fresh and not force:
+            return
+        async with self._refresh_guard:
+            fresh = (
+                self._last_refresh_monotonic is not None
+                and (time.monotonic() - self._last_refresh_monotonic) < ttl
+            )
+            if not fresh or force:
+                await self.refresh()
 
     async def _verify_runner(self, runner: RunnerConfig, health: RunnerHealth) -> None:
         session = self._session_factory(runner)
@@ -260,6 +314,8 @@ class RunnerRegistry:
             health.max_parallel_runs = runtime["max_parallel_runs"]
             health.max_queue = runtime["max_queue"]
             health.cancel_cleanup_seconds = runtime["cancel_cleanup_seconds"]
+            health.observed_at = datetime.now(timezone.utc).isoformat()
+            health.observed_monotonic = time.monotonic()
             health.ok = True
             health.detail = "manifest/probe/discover verified against the SDK schemas"
         except Exception as exc:  # noqa: BLE001 - classified for health output
@@ -361,6 +417,17 @@ class RunnerRegistry:
             health.detail = (
                 f"model {preset.model_id!r} verification status {status!r} is not "
                 f"'passed' (source {verification.get('source')!r})"
+            )
+            return
+        if descriptor.get("executable") is False:
+            # Catalog membership is verified but the driver's own execution
+            # policy (operator allowlist / prepared lane) does not admit this
+            # model. Discovery is not authorization: the preset stays
+            # unavailable instead of degrading to a driver-side failure.
+            health.verified = False
+            health.detail = (
+                f"model {preset.model_id!r} is catalog-verified but the driver "
+                "does not admit it for execution"
             )
             return
 

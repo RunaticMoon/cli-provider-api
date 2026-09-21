@@ -6,7 +6,13 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
-from cli_provider_core import NotFound, OperatorConfig, PrincipalConfig, RunnerRegistry
+from cli_provider_core import (
+    NotFound,
+    OperatorConfig,
+    PrincipalConfig,
+    RunnerRegistry,
+    dynamic_model_entries,
+)
 
 from .auth import authenticate
 
@@ -43,8 +49,14 @@ def _entries(
                 "capabilities": health.capabilities if health else None,
                 "verification": health.verification if health else None,
                 "real_verification": bool(health and health.real_verification),
+                "dynamic": False,
             }
         )
+    # Verified+authorized dynamic aliases join the compatible list; the full
+    # discovery view (incl. not-executable entries) is GET /api/v1/catalog.
+    entries.extend(
+        dynamic_model_entries(config, registry, principal, driver_scope)
+    )
     return entries
 
 
@@ -60,6 +72,8 @@ async def list_models(request: Request) -> dict[str, Any]:
     principal = authenticate(request)
     config: OperatorConfig = request.app.state.config
     registry: RunnerRegistry = request.app.state.registry
+    if config.catalogs:
+        await registry.ensure_fresh()
     return {"object": "list", "data": _entries(config, registry, principal, None)}
 
 
@@ -69,6 +83,8 @@ async def list_models_scoped(request: Request, driver_id: str) -> dict[str, Any]
     config: OperatorConfig = request.app.state.config
     registry: RunnerRegistry = request.app.state.registry
     _assert_driver_scope_known(config, registry, driver_id)
+    if config.catalogs:
+        await registry.ensure_fresh()
     return {
         "object": "list",
         "data": _entries(config, registry, principal, driver_id),

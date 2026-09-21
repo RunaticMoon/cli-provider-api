@@ -171,6 +171,10 @@ class RunController:
         messages: Sequence[Mapping[str, Any]],
         deadline_seconds: float,
         execution: Mapping[str, Any] | None = None,
+        # Validated effort token plus the durable binding evidence built by the
+        # API's model resolution (requested/resolved ids, effort mode, dynamic).
+        reasoning_effort: str | None = None,
+        model_binding: dict[str, Any] | None = None,
     ) -> Submission:
         instance_id = preset.runner_ref
         # Operator config owns the task policy: it is never caller-selected.
@@ -182,6 +186,7 @@ class RunController:
             task_policy=task_policy,
             messages=messages,
             execution=execution,
+            reasoning_effort=reasoning_effort,
         )
 
         existing = self._store.latest_attempt(principal, task_id)
@@ -278,6 +283,7 @@ class RunController:
                 status=QUEUED,
                 synthetic=self._registry.runner_synthetic(instance_id),
                 execution=dict(execution) if execution is not None else None,
+                model_binding=model_binding,
             )
         except Conflict as exc:
             if exc.code != "run_not_retryable":
@@ -521,6 +527,13 @@ class RunController:
             # support for the field is required for dispatch — a Runner
             # without it rejects pre-execution.
             params["execution"] = dict(record.execution)
+        binding = record.model_binding or {}
+        if binding.get("reasoning_effort") is not None:
+            # Strictly validated upstream: a short effort enum token plus the
+            # API's resolved exact target. The driver re-derives the target from
+            # its own catalog and refuses on mismatch.
+            params["reasoning_effort"] = binding["reasoning_effort"]
+            params["resolved_model"] = binding.get("resolved_model")
         chunks: list[str] = []
         output_bytes = 0
         events_seen = 0

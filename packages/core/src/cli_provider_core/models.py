@@ -65,6 +65,11 @@ class AttemptRecord:
     # authenticated — the values are NOT server-attested route/policy proof,
     # are never model-supplied, and never select execution authority.
     execution: dict[str, Any] | None = None
+    # Server-side model binding evidence: the admitted alias, the requested
+    # native model id, the resolved exact id and any reasoning-effort request,
+    # plus whether the alias came from a catalog source or a static preset.
+    # Persisted verbatim at reservation; never model-supplied.
+    model_binding: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -113,6 +118,9 @@ class RunResultView(BaseModel):
     # a trusted dispatcher must match it against its own durable receipt and
     # the canonical run/preset/model, never admit policy from the echo.
     execution: dict[str, Any] | None = None
+    # Model binding evidence: requested/resolved native model ids, requested
+    # effort, descriptor effort mode and whether the alias was dynamic.
+    model: dict[str, Any] | None = None
     summary: str | None = None
     verification: dict[str, Any] = Field(default_factory=dict)
     usage: dict[str, Any] = Field(default_factory=dict)

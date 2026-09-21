@@ -51,6 +51,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from cli_provider_sdk import (
     Alias,
+    EFFORT_PATTERN,
     ID_PATTERN,
     NormalizedRequest,
     Message,
@@ -158,6 +159,13 @@ class RunParams(BaseModel):
     messages: list[Message] = Field(min_length=1)
     deadline_seconds: float | None = Field(default=None, gt=0)
     execution: ExecutionContext | None = None
+    # Strict bounded effort token — never a flag; the driver re-validates it
+    # against its own catalog descriptor before any process spawn.
+    reasoning_effort: str | None = Field(default=None, pattern=EFFORT_PATTERN)
+    # The API's admitted exact variant target. The driver must re-derive it
+    # from its own catalog and refuse a mismatch — it is evidence, not a
+    # selector a caller can use to hop to an unauthorized model.
+    resolved_model: Alias | None = None
 
     def to_driver_request(self) -> NormalizedRequest:
         return NormalizedRequest(
@@ -170,6 +178,8 @@ class RunParams(BaseModel):
             messages=self.messages,
             deadline_seconds=self.deadline_seconds,
             execution=self.execution,
+            reasoning_effort=self.reasoning_effort,
+            resolved_model=self.resolved_model,
         )
 
 

@@ -61,6 +61,22 @@ presets:
     # opt-in only allows serving that synthetic model in local development.
     allow_synthetic_unverified: true
 
+# Dynamic catalog sources: the driver's own discovered catalog becomes
+# addressable as <alias_prefix><exact model_id> — no per-model preset needed.
+# Discovery is never authorization: a principal still needs the source in
+# executable_catalogs (or the exact alias in allowed_presets), and the
+# source's own models/cost_tiers filters apply. See docs/DYNAMIC_CATALOG.md.
+#
+# catalogs:
+#   - name: mock-catalog
+#     runner_ref: runner-local-1
+#     alias_prefix: "mock/"
+#     # models: [mock-model]       # optional exact-id allowlist (omit = all)
+#     # cost_tiers: [free]         # optional cost-tier filter
+#     task_policy: default
+#     allow_synthetic_unverified: true   # mock driver only; never for native
+#     enabled: true
+
 workspaces:
   - workspace_id: ws-alpha
     description: Example workspace identity (opaque ID; no path is bound here)
@@ -69,5 +85,7 @@ principals:
   - name: alpha
     key_hash: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
     allowed_presets: [mock/text]
+    # allowed_catalogs: [mock-catalog]      # read-only: /api/v1/catalog metadata
+    # executable_catalogs: [mock-catalog]   # run grant: source-wide execution
     allowed_workspaces: [ws-alpha]
     max_concurrency: 2

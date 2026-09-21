@@ -84,14 +84,30 @@ The API binds to loopback by default and runs a single instance.
   returns only `{"status": "ready"|"not_ready"}`; the detailed runner/preset
   topology requires a valid API key)
 - `GET /v1/models`, `POST /v1/chat/completions`
-- the same under `/providers/{driver_id}/v1/...`, scoped to that driver's
-  manifest `driver_id` (generic; no per-driver code in the API)
+- `GET /api/v1/catalog` — authenticated dynamic catalog: every discovered
+  model with effort metadata, provenance, observed CLI version/timestamp,
+  staleness, and per-principal `executable`/`rejection` truth
+- the same under `/providers/{driver_id}/v1/...` (and
+  `/providers/{driver_id}/api/v1/catalog`), scoped to that driver's manifest
+  `driver_id` (generic; no per-driver code in the API)
 - `GET /api/v1/runs/{run_id}`, `GET /api/v1/runs/{run_id}/events`,
   `POST /api/v1/runs/{run_id}/cancel`, `GET /api/v1/artifacts/{artifact_id}`
 
 Every model/run/artifact route requires `Authorization: Bearer <api-key>`.
 Requests carry required `metadata.task_id` and `metadata.workspace_id`; the
 caller identity comes from the API key only.
+
+Model aliases are either static presets or dynamic
+`<alias_prefix><exact catalog id>` aliases resolved from a configured
+`catalogs:` source. Discovery is never authorization — a principal needs the
+source in `executable_catalogs` (or the alias in `allowed_presets`), plus
+the source's model/cost filters, before a dynamic alias runs; a
+`allowed_catalogs` grant is read-only metadata. Requests may carry a bounded
+`reasoning_effort` token (top level or `metadata.reasoning_effort` — both
+must agree when both are sent); it is validated against the descriptor's
+declared `effort`/`effort_options`/`effort_variants` and resolved to an
+exact, independently authorized catalog id. See docs/DYNAMIC_CATALOG.md and
+examples/catalog_client.py.
 
 `POST /v1/chat/completions` returns a standard `chat.completion` object (never a
 202) plus:

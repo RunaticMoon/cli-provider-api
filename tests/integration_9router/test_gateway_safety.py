@@ -299,3 +299,27 @@ def test_gateway_execution_metadata_reaches_worker(gateway):
         run = management.get(f"/api/v1/runs/{run_id}").json()
         assert run["execution"] == EXECUTION
         assert run["status"] == "completed"
+
+
+def test_gateway_metadata_reasoning_effort_reaches_worker(gateway):
+    """``metadata.reasoning_effort`` is the gateway-safe effort carrier.
+
+    Measured 9Router 0.5.81 behaviour: the provider-model route forwards the
+    request ``metadata`` object verbatim but strips the top-level
+    ``reasoning_effort`` field, so consumers behind the gateway MUST send the
+    effort inside ``metadata`` (duplicating it at the top level is the
+    recommended belt-and-braces form; the API rejects disagreement).
+    """
+    client, system = gateway
+    body = gateway_request("gw-effort", model="cpa.safety")
+    body["reasoning_effort"] = "low"
+    body["metadata"]["reasoning_effort"] = "low"
+    response = client.post("/v1/chat/completions", json=body)
+    assert response.status_code == 200, response.text[:500]
+    received = system.runs_received()
+    assert len(received) == 1
+    # The declared fixture option resolved to the exact same catalog id and the
+    # requested token reached the worker RunParams verbatim.
+    assert received[0]["reasoning_effort"] == "low"
+    assert received[0]["resolved_model"] == "fixture-model"
+    assert system.effects()[0]["reasoning_effort"] == "low"

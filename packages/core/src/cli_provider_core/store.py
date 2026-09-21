@@ -192,6 +192,10 @@ class Store:
             # Nullable dispatcher-supplied execution context (JSON object);
             # pre-existing rows truthfully have none.
             self._conn.execute("ALTER TABLE attempts ADD COLUMN execution TEXT")
+        if "model_binding" not in columns:
+            # Nullable model/effort binding evidence (JSON object);
+            # pre-existing rows truthfully have none.
+            self._conn.execute("ALTER TABLE attempts ADD COLUMN model_binding TEXT")
 
     def _reconcile_restart(self) -> dict[str, Any]:
         """Formerly active attempts become unknown; never re-queued for replay."""
@@ -259,6 +263,7 @@ class Store:
         synthetic: bool = True,
         finished_at: str | None = None,
         execution: dict[str, Any] | None = None,
+        model_binding: dict[str, Any] | None = None,
     ) -> AttemptRecord:
         """Atomically reserve a task+attempt before any run dispatch.
 
@@ -314,13 +319,16 @@ class Store:
                     "INSERT INTO attempts(run_id, principal, task_id, attempt_id, preset, "
                     "driver_id, runner_instance, workspace_id, request_hash, status, outcome, "
                     "detail, summary, synthetic, cached, created_at, updated_at, finished_at, "
-                    "execution) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "execution, model_binding) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         run_id, principal, task_id, attempt_id, preset, driver_id,
                         runner_instance, workspace_id, request_hash, status, outcome,
                         detail, summary, int(synthetic), int(cached), now, now, finished_at,
                         json.dumps(execution, sort_keys=True) if execution is not None else None,
+                        json.dumps(model_binding, sort_keys=True)
+                        if model_binding is not None
+                        else None,
                     ),
                 )
                 self._conn.execute("COMMIT")
@@ -551,6 +559,7 @@ def _attempt(row: sqlite3.Row) -> AttemptRecord:
         synthetic=bool(row["synthetic"]),
         cached=bool(row["cached"]),
         execution=json.loads(row["execution"]) if row["execution"] else None,
+        model_binding=json.loads(row["model_binding"]) if row["model_binding"] else None,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         started_at=row["started_at"],

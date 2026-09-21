@@ -123,6 +123,10 @@ MODELS = {
                 "source": "fixture",
                 "reason": "synthetic fixture; no real verification performed",
             },
+            # Declared fixture effort support: proves the request-level
+            # reasoning_effort carrier reaches the worker verbatim.
+            "effort": "selectable",
+            "effort_options": ["low", "medium", "high"],
         }
     ]
 }
@@ -275,6 +279,8 @@ class FixtureRunner:
                         if run.execution is not None
                         else None
                     ),
+                    "reasoning_effort": run.reasoning_effort,
+                    "resolved_model": run.resolved_model,
                     "behavior": behavior,
                     "dispatched": False,
                     "received_at": _now(),
@@ -310,6 +316,8 @@ class FixtureRunner:
                         if run.execution is not None
                         else None
                     ),
+                    "reasoning_effort": run.reasoning_effort,
+                    "resolved_model": run.resolved_model,
                     "behavior": behavior,
                     "started_at": _now(),
                 },
@@ -327,6 +335,8 @@ class FixtureRunner:
                         if run.execution is not None
                         else None
                     ),
+                    "reasoning_effort": run.reasoning_effort,
+                    "resolved_model": run.resolved_model,
                     "behavior": behavior,
                     "dispatched": True,
                     "received_at": _now(),

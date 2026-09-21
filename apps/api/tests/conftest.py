@@ -46,6 +46,7 @@ class MockSystem:
     beta_key: str = "local-beta-key"
     gamma_key: str = "local-gamma-key"
     config_overrides: dict[str, Any] = field(default_factory=dict)
+    runner_env: dict[str, str] = field(default_factory=dict)
     port: int = 0
     api_proc: subprocess.Popen | None = None
     runner_proc: subprocess.Popen | None = None
@@ -151,6 +152,7 @@ class MockSystem:
 
         env = os.environ.copy()
         env["CLI_DRIVER_MOCK_BEHAVIOR"] = self.behavior
+        env.update(self.runner_env)
 
         self.runner_proc = subprocess.Popen(
             [

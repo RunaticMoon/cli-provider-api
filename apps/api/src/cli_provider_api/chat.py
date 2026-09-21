@@ -16,6 +16,7 @@ from cli_provider_core import (
     RunnerRegistry,
     Store,
     chat_id_for_run,
+    resolve_model,
 )
 from cli_provider_core.models import (
     CANCELLED,
@@ -26,7 +27,7 @@ from cli_provider_core.models import (
     UNKNOWN,
 )
 
-from .auth import authenticate, check_workspace, resolve_preset
+from .auth import authenticate, check_workspace
 from .errors import ApiRunError
 from .schemas import chat_completion, parse_chat_request, read_bounded_json
 from .sse import stream_cached, stream_chat
@@ -91,13 +92,19 @@ async def _handle(request: Request, driver_id: str | None) -> Any:
         timeout_seconds=config.api.request_body_timeout_seconds,
     )
     chat_request = parse_chat_request(data)
-    preset, _runner = resolve_preset(
+    if config.catalogs:
+        # Dynamic aliases resolve against the cached catalog; keep it inside
+        # its TTL window so additions/removals propagate without a restart.
+        await registry.ensure_fresh()
+    binding = resolve_model(
         config=config,
         registry=registry,
         principal=principal,
         alias=chat_request.model,
         driver_scope=driver_id,
+        effort=chat_request.reasoning_effort,
     )
+    preset = binding.preset
     check_workspace(
         config=config, principal=principal, workspace_id=chat_request.workspace_id
     )
@@ -111,6 +118,8 @@ async def _handle(request: Request, driver_id: str | None) -> Any:
         messages=chat_request.messages,
         deadline_seconds=_effective_deadline(config),
         execution=chat_request.execution,
+        reasoning_effort=chat_request.reasoning_effort,
+        model_binding=binding.evidence(),
     )
 
     # The standard completion id is deterministically bound to the run, so a

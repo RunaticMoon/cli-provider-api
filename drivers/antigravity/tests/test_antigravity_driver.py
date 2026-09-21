@@ -1094,3 +1094,163 @@ async def test_repeated_runs_do_not_leak_descriptors(tmp_path):
         gc.enable()
     # One incidental descriptor is tolerated; a leaked transport would show more.
     assert after - before <= 1, f"descriptor growth across runs: {before} -> {after}"
+
+
+# ------------------------------------------- dynamic catalog / effort modes
+
+
+async def test_discovery_lists_full_catalog_with_executable_flags(tmp_path):
+    """Discovery enumerates every catalog row; the allowlist stays a separate
+    execution gate reflected truthfully per descriptor."""
+    driver = driver_for(tmp_path)  # allowlist = [MODEL, MODEL_2]
+    descriptors = await driver.discover_models(make_ctx(tmp_path))
+    by_id = {d.model_id: d for d in descriptors}
+    assert set(by_id) == {
+        "gemini-3.8-flash-high",
+        "gemini-3.8-flash-medium",
+        "claude-opus-4-6-thinking",
+        "claude-sonnet-4-6",
+        "gemini-3.8-flash-high-x",
+        "xgemini-3.8-flash-high",
+    }
+    assert all(
+        d.verification.status == VerificationStatus.PASSED for d in descriptors
+    )
+    assert by_id[MODEL].executable is True
+    assert by_id[MODEL_2].executable is True
+    assert by_id["gemini-3.8-flash-medium"].executable is False
+    # The native catalog carries no per-model effort evidence.
+    assert all(d.effort.value == "unknown" for d in descriptors)
+    assert by_id["claude-sonnet-4-6"].display_name == "Claude Sonnet 4.6"
+
+
+async def test_star_allowlist_runs_catalog_member_without_preset_pin(tmp_path):
+    """AGY_MODELS=* is the explicit operator opt-in: a verified catalog member
+    executes with no per-model pin."""
+    logfile = tmp_path / "agy.log"
+    driver = driver_for(tmp_path, models=["*"])
+    events = await collect(
+        driver,
+        make_request(
+            preset="antigravity/gemini-3.8-flash-medium",
+            model_alias="gemini-3.8-flash-medium",
+        ),
+        make_ctx(tmp_path, logfile=logfile),
+    )
+    assert terminal(events).kind == EventKind.RUN_COMPLETED
+    argv = session_spawns(logfile)[0]["argv"]
+    assert argv[argv.index("--model") + 1] == "gemini-3.8-flash-medium"
+
+
+async def test_catalog_member_outside_allowlist_has_zero_effects(tmp_path):
+    """Discovery alone never authorizes: a verified catalog member outside the
+    allowlist fails before any session spawn."""
+    logfile = tmp_path / "agy.log"
+    driver = driver_for(tmp_path)  # allowlist = [MODEL, MODEL_2]
+    events = await collect(
+        driver,
+        make_request(
+            preset="antigravity/claude-sonnet-4-6",
+            model_alias="claude-sonnet-4-6",
+        ),
+        make_ctx(tmp_path, logfile=logfile),
+    )
+    result = terminal(events)
+    assert result.kind == EventKind.RUN_FAILED
+    assert result.payload.code == "unsupported_model"
+    assert session_spawns(logfile) == []
+
+
+async def test_effort_rejected_when_catalog_declares_no_support(tmp_path):
+    """Native agy exposes no per-model effort evidence: explicit effort is a
+    truthful pre-spawn rejection, never silently dropped."""
+    logfile = tmp_path / "agy.log"
+    driver = driver_for(tmp_path)
+    request = make_request().model_copy(update={"reasoning_effort": "high"})
+    events = await collect(driver, request, make_ctx(tmp_path, logfile=logfile))
+    result = terminal(events)
+    assert result.kind == EventKind.RUN_FAILED
+    assert result.payload.code == "unsupported_effort"
+    assert session_spawns(logfile) == []
+
+
+async def test_declared_selectable_effort_reaches_the_cli(tmp_path):
+    """A fixture-declared selectable enum maps to the native ``--effort`` flag."""
+    logfile = tmp_path / "agy.log"
+    driver = driver_for(
+        tmp_path,
+        effort_fixture={
+            MODEL: {"effort": "selectable", "effort_options": ["low", "high"]}
+        },
+    )
+    request = make_request().model_copy(update={"reasoning_effort": "high"})
+    events = await collect(driver, request, make_ctx(tmp_path, logfile=logfile))
+    assert terminal(events).kind == EventKind.RUN_COMPLETED
+    argv = session_spawns(logfile)[0]["argv"]
+    assert argv[argv.index("--effort") + 1] == "high"
+    assert argv[argv.index("--model") + 1] == MODEL
+    started = events[0]
+    assert started.payload.reasoning_effort == "high"
+    assert started.payload.resolved_model == MODEL
+
+
+async def test_declared_variant_effort_resolves_to_catalog_id(tmp_path):
+    """A fixture-declared variant maps the token to an exact catalog id; the
+    target is re-checked against the allowlist and the fresh catalog."""
+    logfile = tmp_path / "agy.log"
+    driver = driver_for(
+        tmp_path,
+        models=[MODEL, "gemini-3.8-flash-medium"],
+        effort_fixture={
+            MODEL: {
+                "effort": "model_variant",
+                "effort_variants": {"medium": "gemini-3.8-flash-medium"},
+            }
+        },
+    )
+    request = make_request().model_copy(
+        update={"reasoning_effort": "medium", "resolved_model": "gemini-3.8-flash-medium"}
+    )
+    events = await collect(driver, request, make_ctx(tmp_path, logfile=logfile))
+    assert terminal(events).kind == EventKind.RUN_COMPLETED
+    argv = session_spawns(logfile)[0]["argv"]
+    assert argv[argv.index("--model") + 1] == "gemini-3.8-flash-medium"
+    assert "--effort" not in argv
+
+
+async def test_variant_target_outside_allowlist_is_rejected(tmp_path):
+    """An effort variant can never hop to a model the operator did not admit."""
+    logfile = tmp_path / "agy.log"
+    driver = driver_for(
+        tmp_path,
+        effort_fixture={
+            MODEL: {
+                "effort": "model_variant",
+                "effort_variants": {"high": "claude-sonnet-4-6"},
+            }
+        },
+    )
+    request = make_request().model_copy(
+        update={"reasoning_effort": "high", "resolved_model": "claude-sonnet-4-6"}
+    )
+    events = await collect(driver, request, make_ctx(tmp_path, logfile=logfile))
+    result = terminal(events)
+    assert result.kind == EventKind.RUN_FAILED
+    assert result.payload.code == "unsupported_effort"
+    assert session_spawns(logfile) == []
+
+
+async def test_effort_option_not_declared_is_rejected(tmp_path):
+    logfile = tmp_path / "agy.log"
+    driver = driver_for(
+        tmp_path,
+        effort_fixture={
+            MODEL: {"effort": "selectable", "effort_options": ["low"]}
+        },
+    )
+    request = make_request().model_copy(update={"reasoning_effort": "high"})
+    events = await collect(driver, request, make_ctx(tmp_path, logfile=logfile))
+    result = terminal(events)
+    assert result.kind == EventKind.RUN_FAILED
+    assert result.payload.code == "unsupported_effort"
+    assert session_spawns(logfile) == []

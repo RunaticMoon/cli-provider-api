@@ -26,11 +26,14 @@ the operator probe evidence captured alongside it):
 * ``session/cancel`` is a notification; a later ``cancelled`` stop reason is
   not proof the process stopped - only confirmed termination counts.
 
-Safety posture: exact ``swe-2-max`` only (the Max variant is already the exact
-model id, so no tier/effort is ever passed), ``DEVIN_REFUSAL_FALLBACK`` and the
-other ``DEVIN_*`` model/permission overrides are stripped from the child
-environment, ``bypass`` mode requires an explicit injected permission policy,
-and usage/cost is never invented.
+Safety posture: the executed model is the exact request-admitted id (default
+pin ``swe-2-max``), gated by the operator allowlist (``DEVIN_MODELS``, ``*``
+opts in to the whole verified catalog) and admitted cost tiers
+(``DEVIN_ALLOWED_COST_TIERS``, default ``Free``); the observed catalog exposes
+no per-model effort option so an explicit ``reasoning_effort`` is rejected,
+``DEVIN_REFUSAL_FALLBACK`` and the other ``DEVIN_*`` model/permission overrides
+are stripped from the child environment, ``bypass`` mode requires an explicit
+injected permission policy, and usage/cost is never invented.
 """
 
 from __future__ import annotations
@@ -93,17 +96,21 @@ from cli_provider_transports import (
 
 CLI_ENV = "DEVIN_CLI"
 MODEL_ENV = "DEVIN_MODEL"
+MODELS_ENV = "DEVIN_MODELS"
 EXPECTED_VERSION_ENV = "DEVIN_EXPECTED_VERSION"
 WORKSPACE_ENV = "DEVIN_WORKSPACE_ROOT"
 SESSION_MODE_ENV = "DEVIN_ACP_MODE"
 CATALOG_TTL_ENV = "DEVIN_CATALOG_TTL_SECONDS"
 EXPECTED_COST_ENV = "DEVIN_EXPECTED_COST_TIER"
+ALLOWED_TIERS_ENV = "DEVIN_ALLOWED_COST_TIERS"
 
 DEFAULT_CLI = "devin"
 DEFAULT_MODEL = "swe-2-max"
 DEFAULT_SESSION_MODE = "accept-edits"
 DEFAULT_COST_TIER = "Free"
-SUPPORTED_MODELS = frozenset({DEFAULT_MODEL})
+# Any exact catalog id may be authorized when the operator sets DEVIN_MODELS=*
+# (still gated by the cost-tier policy); a comma list restricts to those ids.
+ALLOW_ALL = "*"
 
 # Never let inherited environment silently change the child's model, its
 # refusal-fallback chain, or its permission default: the driver pins all three
@@ -126,7 +133,6 @@ CANCEL_TURN_GRACE_SECONDS = 2.0
 STOP_PARTIAL = frozenset({"max_tokens", "max_turn_requests", "refusal"})
 STOP_KNOWN = frozenset({"end_turn", "cancelled"}) | STOP_PARTIAL
 _VERSION_RE = re.compile(r"\d+\.\d+(?:\.\d+)?")
-_EFFORT_SEPARATORS = (":", "@", "/")
 
 
 class _Eof(Exception):
@@ -176,6 +182,7 @@ class _RunState:
         self.session_id: str | None = None
         self.current_mode: str | None = None
         self.model_value: str | None = None
+        self.expected_model: str | None = None
         self.awaiting_mode: str | None = None
         self.denied = False
         self.facts_recorded = False
@@ -219,10 +226,12 @@ class DevinDriver(BaseDriver):
         *,
         cli_command: str | None = None,
         model: str | None = None,
+        models: list[str] | None = None,
         expected_version: str | None = None,
         workspace_root: str | None = None,
         session_mode: str | None = None,
         expected_cost_tier: str | None = None,
+        allowed_cost_tiers: list[str] | None = None,
         catalog_ttl_seconds: float | None = None,
         handshake_timeout_seconds: float = DEFAULT_HANDSHAKE_TIMEOUT,
         max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
@@ -232,6 +241,39 @@ class DevinDriver(BaseDriver):
         self._model = (
             model if model is not None else _split_env(os.environ.get(MODEL_ENV))
         ) or DEFAULT_MODEL
+        # Operator execution policy — discovery lists the real catalog, this
+        # decides what may run. Default preserves the legacy pin: only the
+        # configured model at the expected cost tier is admitted.
+        raw_models = (
+            [m.strip() for m in models if m.strip()]
+            if models is not None
+            else [
+                m.strip()
+                for m in (os.environ.get(MODELS_ENV) or "").split(",")
+                if m.strip()
+            ]
+        )
+        self._allow_all_models = ALLOW_ALL in raw_models
+        self._allowed_models = frozenset(
+            m for m in raw_models if m != ALLOW_ALL
+        ) or frozenset({self._model})
+        self._expected_cost_tier = (
+            expected_cost_tier
+            if expected_cost_tier is not None
+            else _split_env(os.environ.get(EXPECTED_COST_ENV))
+        ) or DEFAULT_COST_TIER
+        raw_tiers = (
+            [t.strip() for t in allowed_cost_tiers if t.strip()]
+            if allowed_cost_tiers is not None
+            else [
+                t.strip()
+                for t in (os.environ.get(ALLOWED_TIERS_ENV) or "").split(",")
+                if t.strip()
+            ]
+        )
+        self._allowed_cost_tiers = frozenset(raw_tiers) or frozenset(
+            {self._expected_cost_tier}
+        )
         self._expected_version = (
             expected_version
             if expected_version is not None
@@ -247,11 +289,6 @@ class DevinDriver(BaseDriver):
             if session_mode is not None
             else _split_env(os.environ.get(SESSION_MODE_ENV))
         ) or DEFAULT_SESSION_MODE
-        self._expected_cost_tier = (
-            expected_cost_tier
-            if expected_cost_tier is not None
-            else _split_env(os.environ.get(EXPECTED_COST_ENV))
-        ) or DEFAULT_COST_TIER
         self._catalog_ttl = (
             catalog_ttl_seconds
             if catalog_ttl_seconds is not None
@@ -304,7 +341,7 @@ class DevinDriver(BaseDriver):
 
     # ----------------------------------------------------------------- argv
 
-    def _acp_argv(self) -> list[str]:
+    def _acp_argv(self, model: str | None = None) -> list[str]:
         argv = ["env"]
         for name in SANITIZED_ENV:
             argv += ["-u", name]
@@ -314,7 +351,7 @@ class DevinDriver(BaseDriver):
             ARGV_PERMISSION_MODE,
             "acp",
             "--model",
-            self._model,
+            model or self._model,
         ]
         return argv
 
@@ -507,14 +544,28 @@ class DevinDriver(BaseDriver):
 
     # ------------------------------------------------------------- discovery
 
+    def _model_allowed(self, model_id: str) -> bool:
+        """Operator allowlist: ``DEVIN_MODELS`` list, ``*``, or the legacy pin."""
+        return self._allow_all_models or model_id in self._allowed_models
+
+    def _executable(self, model_id: str, cost_tier: Any) -> bool:
+        """Discovery never authorizes: allowlist + admitted cost tier required."""
+        return (
+            self._model_allowed(model_id)
+            and isinstance(cost_tier, str)
+            and cost_tier in self._allowed_cost_tiers
+        )
+
     async def discover_models(self, ctx: RuntimeContext) -> list[ModelDescriptor]:
-        """Verify the pinned model's exact catalog membership.
+        """List the real catalog, verified by exact ``model_uid`` membership.
 
         ``devin models list --format json`` is the operator-facing catalog; the
         match is on the exact ``model_uid`` only - never a family slug, alias
-        or fuzzy selector. The verification result is cached for a bounded,
-        operator-configured TTL so a stale ``Free`` tier is not replayed as a
-        pricing claim forever.
+        or fuzzy selector. Every observed variant becomes a descriptor; the
+        descriptor's ``executable`` flag is the operator policy decision
+        (allowlist + cost tier), kept strictly separate from verification.
+        Results are cached for a bounded, operator-configured TTL so a stale
+        ``Free`` tier is not replayed as a pricing claim forever.
         """
         if (
             self._catalog_cache is not None
@@ -522,31 +573,37 @@ class DevinDriver(BaseDriver):
         ):
             return self._catalog_cache[1]
 
-        descriptor = await self._verify_catalog(ctx)
-        self._catalog_cache = (time.monotonic(), [descriptor])
-        return [descriptor]
+        descriptors = await self._catalog_descriptors(ctx)
+        self._catalog_cache = (time.monotonic(), descriptors)
+        return descriptors
 
-    async def _verify_catalog(self, ctx: RuntimeContext) -> ModelDescriptor:
+    async def _catalog_descriptors(self, ctx: RuntimeContext) -> list[ModelDescriptor]:
         source = "devin models list --format json"
-        if self._model not in SUPPORTED_MODELS:
-            return ModelDescriptor(
-                model_id=self._model,
-                display_name=f"{self._model} (unsupported by this driver)",
-                verification=Verification(
-                    status=VerificationStatus.FAILED,
-                    source=source,
-                    reason=f"this driver only supports {sorted(SUPPORTED_MODELS)}",
-                ),
+
+        def fallback(
+            status: VerificationStatus, reason: str, display: str | None = None
+        ) -> list[ModelDescriptor]:
+            return [
+                ModelDescriptor(
+                    model_id=self._model,
+                    display_name=display or f"{self._model} ({status.value})",
+                    verification=Verification(
+                        status=status, source=source, reason=reason
+                    ),
+                    executable=False,
+                )
+            ]
+
+        if not self._model_allowed(self._model):
+            return fallback(
+                VerificationStatus.FAILED,
+                f"operator-pinned model {self._model!r} is not in the "
+                "execution allowlist",
             )
         if ctx.executor is None:
-            return ModelDescriptor(
-                model_id=self._model,
-                display_name=f"{self._model} (catalog verification not run)",
-                verification=Verification(
-                    status=VerificationStatus.UNKNOWN,
-                    source=source,
-                    reason="no process executor supplied; catalog not read",
-                ),
+            return fallback(
+                VerificationStatus.UNKNOWN,
+                "no process executor supplied; catalog not read",
             )
         try:
             output, transport = await self._spawned_stdout(
@@ -556,101 +613,138 @@ class DevinDriver(BaseDriver):
                 self._max_frame_bytes,
             )
         except ProcessStartError:
-            return ModelDescriptor(
-                model_id=self._model,
-                display_name=f"{self._model} (catalog verification not run)",
-                verification=Verification(
-                    status=VerificationStatus.UNKNOWN,
-                    source=source,
-                    reason="CLI not startable",
-                ),
+            return fallback(VerificationStatus.UNKNOWN, "CLI not startable")
+        confirmed = await transport.aclose()
+        # A nonzero exit or unconfirmed termination is never trusted data.
+        if not confirmed or transport.returncode not in (0, None):
+            return fallback(
+                VerificationStatus.UNKNOWN,
+                "catalog command did not exit cleanly; output not trusted",
             )
-        await transport.aclose()
+        if output is None:
+            return fallback(
+                VerificationStatus.UNKNOWN, "catalog read timed out or failed"
+            )
+        try:
+            catalog = json.loads(output.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            catalog = None
+        families = catalog.get("families") if isinstance(catalog, dict) else None
+        if not isinstance(families, list):
+            return fallback(
+                VerificationStatus.UNKNOWN,
+                "catalog output could not be read or parsed",
+            )
 
-        entry: dict[str, Any] | None = None
-        catalog_ok = False
-        if output is not None:
-            try:
-                catalog = json.loads(output.decode("utf-8"))
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                catalog = None
-            if isinstance(catalog, dict):
-                catalog_ok = True
-                for family in catalog.get("families") or []:
-                    for variant in (family or {}).get("variants") or []:
-                        if (variant or {}).get("model_uid") == self._model:
-                            entry = variant
-                            break
-        if entry is None:
-            # Unreadable/malformed output means verification never completed
-            # (unknown); a parsed catalog without the exact id means failed.
-            status = (
-                VerificationStatus.FAILED
-                if catalog_ok
-                else VerificationStatus.UNKNOWN
+        descriptors: list[ModelDescriptor] = []
+        configured_seen = False
+        for family in families:
+            if not isinstance(family, dict):
+                continue
+            family_id = (
+                family.get("slug")
+                or family.get("family_uid")
+                or family.get("family_label")
             )
-            reason = (
-                "model_uid not present in catalog (exact match required)"
-                if catalog_ok
-                else "catalog output could not be read or parsed"
-            )
-            return ModelDescriptor(
-                model_id=self._model,
-                display_name=f"{self._model} (catalog verification {status.value})",
-                verification=Verification(
-                    status=status, source=source, reason=reason
-                ),
-            )
-        observed_tier = entry.get("cost_tier")
-        if observed_tier != self._expected_cost_tier:
-            return ModelDescriptor(
-                model_id=self._model,
-                display_name=f"{self._model} (cost tier mismatch)",
-                verification=Verification(
-                    status=VerificationStatus.FAILED,
-                    source=source,
-                    reason=(
-                        f"catalog cost_tier {observed_tier!r} does not match the "
-                        f"operator-pinned expectation {self._expected_cost_tier!r}"
+            aliases = [
+                a for a in (family.get("aliases") or []) if isinstance(a, str)
+            ]
+            for variant in family.get("variants") or []:
+                if not isinstance(variant, dict):
+                    continue
+                uid = variant.get("model_uid")
+                if not isinstance(uid, str) or not uid:
+                    continue
+                tier = variant.get("cost_tier")
+                status = VerificationStatus.PASSED
+                reason = (
+                    "exact model_uid membership verified against the local "
+                    f"catalog; valid for {self._catalog_ttl:.0f}s "
+                    "(membership only - not an inference or quota claim)"
+                )
+                if uid == self._model:
+                    configured_seen = True
+                    if tier != self._expected_cost_tier:
+                        # The operator-pinned expectation on the configured
+                        # model is a verification failure, not just a policy
+                        # denial: a silently more expensive pinned model must
+                        # never verify.
+                        status = VerificationStatus.FAILED
+                        reason = (
+                            f"catalog cost_tier {tier!r} does not match the "
+                            f"operator-pinned expectation "
+                            f"{self._expected_cost_tier!r}"
+                        )
+                descriptors.append(
+                    ModelDescriptor(
+                        model_id=uid,
+                        display_name=str(variant.get("label") or uid),
+                        verification=Verification(
+                            status=status, source=source, reason=reason
+                        ),
+                        cost_tier=tier if isinstance(tier, str) else None,
+                        family=family_id if isinstance(family_id, str) else None,
+                        aliases=aliases,
+                        executable=(
+                            status is VerificationStatus.PASSED
+                            and self._executable(uid, tier)
+                        ),
+                    )
+                )
+        if not configured_seen:
+            descriptors.append(
+                ModelDescriptor(
+                    model_id=self._model,
+                    display_name=f"{self._model} (catalog verification failed)",
+                    verification=Verification(
+                        status=VerificationStatus.FAILED,
+                        source=source,
+                        reason=(
+                            "model_uid not present in catalog "
+                            "(exact match required)"
+                        ),
                     ),
-                ),
+                    executable=False,
+                )
             )
-        return ModelDescriptor(
-            model_id=self._model,
-            display_name=str(entry.get("label") or self._model),
-            verification=Verification(
-                status=VerificationStatus.PASSED,
-                source=source,
-                reason=(
-                    f"exact model_uid membership + cost_tier {observed_tier!r} "
-                    f"verified against the local catalog; valid for "
-                    f"{self._catalog_ttl:.0f}s (operator expiry, not a pricing claim)"
-                ),
-            ),
-        )
+        return descriptors
 
     # -------------------------------------------------------------- execute
 
-    def _model_rejection(self, model_alias: str | None) -> tuple[str, str] | None:
-        if self._model not in SUPPORTED_MODELS:
-            return (
-                "unsupported_model",
-                f"this driver only supports {sorted(SUPPORTED_MODELS)}; "
-                f"operator configured {self._model!r}",
+    def _resolve_run_model(
+        self, request: NormalizedRequest
+    ) -> tuple[str | None, tuple[str, str] | None]:
+        """Resolve the exact model this run may use, or a rejection.
+
+        Selection comes from the admitted request (``model_alias``), falling
+        back to the operator-pinned default only when the request carries no
+        model. ``self._model`` is never mutated per run. Catalog membership and
+        cost-tier admission are re-verified by the caller against the bounded
+        TTL cache before any subprocess exists.
+        """
+        if request.reasoning_effort is not None:
+            return None, (
+                "unsupported_effort",
+                "the Devin catalog exposes no per-model effort option; an "
+                "explicit reasoning_effort is rejected rather than silently "
+                "dropped",
             )
-        if model_alias is None or model_alias == self._model:
-            return None
-        for separator in _EFFORT_SEPARATORS:
-            if model_alias.startswith(self._model + separator):
-                return (
-                    "unsupported_effort",
-                    "the exact swe-2-max variant is already Max; this driver does "
-                    "not accept tier/effort modifiers",
-                )
-        return (
-            "unsupported_model",
-            f"model alias {model_alias!r} does not match the pinned {self._model!r}",
-        )
+        model = request.model_alias or self._model
+        if (
+            request.resolved_model is not None
+            and request.resolved_model != model
+        ):
+            return None, (
+                "resolved_model_mismatch",
+                f"admitted resolved model {request.resolved_model!r} does not "
+                f"match the requested {model!r}",
+            )
+        if not self._model_allowed(model):
+            return None, (
+                "unsupported_model",
+                f"model {model!r} is not in the operator execution allowlist",
+            )
+        return model, None
 
     @staticmethod
     def _serialize_messages(request: NormalizedRequest) -> str:
@@ -676,7 +770,7 @@ class DevinDriver(BaseDriver):
         if not request.deadline_seconds or request.deadline_seconds <= 0:
             yield fail("no_deadline", "a finite deadline is required to run the CLI")
             return
-        rejection = self._model_rejection(request.model_alias)
+        model, rejection = self._resolve_run_model(request)
         if rejection is not None:
             yield fail(*rejection)
             return
@@ -696,16 +790,33 @@ class DevinDriver(BaseDriver):
         # consulted again so a stale `Free` membership is never replayed as a
         # standing authorization. The check itself is only a read-only
         # `models list` spawn — never an agent prompt — and an absent,
-        # not-Free, expired, or unreadable catalog fails the run before the
+        # non-admitted, expired, or unreadable catalog fails the run before the
         # agent subprocess exists.
-        catalog = (await self.discover_models(ctx))[0].verification
-        if catalog.status is not VerificationStatus.PASSED:
+        descriptor = next(
+            (
+                d
+                for d in await self.discover_models(ctx)
+                if d.model_id == model
+            ),
+            None,
+        )
+        if (
+            descriptor is None
+            or descriptor.verification.status is not VerificationStatus.PASSED
+            or not descriptor.executable
+        ):
+            detail = (
+                descriptor.verification.reason
+                if descriptor is not None
+                else "model is absent from the verified catalog"
+            )
             yield fail(
                 "catalog_not_verified",
-                f"catalog verification is {catalog.status.value}: "
-                f"{catalog.reason}; refusing to spawn the agent",
+                f"catalog admission for {model!r} failed: {detail}; "
+                "refusing to spawn the agent",
             )
             return
+        state.expected_model = model
 
         # run.started is emitted here — after every admission gate and
         # immediately before the ACP agent subprocess is spawned — so it
@@ -714,12 +825,15 @@ class DevinDriver(BaseDriver):
         yield RunStartedEvent(
             **self._event_kwargs(request, state),
             payload=RunStartedPayload(
-                preset=request.preset, model_alias=request.model_alias
+                preset=request.preset,
+                model_alias=model,
+                reasoning_effort=request.reasoning_effort,
+                resolved_model=request.resolved_model,
             ),
         )
 
         try:
-            process = await ctx.executor.spawn(self._acp_argv(), cwd=cwd)
+            process = await ctx.executor.spawn(self._acp_argv(model), cwd=cwd)
         except ProcessStartError as exc:
             yield fail("cli_not_startable", str(exc))
             return
@@ -808,10 +922,10 @@ class DevinDriver(BaseDriver):
                 terminal_sent = True
                 return
             state.model_value = model_value
-            if model_value != self._model:
+            if model_value != model:
                 yield fail(
                     "model_mismatch",
-                    f"session model currentValue {model_value!r} != pinned {self._model!r}",
+                    f"session model currentValue {model_value!r} != pinned {model!r}",
                 )
                 terminal_sent = True
                 return
@@ -1241,7 +1355,11 @@ class DevinDriver(BaseDriver):
         if kind == "config_option_update":
             option_id = update.get("configId") or update.get("id")
             value = update.get("value", update.get("currentValue"))
-            if option_id == "model" and isinstance(value, str) and value != self._model:
+            if (
+                option_id == "model"
+                and isinstance(value, str)
+                and value != getattr(state, "expected_model", self._model)
+            ):
                 raise _ProtocolError("model_changed")
             if option_id in ("mode", "session_mode") and isinstance(value, str):
                 state.current_mode = value

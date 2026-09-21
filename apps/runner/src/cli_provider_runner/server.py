@@ -576,6 +576,17 @@ class RunnerServer:
                 f"model {request.model_alias!r} is not allowed in workspace "
                 f"{request.workspace.workspace_id!r}",
             )
+        if (
+            binding.allowed_models is not None
+            and request.resolved_model is not None
+            and request.resolved_model != request.model_alias
+            and request.resolved_model not in binding.allowed_models
+        ):
+            return _BindingDenial(
+                "model_not_allowed",
+                f"resolved model {request.resolved_model!r} is not allowed in "
+                f"workspace {request.workspace.workspace_id!r}",
+            )
         return binding
 
     def _denied_result(

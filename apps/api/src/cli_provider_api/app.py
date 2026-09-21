@@ -19,7 +19,7 @@ from cli_provider_core import (
     Store,
 )
 
-from . import chat, health, models, runs
+from . import catalog, chat, health, models, runs
 from .errors import error_payload, install_handlers
 from .ownerlock import acquire_store_owner_lock, release_store_owner_lock
 
@@ -103,6 +103,7 @@ def create_app(config: OperatorConfig) -> FastAPI:
         )
 
     app.include_router(health.router)
+    app.include_router(catalog.router)
     app.include_router(models.router)
     app.include_router(chat.router)
     app.include_router(runs.router)

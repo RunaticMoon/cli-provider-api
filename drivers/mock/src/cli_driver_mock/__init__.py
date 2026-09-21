@@ -16,15 +16,18 @@ an HTTP/run request:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import AsyncIterator
 
 from cli_provider_sdk import (
     BaseDriver,
     CancelResult,
     Capabilities,
+    DriverError,
     DriverManifest,
     MessageDeltaEvent,
     MessageDeltaPayload,
@@ -42,6 +45,7 @@ from cli_provider_sdk import (
     RunStartedEvent,
     RunStartedPayload,
     RuntimeContext,
+    resolve_effort,
     SDK_VERSION,
     SessionMode,
     StreamingMode,
@@ -56,6 +60,11 @@ from cli_provider_sdk import (
 BEHAVIOR_ENV = "CLI_DRIVER_MOCK_BEHAVIOR"
 CANCEL_DETAIL_ENV = "CLI_DRIVER_MOCK_CANCEL_DETAIL"
 MALFORMED_ENV = "CLI_DRIVER_MOCK_MALFORMED_MODE"
+# Optional JSON catalog fixture ({"models": [{model_id, display_name?,
+# verification?, effort?, effort_options?, effort_variants?, cost_tier?,
+# family?, aliases?, executable?}]} or a bare list). Re-read on every
+# discover_models call so tests exercise add/remove/refresh without a restart.
+CATALOG_ENV = "CLI_DRIVER_MOCK_CATALOG_FILE"
 
 SYNTHETIC_SOURCE = "mock-fixture"
 SLOW_DELTAS = 30
@@ -160,18 +169,95 @@ class MockDriver(BaseDriver):
             ],
         )
 
-    async def discover_models(self, ctx: RuntimeContext) -> list[ModelDescriptor]:
-        return [
-            ModelDescriptor(
-                model_id="mock-model",
-                display_name="Mock Model (synthetic)",
-                verification=Verification(
-                    status=VerificationStatus.UNKNOWN,
-                    source=SYNTHETIC_SOURCE,
-                    reason="synthetic fixture; no real CLI verification performed",
-                ),
+    def _catalog(self) -> list[ModelDescriptor]:
+        path = os.environ.get(CATALOG_ENV)
+        if not path:
+            return [
+                ModelDescriptor(
+                    model_id="mock-model",
+                    display_name="Mock Model (synthetic)",
+                    verification=Verification(
+                        status=VerificationStatus.UNKNOWN,
+                        source=SYNTHETIC_SOURCE,
+                        reason="synthetic fixture; no real CLI verification performed",
+                    ),
+                )
+            ]
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            # A malformed catalog must fail discovery, never authorize models.
+            raise DriverError(
+                f"mock catalog file unreadable: {type(exc).__name__}"
+            ) from exc
+        rows = data.get("models") if isinstance(data, dict) else data
+        if not isinstance(rows, list):
+            raise DriverError("mock catalog must be a list or {'models': [...]}")
+        descriptors: list[ModelDescriptor] = []
+        for raw in rows:
+            if not isinstance(raw, dict) or not isinstance(raw.get("model_id"), str):
+                raise DriverError("mock catalog row is not an object with model_id")
+            verification = raw.get("verification")
+            if verification is None:
+                verification = {
+                    "status": raw.get("verification_status", "unknown"),
+                    "source": SYNTHETIC_SOURCE,
+                    "reason": "synthetic fixture; no real CLI verification performed",
+                }
+            descriptors.append(
+                ModelDescriptor(
+                    model_id=raw["model_id"],
+                    display_name=raw.get("display_name") or raw["model_id"],
+                    verification=Verification.model_validate(verification),
+                    effort=raw.get("effort", "unknown"),
+                    effort_options=list(raw.get("effort_options") or []),
+                    effort_variants=dict(raw.get("effort_variants") or {}),
+                    cost_tier=raw.get("cost_tier"),
+                    family=raw.get("family"),
+                    aliases=list(raw.get("aliases") or []),
+                    executable=bool(raw.get("executable", True)),
+                )
             )
-        ]
+        return descriptors
+
+    async def discover_models(self, ctx: RuntimeContext) -> list[ModelDescriptor]:
+        return self._catalog()
+
+    def _resolve_run_model(
+        self, request: NormalizedRequest
+    ) -> tuple[str | None, tuple[str, str] | None]:
+        """Resolve the executed model id + verify effort against the catalog.
+
+        Mirrors the native drivers: the wire carries the admitted/requested id
+        plus the effort token; the driver re-derives the exact target from its
+        own catalog and refuses a ``resolved_model`` that disagrees.
+        """
+        effort = request.reasoning_effort
+        if effort is None:
+            # No effort resolution happened, so there is no variant evidence to
+            # report — ``resolved_model`` stays unset (the executed model is
+            # simply the admitted ``model_alias``).
+            return None, None
+        try:
+            descriptors = self._catalog()
+        except DriverError:
+            return None, (
+                "catalog_unavailable",
+                "the mock catalog could not be read; refusing effort resolution",
+            )
+        descriptor = next(
+            (d for d in descriptors if d.model_id == request.model_alias), None
+        )
+        resolved, rejection = resolve_effort(descriptor, effort)
+        if rejection is not None or resolved is None:
+            return None, ("unsupported_effort", rejection or "effort rejected")
+        if request.resolved_model is not None and request.resolved_model != resolved:
+            return None, (
+                "resolved_model_mismatch",
+                f"admitted resolved model {request.resolved_model!r} does not "
+                f"match the catalog resolution {resolved!r}",
+            )
+        return resolved, None
 
     async def cancel(self, run_id: str, ctx: RuntimeContext) -> CancelResult:
         now = datetime.now(timezone.utc)
@@ -211,11 +297,16 @@ class MockDriver(BaseDriver):
             payload=MessageDeltaPayload(text=text),
         )
 
-    def _started(self, request: NormalizedRequest, sequence: int) -> RunEvent:
+    def _started(
+        self, request: NormalizedRequest, sequence: int, resolved_model: str | None = None
+    ) -> RunEvent:
         return RunStartedEvent(
             **self._event(request, sequence),
             payload=RunStartedPayload(
-                preset=request.preset, model_alias=request.model_alias
+                preset=request.preset,
+                model_alias=request.model_alias,
+                reasoning_effort=request.reasoning_effort,
+                resolved_model=resolved_model,
             ),
         )
 
@@ -288,7 +379,14 @@ class MockDriver(BaseDriver):
             return
 
         sequence = 1
-        yield self._started(request, sequence)
+        resolved_model, rejection = self._resolve_run_model(request)
+        if rejection is not None:
+            yield RunFailedEvent(
+                **self._event(request, sequence),
+                payload=RunFailedPayload(code=rejection[0], message=rejection[1]),
+            )
+            return
+        yield self._started(request, sequence, resolved_model)
 
         if behavior is MockBehavior.CRASH:
             for text in self._chunks(request):

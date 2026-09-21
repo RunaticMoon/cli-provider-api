@@ -118,9 +118,11 @@ async def test_runner_loads_devin_driver_and_runs_over_uds(runner_factory, tmp_p
 
         models = await client.call("discover_models")
         assert models.ok
-        descriptor = models.result["models"][0]
-        assert descriptor["model_id"] == "swe-2-max"
-        assert descriptor["verification"]["status"] == "passed"
+        # Discovery now enumerates the full official catalog; the configured
+        # lane model remains a verified member of it.
+        by_id = {m["model_id"]: m for m in models.result["models"]}
+        assert "swe-2-high" in by_id and "swe-2-max" in by_id
+        assert by_id["swe-2-max"]["verification"]["status"] == "passed"
 
         params = run_params(
             preset="devin/code", model_alias="swe-2-max", deadline_seconds=15.0

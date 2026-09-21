@@ -27,6 +27,7 @@ from .errors import (
 from .models import (
     ALIAS_SEGMENT,
     ANSWER_KINDS,
+    EFFORT_PATTERN,
     ID_PATTERN,
     MAX_ALIAS_LENGTH,
     MAX_ALIAS_SEGMENTS,
@@ -40,6 +41,8 @@ from .models import (
     Capabilities,
     CompletionStatus,
     DriverManifest,
+    EffortSupport,
+    EffortToken,
     EventKind,
     Message,
     MessageDeltaEvent,
@@ -77,14 +80,17 @@ from .models import (
     VerificationStatus,
     WorkspaceRef,
     is_terminal_kind,
+    resolve_effort,
     terminal_kind_for,
     validate_alias,
+    validate_effort,
 )
 
 # Canonical public names live in cli_provider_sdk.types.
 __all__ = [
     "ALIAS_SEGMENT",
     "ANSWER_KINDS",
+    "EFFORT_PATTERN",
     "ID_PATTERN",
     "MAX_ALIAS_LENGTH",
     "MAX_ALIAS_SEGMENTS",
@@ -103,6 +109,8 @@ __all__ = [
     "DriverError",
     "DriverManifest",
     "DriverUnavailable",
+    "EffortSupport",
+    "EffortToken",
     "EventKind",
     "InMemorySessionStore",
     "Message",
@@ -152,7 +160,9 @@ __all__ = [
     "WorkspaceRef",
     "WorkspaceService",
     "is_terminal_kind",
+    "resolve_effort",
     "terminal_kind_for",
     "types",
     "validate_alias",
+    "validate_effort",
 ]

@@ -22,6 +22,12 @@ MODE = os.environ.get("FAKE_DEVIN_MODE", "ok")
 CATALOG = os.environ.get("FAKE_DEVIN_CATALOG", "ok")
 LOG = os.environ.get("FAKE_DEVIN_LOG")
 
+# The exact id the driver pinned on this process's argv (--model <id>).
+_argv = sys.argv[1:]
+REQUEST_MODEL = (
+    _argv[_argv.index("--model") + 1] if "--model" in _argv else "swe-2-max"
+)
+
 SECRET_THOUGHT = "SECRET-THOUGHT-TEXT"
 SECRET_STDERR = "SECRET-STDERR-TOKEN"
 SECRET_RPC_ERROR = "SECRET-RPC-ERROR-TEXT"
@@ -112,6 +118,9 @@ def catalog_document() -> dict:
 
 def session_new_result() -> dict:
     current_mode = "plan" if MODE == "current_mode_plan" else "accept-edits"
+    # The fake acknowledges exactly the model pinned on the argv, like the real
+    # ACP `model` configOption echoes the session's effective model.
+    acknowledged = "swe-2-medium" if MODE == "model_mismatch" else REQUEST_MODEL
     result = {
         "sessionId": "fixture-session-1",
         "modes": {"currentModeId": current_mode, "availableModes": MODES},
@@ -129,7 +138,7 @@ def session_new_result() -> dict:
                 "description": "AI model to use",
                 "category": "model",
                 "type": "select",
-                "currentValue": "swe-2-medium" if MODE == "model_mismatch" else "swe-2-max",
+                "currentValue": acknowledged,
             },
         ],
         "_meta": {"cognition.ai/isLocked": False},

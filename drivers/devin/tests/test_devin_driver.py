@@ -278,25 +278,65 @@ async def test_probe_fails_on_initialize_rpc_error(tmp_path):
 # ----------------------------------------------------------------- discovery
 
 
-async def test_discovery_verifies_exact_catalog_membership_and_free_tier(tmp_path):
+async def test_discovery_lists_every_catalog_variant_with_exact_ids(tmp_path):
+    """Discovery enumerates the real catalog; execution stays a separate gate."""
     driver = driver_for(tmp_path)
     models = await driver.discover_models(make_ctx(tmp_path, "ok"))
-    assert [model.model_id for model in models] == ["swe-2-max"]
-    verification = models[0].verification
-    assert verification.status.value == "passed"
-    assert "models list" in verification.source
+    by_id = {model.model_id: model for model in models}
+    assert set(by_id) == {"swe-2-high", "swe-2-medium", "swe-2-max"}
+    for model in models:
+        assert model.verification.status.value == "passed"
+        assert "models list" in model.verification.source
+        # The observed catalog exposes no per-model effort option.
+        assert model.effort.value == "unknown"
+        assert model.family == "swe-2"
+        assert model.cost_tier == "Free"
+    # The legacy pin admits only the configured model at the expected tier.
+    assert by_id["swe-2-max"].executable is True
+    assert by_id["swe-2-high"].executable is False
+    assert by_id["swe-2-medium"].executable is False
+
+
+async def test_discovery_marks_allowlisted_catalog_models_executable(tmp_path):
+    driver = driver_for(tmp_path, models=["swe-2-max", "swe-2-high"])
+    models = await driver.discover_models(make_ctx(tmp_path, "ok"))
+    by_id = {model.model_id: model for model in models}
+    assert by_id["swe-2-high"].executable is True
+    assert by_id["swe-2-medium"].executable is False
+
+
+async def test_discovery_star_admits_all_catalog_models_at_admitted_tiers(tmp_path):
+    driver = driver_for(tmp_path, models=["*"])
+    models = await driver.discover_models(make_ctx(tmp_path, "ok"))
+    assert all(model.executable for model in models)
+
+
+async def test_discovery_tier_not_admitted_is_not_executable(tmp_path):
+    """A model whose catalog tier is outside the admitted set never runs."""
+    driver = driver_for(tmp_path, models=["*"], allowed_cost_tiers=["Free"])
+    models = await driver.discover_models(make_ctx(tmp_path, "ok", catalog="cost"))
+    by_id = {model.model_id: model for model in models}
+    # swe-2-max's tier moved to "High cost": verification fails for the pinned
+    # model and it is not executable.
+    assert by_id["swe-2-max"].verification.status.value == "failed"
+    assert by_id["swe-2-max"].executable is False
+    assert by_id["swe-2-high"].executable is True
 
 
 async def test_discovery_fails_closed_when_model_absent_from_catalog(tmp_path):
     driver = driver_for(tmp_path)
     models = await driver.discover_models(make_ctx(tmp_path, "ok", catalog="missing"))
-    assert models[0].verification.status.value == "failed"
+    by_id = {model.model_id: model for model in models}
+    # The dropped configured id fails; catalog members still verify truthfully.
+    assert by_id["swe-2-max"].verification.status.value == "failed"
+    assert by_id["swe-2-max"].executable is False
+    assert by_id["swe-2-high"].verification.status.value == "passed"
 
 
 async def test_discovery_fails_when_cost_tier_is_not_the_pinned_expectation(tmp_path):
     driver = driver_for(tmp_path)
     models = await driver.discover_models(make_ctx(tmp_path, "ok", catalog="cost"))
-    verification = models[0].verification
+    verification = {m.model_id: m for m in models}["swe-2-max"].verification
     assert verification.status.value == "failed"
     assert "cost" in (verification.reason or "").lower()
 
@@ -480,6 +520,7 @@ async def test_model_alias_mismatch_is_refused_before_spawn(tmp_path):
 
 
 async def test_effort_suffix_is_an_explicit_unsupported_error_before_spawn(tmp_path):
+    """A ``<model>:<effort>`` alias is not an exact catalog id: refused."""
     ctx, executor = recording_ctx(tmp_path, "ok")
     driver = driver_for(tmp_path)
     events = await collect(
@@ -487,17 +528,76 @@ async def test_effort_suffix_is_an_explicit_unsupported_error_before_spawn(tmp_p
     )
     result = terminal(events)
     assert result.kind == EventKind.RUN_FAILED
+    assert result.payload.code == "unsupported_model"
+    assert not any("acp" in c["argv"] for c in executor.calls)
+
+
+async def test_reasoning_effort_is_rejected_before_spawn(tmp_path):
+    """The Devin catalog exposes no per-model effort option: explicit effort
+    is rejected, never silently dropped or mapped to a suffix guess."""
+    ctx, executor = recording_ctx(tmp_path, "ok")
+    driver = driver_for(tmp_path)
+    request = make_request(model_alias="swe-2-max").model_copy(
+        update={"reasoning_effort": "high"}
+    )
+    events = await collect(driver, request, ctx)
+    result = terminal(events)
+    assert result.kind == EventKind.RUN_FAILED
     assert result.payload.code == "unsupported_effort"
     assert not any("acp" in c["argv"] for c in executor.calls)
 
 
-async def test_non_max_configured_model_is_refused_before_spawn(tmp_path):
+async def test_configured_model_absent_from_catalog_is_refused_before_spawn(tmp_path):
     ctx, executor = recording_ctx(tmp_path, "ok")
     driver = driver_for(
         tmp_path, model="claude-opus-5-high"
     )
     events = await collect(driver, make_request(), ctx)
-    assert terminal(events).payload.code == "unsupported_model"
+    assert terminal(events).payload.code == "catalog_not_verified"
+    assert not any("acp" in c["argv"] for c in executor.calls)
+
+
+async def test_catalog_selected_model_executes_when_operator_admits_it(tmp_path):
+    """A catalog id with no code preset runs once the operator allowlist +
+    cost tier admit it — the request selects it, argv pins it, ACP acks it."""
+    ctx, executor = recording_ctx(tmp_path, "ok")
+    driver = driver_for(tmp_path, models=["swe-2-max", "swe-2-high"])
+    events = await collect(
+        driver, make_request(model_alias="swe-2-high"), ctx
+    )
+    assert terminal(events).kind == EventKind.RUN_COMPLETED
+    acp_calls = [c["argv"] for c in executor.calls if "acp" in c["argv"]]
+    assert acp_calls, "the ACP server was never spawned"
+    argv = acp_calls[-1]
+    assert argv[argv.index("--model") + 1] == "swe-2-high"
+
+
+async def test_catalog_model_without_allowlist_grant_has_zero_effects(tmp_path):
+    """Discovery alone never authorizes: a catalog member outside the
+    operator allowlist fails before any prompt or spawn."""
+    ctx, executor = recording_ctx(tmp_path, "ok")
+    driver = driver_for(tmp_path)
+    events = await collect(
+        driver, make_request(model_alias="swe-2-high"), ctx
+    )
+    result = terminal(events)
+    assert result.kind == EventKind.RUN_FAILED
+    assert result.payload.code == "unsupported_model"
+    assert not any("acp" in c["argv"] for c in executor.calls)
+
+
+async def test_catalog_model_at_unadmitted_cost_tier_has_zero_effects(tmp_path):
+    """An admitted id whose catalog tier is outside the policy never runs."""
+    ctx, executor = recording_ctx(
+        tmp_path, "ok", extra_env={"FAKE_DEVIN_CATALOG": "cost"}
+    )
+    driver = driver_for(tmp_path, models=["*"], allowed_cost_tiers=["Free"])
+    events = await collect(
+        driver, make_request(model_alias="swe-2-max"), ctx
+    )
+    result = terminal(events)
+    assert result.kind == EventKind.RUN_FAILED
+    assert result.payload.code == "catalog_not_verified"
     assert not any("acp" in c["argv"] for c in executor.calls)
 
 

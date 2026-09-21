@@ -56,6 +56,21 @@ def validate_alias(value: str) -> str:
 
 Alias = Annotated[str, AfterValidator(validate_alias)]
 
+# Reasoning-effort tokens are short lowercase enum members declared per model
+# in the driver's catalog. They are NEVER forwarded to a CLI as raw flags: the
+# leading letter rules out argv-looking values ("--help", "-x"), and a driver
+# may only honour a token the descriptor explicitly advertises.
+EFFORT_PATTERN = r"^[a-z][a-z0-9_]{0,31}$"
+
+
+def validate_effort(value: str) -> str:
+    if re.match(EFFORT_PATTERN, value) is None:
+        raise ValueError(f"effort {value!r} is not a valid effort token")
+    return value
+
+
+EffortToken = Annotated[str, AfterValidator(validate_effort)]
+
 # Dispatcher route in `role.capability.tier` form (e.g. ``worker.code.standard``):
 # exactly three bounded dot-separated segments, never a path or URL.
 ROUTE_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_-]{0,62}(\.[A-Za-z0-9][A-Za-z0-9_-]{0,62}){2}$"
@@ -105,6 +120,24 @@ class VerificationStatus(str, Enum):
     PASSED = "passed"
     FAILED = "failed"
     NOT_RUN = "not_run"
+    UNKNOWN = "unknown"
+
+
+class EffortSupport(str, Enum):
+    """How a model's reasoning effort may be selected, per catalog evidence.
+
+    ``SELECTABLE``: the descriptor's ``effort_options`` is a declared enum the
+    driver can apply (e.g. a CLI flag the model is known to accept).
+    ``MODEL_VARIANT``: effort is encoded by exact native model ids; the
+    descriptor's ``effort_variants`` maps each advertised level to a catalog id.
+    ``UNSUPPORTED``: the model provably takes no effort selection.
+    ``UNKNOWN``: no official evidence; effort requests must be refused, never
+    guessed. Membership in a catalog alone is never evidence of support.
+    """
+
+    SELECTABLE = "selectable"
+    MODEL_VARIANT = "model_variant"
+    UNSUPPORTED = "unsupported"
     UNKNOWN = "unknown"
 
 
@@ -196,9 +229,82 @@ class ProbeReport(_Schema):
 
 
 class ModelDescriptor(_Schema):
+    """One discovered catalog entry. Discovery is not execution authorization:
+    ``executable`` reports the driver's own admission decision (operator
+    allowlist / prepared lane), never a capability claim on its own."""
+
     model_id: str = Field(pattern=ID_PATTERN)
     display_name: str = Field(min_length=1)
     verification: Verification
+    effort: EffortSupport = EffortSupport.UNKNOWN
+    effort_options: list[EffortToken] = Field(default_factory=list, max_length=16)
+    effort_variants: dict[EffortToken, str] = Field(default_factory=dict, max_length=16)
+    cost_tier: str | None = Field(default=None, max_length=64)
+    family: str | None = Field(default=None, max_length=128)
+    aliases: list[str] = Field(default_factory=list, max_length=32)
+    executable: bool = True
+
+    @field_validator("effort_variants")
+    @classmethod
+    def _variant_ids(cls, value: dict[str, str]) -> dict[str, str]:
+        for level, target in value.items():
+            if re.match(ID_PATTERN, target) is None:
+                raise ValueError(
+                    f"effort variant {level!r} target {target!r} is not a model id"
+                )
+        return value
+
+    @model_validator(mode="after")
+    def _effort_shape(self) -> "ModelDescriptor":
+        if self.effort is EffortSupport.SELECTABLE:
+            if not self.effort_options:
+                raise ValueError("selectable effort requires declared effort_options")
+            if self.effort_variants:
+                raise ValueError("selectable effort must not carry variants")
+        elif self.effort is EffortSupport.MODEL_VARIANT:
+            if not self.effort_variants:
+                raise ValueError("model_variant effort requires declared effort_variants")
+            if self.effort_options:
+                raise ValueError("model_variant effort must not carry options")
+        elif self.effort_options or self.effort_variants:
+            raise ValueError(
+                "effort options/variants require selectable or model_variant effort"
+            )
+        return self
+
+
+def resolve_effort(
+    descriptor: "ModelDescriptor | None", effort: "str | None"
+) -> "tuple[str | None, str | None]":
+    """Resolve a requested effort token against one catalog descriptor.
+
+    Returns ``(resolved_model_id, rejection)``. The resolved id is the exact
+    catalog id that must execute (the descriptor's own id unless the effort is
+    encoded as a variant). ``rejection`` is a short reason when the request
+    cannot be honoured truthfully; unknown metadata never blocks the
+    effort-omitted path, which returns the descriptor's own id.
+    """
+
+    if effort is None:
+        return (descriptor.model_id if descriptor is not None else None), None
+    if descriptor is None or descriptor.effort is EffortSupport.UNKNOWN:
+        return None, "model advertises no effort support"
+    if descriptor.effort is EffortSupport.UNSUPPORTED:
+        return None, "model does not support effort selection"
+    if descriptor.effort is EffortSupport.SELECTABLE:
+        if effort not in descriptor.effort_options:
+            return None, (
+                f"effort {effort!r} is not in the declared options "
+                f"{sorted(descriptor.effort_options)}"
+            )
+        return descriptor.model_id, None
+    target = descriptor.effort_variants.get(effort)
+    if target is None:
+        return None, (
+            f"effort {effort!r} has no catalog-backed variant for "
+            f"{descriptor.model_id!r}"
+        )
+    return target, None
 
 
 class WorkspaceRef(_Schema):
@@ -244,6 +350,12 @@ class NormalizedRequest(_Schema):
     # Optional caller-supplied execution context (backwards-compatible: absent
     # means a legacy request with no dispatcher metadata).
     execution: ExecutionContext | None = None
+    # Requested reasoning-effort token plus the API's resolved exact target id.
+    # ``model_alias`` stays the admitted/requested model; a driver MUST re-derive
+    # the target from its own catalog and refuse when ``resolved_model`` does not
+    # match its own resolution.
+    reasoning_effort: EffortToken | None = None
+    resolved_model: str | None = Field(default=None, pattern=ID_PATTERN)
 
 
 class Usage(_Schema):
@@ -342,6 +454,8 @@ class _EventBase(_Schema):
 class RunStartedPayload(_Schema):
     preset: Alias
     model_alias: Alias | None = None
+    reasoning_effort: EffortToken | None = None
+    resolved_model: str | None = Field(default=None, pattern=ID_PATTERN)
 
 
 class MessageDeltaPayload(_Schema):
