@@ -60,6 +60,10 @@ from cli_provider_sdk import (
 BEHAVIOR_ENV = "CLI_DRIVER_MOCK_BEHAVIOR"
 CANCEL_DETAIL_ENV = "CLI_DRIVER_MOCK_CANCEL_DETAIL"
 MALFORMED_ENV = "CLI_DRIVER_MOCK_MALFORMED_MODE"
+# Test-only operator knob: append one JSON line per verification RPC
+# (probe/discover_models) so tests can prove scoped refresh never touches
+# an unrelated runner.
+RPC_LOG_ENV = "CLI_DRIVER_MOCK_RPC_LOG"
 # Optional JSON catalog fixture ({"models": [{model_id, display_name?,
 # verification?, effort?, effort_options?, effort_variants?, cost_tier?,
 # family?, aliases?, executable?}]} or a bare list). Re-read on every
@@ -123,8 +127,18 @@ class MockDriver(BaseDriver):
         # Test-only knob: a long driver detail lets the Runner's truncation of
         # the driver-supplied deadline detail be exercised.
         self._cancel_detail = os.environ.get(CANCEL_DETAIL_ENV) or None
+        self._rpc_log = os.environ.get(RPC_LOG_ENV) or None
         self._cancelled = asyncio.Event()
         self._closed = False
+
+    def _log_rpc(self, method: str) -> None:
+        if not self._rpc_log:
+            return
+        try:
+            with open(self._rpc_log, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"rpc": method}) + "\n")
+        except OSError:
+            pass
 
     @property
     def behavior(self) -> MockBehavior:
@@ -157,6 +171,7 @@ class MockDriver(BaseDriver):
         )
 
     async def probe(self, ctx: RuntimeContext) -> ProbeReport:
+        self._log_rpc("probe")
         return ProbeReport(
             ok=True,
             driver_id=self.manifest.driver_id,
@@ -221,6 +236,7 @@ class MockDriver(BaseDriver):
         return descriptors
 
     async def discover_models(self, ctx: RuntimeContext) -> list[ModelDescriptor]:
+        self._log_rpc("discover_models")
         return self._catalog()
 
     def _resolve_run_model(

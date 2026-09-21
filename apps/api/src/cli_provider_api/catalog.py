@@ -17,7 +17,11 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Request
 
-from cli_provider_core import NotFound, catalog_view, principal_may_read
+from cli_provider_core import (
+    NotFound,
+    catalog_refresh_refs,
+    catalog_view,
+)
 
 from .auth import authenticate
 
@@ -30,7 +34,6 @@ async def _catalog_body(request: Request, driver_scope: str | None):
         raise NotFound("no dynamic catalog sources are configured")
     principal = authenticate(request)
     registry = request.app.state.registry
-    runners = config.runner_map()
     if driver_scope is not None and not any(
         runner.driver_id == driver_scope for runner in config.runners
     ):
@@ -38,17 +41,12 @@ async def _catalog_body(request: Request, driver_scope: str | None):
         # scope is a 404, never a silent empty catalog.
         raise NotFound("provider not found")
     # Bounded singleflight refresh — at most one discovery pass per TTL
-    # window — but only when this principal can actually read an in-scope
-    # source. Anything else is unauthenticated or ungranted driver work.
-    readable = any(
-        source.enabled
-        and principal_may_read(principal, source)
-        and (runner := runners.get(source.runner_ref)) is not None
-        and (driver_scope is None or runner.driver_id == driver_scope)
-        for source in config.catalogs
+    # window per runner — scoped to exactly the runners whose catalogs this
+    # principal can read here. Anything else is unauthenticated, ungranted,
+    # or unrelated driver work.
+    await registry.ensure_fresh(
+        runner_refs=catalog_refresh_refs(config, principal, driver_scope)
     )
-    if readable:
-        await registry.ensure_fresh()
     return {
         "object": "list",
         "data": catalog_view(

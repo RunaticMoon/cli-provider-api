@@ -692,3 +692,214 @@ def test_catalog_refresh_never_runs_for_unauthenticated_or_ungranted(
         fresh = alpha.get("/api/v1/catalog")
         assert fresh.status_code == 200
         assert fresh.json()["data"][0]["ok"] is False
+
+
+# ------------------------------------------------- r2: scoped refresh + shadow
+
+
+def _two_source_system(
+    system_factory,
+    tmp_path,
+    *,
+    alpha_catalogs=("src-a",),
+    alpha_exec=(),
+    extra_principals=(),
+    refresh_seconds=0.4,
+):
+    """Two runners, two catalog sources, per-runner RPC-count logs."""
+    catalog_a = tmp_path / "catalog-a.json"
+    catalog_b = tmp_path / "catalog-b.json"
+    rpc_a = tmp_path / "rpc-a.log"
+    rpc_b = tmp_path / "rpc-b.log"
+    _write_catalog(catalog_a, [{"model_id": "mock-model"}, {"model_id": "a-only"}])
+    _write_catalog(catalog_b, [{"model_id": "mock-model"}, {"model_id": "b-only"}])
+    principals = [
+        {
+            "name": "alpha",
+            "key_hash": hash_api_key("local-alpha-key"),
+            "allowed_presets": ["mock/text"],
+            "allowed_workspaces": ["ws-alpha"],
+            "allowed_catalogs": list(alpha_catalogs),
+            "executable_catalogs": list(alpha_exec),
+            "max_concurrency": 2,
+        },
+        *extra_principals,
+    ]
+    overrides = {
+        "api": {"catalog_refresh_seconds": refresh_seconds},
+        "catalogs": [
+            {
+                "name": "src-a",
+                "runner_ref": "runner-1",
+                "alias_prefix": "mock/",
+                "allow_synthetic_unverified": True,
+            },
+            {
+                "name": "src-b",
+                "runner_ref": "runner-2",
+                "alias_prefix": "aux/",
+                "allow_synthetic_unverified": True,
+            },
+        ],
+        "principals": principals,
+    }
+    system = system_factory(
+        runner2=True,
+        config_overrides=overrides,
+        runner_env={
+            "CLI_DRIVER_MOCK_CATALOG_FILE": str(catalog_a),
+            "CLI_DRIVER_MOCK_RPC_LOG": str(rpc_a),
+        },
+        runner2_env={
+            "CLI_DRIVER_MOCK_CATALOG_FILE": str(catalog_b),
+            "CLI_DRIVER_MOCK_RPC_LOG": str(rpc_b),
+        },
+    )
+    return system, rpc_a, rpc_b
+
+
+def _rpc_count(path) -> int:
+    if not path.exists():
+        return 0
+    return sum(1 for line in path.read_text().splitlines() if line.strip())
+
+
+def test_catalog_read_refreshes_only_the_readable_runner(
+    system_factory, tmp_path
+):
+    """A principal granted read on source A alone must not trigger discovery
+    RPCs on source B's runner — even after the TTL expires."""
+    system, rpc_a, rpc_b = _two_source_system(
+        system_factory, tmp_path
+    )
+    base_a, base_b = _rpc_count(rpc_a), _rpc_count(rpc_b)
+    time.sleep(0.6)  # expire the refresh window
+    with system.client() as client:
+        assert client.get("/api/v1/catalog").status_code == 200
+    assert _rpc_count(rpc_a) > base_a
+    assert _rpc_count(rpc_b) == base_b
+
+
+def test_catalog_read_both_grants_refreshes_both(system_factory, tmp_path):
+    """Positive control: a principal reading both sources refreshes both
+    runners once each."""
+    system, rpc_a, rpc_b = _two_source_system(
+        system_factory, tmp_path, alpha_catalogs=("src-a", "src-b")
+    )
+    base_a, base_b = _rpc_count(rpc_a), _rpc_count(rpc_b)
+    time.sleep(0.6)
+    with system.client() as client:
+        assert client.get("/api/v1/catalog").status_code == 200
+    assert _rpc_count(rpc_a) > base_a
+    assert _rpc_count(rpc_b) > base_b
+
+
+def test_no_readable_catalog_key_causes_zero_rpcs(system_factory, tmp_path):
+    """An authenticated key with no readable in-scope catalog performs zero
+    discovery RPCs on either runner."""
+    beta = {
+        "name": "beta",
+        "key_hash": hash_api_key("local-beta-key"),
+        "allowed_presets": ["mock/review"],
+        "allowed_workspaces": ["ws-beta"],
+        "max_concurrency": 2,
+    }
+    system, rpc_a, rpc_b = _two_source_system(
+        system_factory, tmp_path, extra_principals=[beta]
+    )
+    base_a, base_b = _rpc_count(rpc_a), _rpc_count(rpc_b)
+    time.sleep(0.6)
+    with system.client(key="local-beta-key") as client:
+        assert client.get("/api/v1/catalog").status_code == 200
+        assert client.get("/api/v1/catalog").json()["data"] == []
+    assert _rpc_count(rpc_a) == base_a
+    assert _rpc_count(rpc_b) == base_b
+
+
+def test_static_chat_never_touches_unrelated_catalog_runner(
+    system_factory, tmp_path
+):
+    """A static-preset chat refreshes only its own runner's metadata —
+    catalog source B's runner sees zero RPCs even with an expired TTL."""
+    system, rpc_a, rpc_b = _two_source_system(
+        system_factory, tmp_path, alpha_exec=("src-a",)
+    )
+    base_a, base_b = _rpc_count(rpc_a), _rpc_count(rpc_b)
+    time.sleep(0.6)
+    with system.client() as client:
+        response = _chat(client, "mock/text", task_id="task-scoped-static")
+    assert response.status_code == 200, response.text
+    assert _rpc_count(rpc_a) > base_a
+    assert _rpc_count(rpc_b) == base_b
+
+
+def test_denied_and_unknown_aliases_cause_zero_rpcs(system_factory, tmp_path):
+    """Denied dynamic aliases and unknown aliases must fail before any
+    refresh — zero RPCs on either runner."""
+    system, rpc_a, rpc_b = _two_source_system(
+        system_factory, tmp_path, alpha_exec=("src-a",)
+    )
+    base_a, base_b = _rpc_count(rpc_a), _rpc_count(rpc_b)
+    time.sleep(0.6)
+    with system.client() as client:
+        # aux/b-only exists on runner-2 but alpha holds no grant for it.
+        assert _chat(client, "aux/b-only", task_id="task-denied").status_code == 403
+        # An alias under no configured prefix is simply unknown.
+        assert _chat(client, "zzz/none", task_id="task-unknown").status_code == 404
+    assert _rpc_count(rpc_a) == base_a
+    assert _rpc_count(rpc_b) == base_b
+
+
+def test_models_endpoint_scopes_refresh_to_relevant_runners(
+    system_factory, tmp_path
+):
+    """GET /v1/models refreshes the granted static preset's runner and
+    exec-granted sources — a read-only source's runner stays untouched."""
+    beta = {
+        "name": "beta",
+        "key_hash": hash_api_key("local-beta-key"),
+        "allowed_presets": ["mock/review"],
+        "allowed_workspaces": ["ws-beta"],
+        "allowed_catalogs": ["src-b"],  # read-only grant: no /v1/models rows
+        "max_concurrency": 2,
+    }
+    system, rpc_a, rpc_b = _two_source_system(
+        system_factory,
+        tmp_path,
+        alpha_exec=("src-a",),
+        extra_principals=[beta],
+    )
+    base_a, base_b = _rpc_count(rpc_a), _rpc_count(rpc_b)
+    time.sleep(0.6)
+    with system.client(key="local-beta-key") as client:
+        response = client.get("/v1/models")
+    assert response.status_code == 200
+    # beta holds only a static preset on runner-1 + a READ grant on src-b:
+    # runner-2 must not be refreshed for this listing.
+    assert _rpc_count(rpc_a) > base_a
+    assert _rpc_count(rpc_b) == base_b
+
+
+def test_catalog_shadowed_row_is_not_executable(system_factory, tmp_path):
+    """A catalog row whose alias equals a static preset is advertised but
+    never executable: the static binding owns the alias."""
+    catalog_file = tmp_path / "catalog.json"
+    _write_catalog(
+        catalog_file,
+        [{"model_id": "mock-model"}, {"model_id": "text"}],
+    )
+    system = system_factory(
+        config_overrides=_catalog_config(executable_catalogs=["mock-catalog"]),
+        runner_env={"CLI_DRIVER_MOCK_CATALOG_FILE": str(catalog_file)},
+    )
+    with system.client() as client:
+        catalog = client.get("/api/v1/catalog").json()["data"][0]
+        by_id = {m["model_id"]: m for m in catalog["models"]}
+        shadowed = by_id["text"]
+        assert shadowed["alias"] == "mock/text"
+        assert shadowed["executable"] is False
+        assert "shadowed" in shadowed["rejection"]
+        # The static binding still executes under its own grant.
+        response = _chat(client, "mock/text", task_id="task-shadow")
+    assert response.status_code == 200, response.text
+    assert response.json()["run"]["model"]["dynamic"] is False

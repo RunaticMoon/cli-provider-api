@@ -15,6 +15,7 @@ from cli_provider_core import (
     RunController,
     RunnerRegistry,
     Store,
+    alias_refresh_refs,
     chat_id_for_run,
     resolve_model,
 )
@@ -93,9 +94,16 @@ async def _handle(request: Request, driver_id: str | None) -> Any:
     )
     chat_request = parse_chat_request(data)
     if config.catalogs:
-        # Dynamic aliases resolve against the cached catalog; keep it inside
-        # its TTL window so additions/removals propagate without a restart.
-        await registry.ensure_fresh()
+        # Dynamic aliases resolve against the cached catalog; keep the
+        # runner(s) this alias may actually bind inside their TTL window.
+        # Scoped by alias+grant+provider BEFORE refresh: a static preset
+        # refreshes only its own runner, and a denied or unknown alias
+        # triggers zero discovery RPCs on unrelated runners.
+        await registry.ensure_fresh(
+            runner_refs=alias_refresh_refs(
+                config, principal, chat_request.model, driver_id
+            )
+        )
     binding = resolve_model(
         config=config,
         registry=registry,

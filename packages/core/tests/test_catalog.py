@@ -11,7 +11,10 @@ from cli_provider_core import (
     NotFound,
     RunnerUnavailable,
     UnsupportedCapability,
+    alias_refresh_refs,
+    catalog_refresh_refs,
     catalog_view,
+    models_refresh_refs,
     request_hash,
     resolve_model,
 )
@@ -560,3 +563,317 @@ async def test_empty_catalog_remains_legitimate(tmp_path):
             alias="mock/mock-effort",
         )
     store.close()
+
+
+# ------------------------------ r2: catalog-grant task-policy coherence (1)
+
+
+def _variant_system(tmp_path, *, source_policy="text", grants=None):
+    """Static mock/text (policy 'text') whose mock-model maps effort 'high'
+    to the catalog-only mock-ungranted; the catalog source policy varies."""
+    source = dict(
+        CATALOGS[0], task_policy=source_policy,
+    )
+    overrides = _overrides()
+    overrides["catalogs"] = [source]
+    if grants is not None:
+        overrides["principals"][0].update(grants)
+    config, store, registry, _c, control = make_system(tmp_path, **overrides)
+    control.models = VARIANT_ROWS
+    return config, store, registry
+
+
+async def test_static_variant_catalog_grant_must_match_task_policy(tmp_path):
+    """A catalog source under a DIFFERENT task policy cannot lend its
+    execution grant to the static binding: authority never composes across
+    policies."""
+    # Broad source grant, differing policy -> denied.
+    config, store, registry = _variant_system(tmp_path, source_policy="review")
+    await registry.refresh()
+    with pytest.raises(UnsupportedCapability):
+        _resolve(config, registry, "mock/text", effort="high")
+    store.close()
+
+    # Exact-alias grant, differing policy -> still denied.
+    config, store, registry = _variant_system(
+        tmp_path / "b",
+        source_policy="review",
+        grants={
+            "executable_catalogs": [],
+            "allowed_presets": ["mock/text", "mock/mock-ungranted"],
+        },
+    )
+    await registry.refresh()
+    with pytest.raises(UnsupportedCapability):
+        _resolve(config, registry, "mock/text", effort="high")
+    store.close()
+
+
+async def test_static_variant_catalog_grant_same_policy_authorized(tmp_path):
+    """Positive controls: same task policy authorizes via both the broad
+    source grant and an exact dynamic alias grant."""
+    config, store, registry = _variant_system(tmp_path, source_policy="text")
+    await registry.refresh()
+    binding = _resolve(config, registry, "mock/text", effort="high")
+    assert binding.resolved_model_id == "mock-ungranted"
+    assert binding.preset.task_policy == "text"
+    store.close()
+
+    config, store, registry = _variant_system(
+        tmp_path / "b",
+        source_policy="text",
+        grants={
+            "executable_catalogs": [],
+            "allowed_presets": ["mock/text", "mock/mock-ungranted"],
+        },
+    )
+    await registry.refresh()
+    binding = _resolve(config, registry, "mock/text", effort="high")
+    assert binding.resolved_model_id == "mock-ungranted"
+    store.close()
+
+
+# -------------------------------------- r2: static alias shadow marker (2)
+
+
+def _shadow_system(tmp_path, **kwargs):
+    overrides = _overrides()
+    overrides.update(kwargs)
+    config, store, registry, _c, control = make_system(tmp_path, **overrides)
+    return config, store, registry, control
+
+
+async def test_catalog_view_marks_shadowed_row_non_executable(tmp_path):
+    """A dynamic row whose alias equals a static preset resolves to the
+    static authority — the catalog view must never advertise it as
+    executable under the source grant."""
+    config, store, registry, control = _shadow_system(tmp_path)
+    control.models = MODEL_ROWS + [_row("text")]  # alias 'mock/text' collides
+    await registry.refresh()
+
+    view = catalog_view(config, registry, _principal(config))
+    by_id = {m["model_id"]: m for m in view[0]["models"]}
+    shadowed = by_id["text"]
+    assert shadowed["alias"] == "mock/text"
+    assert shadowed["executable"] is False
+    assert "shadowed by a static preset" in shadowed["rejection"]
+
+    # The resolution itself still binds the static preset.
+    binding = _resolve(config, registry, "mock/text")
+    assert binding.dynamic is False
+    assert binding.preset.model_id == "mock-model"
+    # ...and a non-colliding dynamic row stays executable.
+    assert by_id["mock-effort"]["executable"] is True
+    store.close()
+
+
+async def test_disabled_static_preset_still_shadows(tmp_path):
+    """Shadowing follows alias identity, not enabled state: a disabled
+    static preset still owns the alias, so the dynamic row cannot claim it."""
+    presets = [
+        {
+            "alias": "mock/text",
+            "runner_ref": "runner-1",
+            "model_id": "mock-model",
+            "allow_synthetic_unverified": True,
+        },
+        {
+            "alias": "mock/ghost",
+            "runner_ref": "runner-1",
+            "model_id": "mock-model",
+            "enabled": False,
+            "allow_synthetic_unverified": True,
+        },
+    ]
+    overrides = _overrides()
+    overrides["presets"] = presets
+    overrides["principals"][0]["allowed_presets"] = ["mock/text", "mock/ghost"]
+    config, store, registry, _c, control = make_system(tmp_path, **overrides)
+    control.models = MODEL_ROWS + [_row("ghost")]
+    await registry.refresh()
+    view = catalog_view(config, registry, _principal(config))
+    by_id = {m["model_id"]: m for m in view[0]["models"]}
+    assert by_id["ghost"]["executable"] is False
+    assert "shadowed by a static preset" in by_id["ghost"]["rejection"]
+    # Resolution never falls through to the dynamic row.
+    with pytest.raises(RunnerUnavailable):
+        _resolve(config, registry, "mock/ghost")
+    store.close()
+
+
+# -------------------------------------- r2: scoped per-runner refresh (3)
+
+from cli_provider_core import RunnerRegistry
+from conftest import FakeControl, FakeSession
+
+
+def _two_runner_system(tmp_path, *, principals=None, catalogs=None):
+    """Two counted fake runners: controls[i].discovery_calls is the RPC
+    count for that runner's verification pass."""
+    overrides = _overrides()
+    overrides["runners"] = [
+        {
+            "instance_id": "runner-1",
+            "driver_id": "mock",
+            "driver_version": "0.1.0",
+            "distribution": "cli-driver-mock",
+            "socket_path": str(tmp_path / "r1.sock"),
+        },
+        {
+            "instance_id": "runner-2",
+            "driver_id": "mock",
+            "driver_version": "0.1.0",
+            "distribution": "cli-driver-mock",
+            "socket_path": str(tmp_path / "r2.sock"),
+        },
+    ]
+    overrides["catalogs"] = catalogs or [
+        {
+            "name": "src-a",
+            "runner_ref": "runner-1",
+            "alias_prefix": "mock/",
+            "allow_synthetic_unverified": True,
+        },
+        {
+            "name": "src-b",
+            "runner_ref": "runner-2",
+            "alias_prefix": "aux/",
+            "allow_synthetic_unverified": True,
+        },
+    ]
+    if principals is not None:
+        overrides["principals"] = principals
+    else:
+        overrides["principals"][0].update(
+            {
+                "allowed_catalogs": ["src-a", "src-b"],
+                "executable_catalogs": ["src-a", "src-b"],
+            }
+        )
+    config, store, _registry, _c, _shared = make_system(tmp_path, **overrides)
+    controls = {"runner-1": FakeControl(), "runner-2": FakeControl()}
+    registry = RunnerRegistry(
+        config,
+        session_factory=lambda cfg: FakeSession(cfg, controls[cfg.instance_id]),
+    )
+    for c in controls.values():
+        c.models = MODEL_ROWS
+    return config, store, registry, controls
+
+
+async def test_scoped_refresh_contacts_only_named_runners(tmp_path):
+    config, store, registry, controls = _two_runner_system(tmp_path)
+    await registry.ensure_fresh(runner_refs={"runner-1"})
+    assert controls["runner-1"].discovery_calls == 1
+    assert controls["runner-2"].discovery_calls == 0
+    # Runner-2 was never attempted: no freshness mark, snapshot untouched.
+    assert registry.runner_health("runner-2").observed_monotonic is None
+    store.close()
+
+
+async def test_partial_refresh_does_not_mark_other_runner_fresh(tmp_path):
+    """After A refreshes, B is still stale and gets its own pass."""
+    config, store, registry, controls = _two_runner_system(tmp_path)
+    await registry.ensure_fresh(runner_refs={"runner-1"})
+    await registry.ensure_fresh(runner_refs={"runner-2"})
+    assert controls["runner-1"].discovery_calls == 1
+    assert controls["runner-2"].discovery_calls == 1
+    store.close()
+
+
+async def test_scoped_refresh_ttl_singleflight_and_force(tmp_path):
+    """Per-runner TTL: a second in-window call is a no-op; concurrent calls
+    share the guard; force bypasses the TTL for the named runner only."""
+    config, store, registry, controls = _two_runner_system(tmp_path)
+    await registry.ensure_fresh(runner_refs={"runner-1"})
+    await registry.ensure_fresh(runner_refs={"runner-1"})
+    assert controls["runner-1"].discovery_calls == 1
+
+    await asyncio.gather(
+        registry.ensure_fresh(runner_refs={"runner-1"}),
+        registry.ensure_fresh(runner_refs={"runner-1"}),
+    )
+    assert controls["runner-1"].discovery_calls == 1
+
+    await registry.ensure_fresh(runner_refs={"runner-1"}, force=True)
+    assert controls["runner-1"].discovery_calls == 2
+    assert controls["runner-2"].discovery_calls == 0
+    store.close()
+
+
+async def test_global_refresh_still_covers_all_runners(tmp_path):
+    """The internal startup/global path is preserved: no scope -> everyone."""
+    config, store, registry, controls = _two_runner_system(tmp_path)
+    await registry.ensure_fresh()
+    assert controls["runner-1"].discovery_calls == 1
+    assert controls["runner-2"].discovery_calls == 1
+    store.close()
+
+
+# ------------------------------------------------- refresh-scope helpers
+
+
+def test_alias_refresh_refs_scope(tmp_path):
+    """The request-scoped refs mirror resolution: granted static -> its
+    runner; granted dynamic -> the source runner; denied/unknown -> empty."""
+    config, store, registry, _controls = _two_runner_system(tmp_path)
+    alpha = _principal(config)
+    assert alias_refresh_refs(config, alpha, "mock/text") == {"runner-1"}
+    assert alias_refresh_refs(config, alpha, "mock/mock-effort") == {"runner-1"}
+    assert alias_refresh_refs(config, alpha, "aux/mock-effort") == {"runner-2"}
+    # Unknown alias, denied dynamic alias, denied static -> no runner work.
+    assert alias_refresh_refs(config, alpha, "bogus/x") == set()
+    assert alias_refresh_refs(config, alpha, "mock/text-beta") == set()
+    # driver_scope filters statically and dynamically.
+    assert (
+        alias_refresh_refs(config, alpha, "mock/text", driver_scope="agy")
+        == set()
+    )
+    assert (
+        alias_refresh_refs(config, alpha, "aux/mock-effort", driver_scope="mock")
+        == {"runner-2"}
+    )
+    store.close()
+
+
+def test_catalog_and_models_refresh_refs_scope(tmp_path):
+    config, store, registry, _controls = _two_runner_system(
+        tmp_path,
+        principals=[
+            {
+                "name": "alpha",
+                "key_hash": hash_api_key("secret-alpha"),
+                "allowed_presets": ["mock/text"],
+                "allowed_workspaces": ["ws-alpha"],
+                "allowed_catalogs": ["src-a"],   # read-only A
+                "executable_catalogs": ["src-b"],  # exec B (implies read)
+                "max_concurrency": 2,
+            }
+        ],
+    )
+    alpha = _principal(config)
+    assert catalog_refresh_refs(config, alpha) == {"runner-1", "runner-2"}
+    assert catalog_refresh_refs(config, alpha, driver_scope="nope") == set()
+    # /v1/models needs exec-capable sources + held static presets, not
+    # read-only ones: runner-2 (exec B) + runner-1 (static mock/text).
+    assert models_refresh_refs(config, alpha) == {"runner-1", "runner-2"}
+    store.close()
+
+    # A key with only a static grant and no catalogs refreshes just its
+    # preset runner.
+    config2, store2, _r2, _c2 = _two_runner_system(
+        tmp_path / "b",
+        principals=[
+            {
+                "name": "alpha",
+                "key_hash": hash_api_key("secret-alpha"),
+                "allowed_presets": ["mock/text"],
+                "allowed_workspaces": ["ws-alpha"],
+                "max_concurrency": 2,
+            }
+        ],
+    )
+    alpha2 = _principal(config2)
+    assert catalog_refresh_refs(config2, alpha2) == set()
+    assert models_refresh_refs(config2, alpha2) == {"runner-1"}
+    store2.close()

@@ -47,9 +47,12 @@ class MockSystem:
     gamma_key: str = "local-gamma-key"
     config_overrides: dict[str, Any] = field(default_factory=dict)
     runner_env: dict[str, str] = field(default_factory=dict)
+    runner2: bool = False
+    runner2_env: dict[str, str] = field(default_factory=dict)
     port: int = 0
     api_proc: subprocess.Popen | None = None
     runner_proc: subprocess.Popen | None = None
+    runner2_proc: subprocess.Popen | None = None
     _log: Any = None
     _config_path: str = ""
     _extra_apis: list = field(default_factory=list)
@@ -61,6 +64,10 @@ class MockSystem:
     @property
     def socket_path(self) -> str:
         return os.path.join(self.root, "runner.sock")
+
+    @property
+    def socket2_path(self) -> str:
+        return os.path.join(self.root, "runner2.sock")
 
     def _config(self) -> dict[str, Any]:
         config = {
@@ -89,7 +96,21 @@ class MockSystem:
                     "socket_path": self.socket_path,
                     "connect_timeout_seconds": 5.0,
                 }
-            ],
+            ]
+            + (
+                [
+                    {
+                        "instance_id": "runner-2",
+                        "driver_id": "mock",
+                        "driver_version": "0.1.0",
+                        "distribution": "cli-driver-mock",
+                        "socket_path": self.socket2_path,
+                        "connect_timeout_seconds": 5.0,
+                    }
+                ]
+                if self.runner2
+                else []
+            ),
             "presets": [
                 {
                     "alias": "mock/text",
@@ -154,19 +175,18 @@ class MockSystem:
         env["CLI_DRIVER_MOCK_BEHAVIOR"] = self.behavior
         env.update(self.runner_env)
 
-        self.runner_proc = subprocess.Popen(
-            [
-                sys.executable, "-m", "cli_provider_runner", "serve",
-                "--socket", self.socket_path,
-                "--instance-id", "runner-1",
-                "--driver-id", "mock",
-                "--distribution", "cli-driver-mock",
-                "--version", "0.1.0",
-            ],
-            cwd=REPO_ROOT, env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        self.runner_proc = self._spawn_runner(
+            "runner-1", self.socket_path, env
         )
-        self._wait_for_socket()
+        self._wait_for_socket(self.runner_proc, self.socket_path)
+        if self.runner2:
+            env2 = os.environ.copy()
+            env2["CLI_DRIVER_MOCK_BEHAVIOR"] = self.behavior
+            env2.update(self.runner2_env)
+            self.runner2_proc = self._spawn_runner(
+                "runner-2", self.socket2_path, env2
+            )
+            self._wait_for_socket(self.runner2_proc, self.socket2_path)
 
         self._log = open(os.path.join(self.root, "api.log"), "w", encoding="utf-8")
         self.api_proc = subprocess.Popen(
@@ -247,16 +267,35 @@ class MockSystem:
                 time.sleep(0.1)
         raise TimeoutError("api never became ready")
 
-    def _wait_for_socket(self, timeout: float = 20.0) -> None:
+    @staticmethod
+    def _spawn_runner(
+        instance_id: str, socket_path: str, env: dict[str, str]
+    ) -> subprocess.Popen:
+        return subprocess.Popen(
+            [
+                sys.executable, "-m", "cli_provider_runner", "serve",
+                "--socket", socket_path,
+                "--instance-id", instance_id,
+                "--driver-id", "mock",
+                "--distribution", "cli-driver-mock",
+                "--version", "0.1.0",
+            ],
+            cwd=REPO_ROOT, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+
+    def _wait_for_socket(
+        self, proc: subprocess.Popen, socket_path: str, timeout: float = 20.0
+    ) -> None:
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if self.runner_proc is not None and self.runner_proc.poll() is not None:
-                err = self.runner_proc.stderr.read() if self.runner_proc.stderr else ""
+            if proc.poll() is not None:
+                err = proc.stderr.read() if proc.stderr else ""
                 raise RuntimeError(f"runner exited early: {err.strip()}")
-            if os.path.exists(self.socket_path):
+            if os.path.exists(socket_path):
                 probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 try:
-                    probe.connect(self.socket_path)
+                    probe.connect(socket_path)
                     return
                 except OSError:
                     pass
@@ -299,7 +338,7 @@ class MockSystem:
                     proc.wait(timeout=5)
             if not log.closed:
                 log.close()
-        for proc in (self.api_proc, self.runner_proc):
+        for proc in (self.api_proc, self.runner_proc, self.runner2_proc):
             if proc is None:
                 continue
             if proc.poll() is None:

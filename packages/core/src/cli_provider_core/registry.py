@@ -119,7 +119,10 @@ class RunnerRegistry:
         }
         self._lock = asyncio.Lock()
         self._refresh_guard = asyncio.Lock()
-        self._last_refresh_monotonic: float | None = None
+        # Per-runner last-refresh-attempt marks: a scoped refresh must never
+        # mark an untouched runner fresh, and one runner's TTL is independent
+        # of another's.
+        self._fresh_marks: dict[str, float] = {}
 
     # ------------------------------------------------------------- snapshot
 
@@ -211,43 +214,69 @@ class RunnerRegistry:
 
     # ------------------------------------------------------------ verifying
 
-    async def refresh(self) -> dict[str, RunnerHealth]:
-        """Probe every configured runner and verify preset model bindings."""
+    async def refresh(
+        self, runner_refs: set[str] | None = None
+    ) -> dict[str, RunnerHealth]:
+        """Probe runners and verify preset model bindings.
+
+        ``runner_refs=None`` (the startup path) verifies every configured
+        runner; a set restricts the pass to those instance ids — untouched
+        runners keep their snapshot and freshness mark. Each attempted
+        runner gets its own mark, so a scoped pass can never refresh-stamp
+        a runner it did not contact.
+        """
         async with self._lock:
+            now = time.monotonic()
             for runner in self._config.runners:
+                if runner_refs is not None and runner.instance_id not in runner_refs:
+                    continue
                 health = self._runners[runner.instance_id]
                 if not runner.enabled:
                     health.ok = False
                     health.detail = "disabled by operator config"
-                    continue
-                await self._verify_runner(runner, health)
+                else:
+                    await self._verify_runner(runner, health)
+                self._fresh_marks[runner.instance_id] = now
+            # Preset health is derived state; re-deriving it from the current
+            # runner snapshots is idempotent for runners this pass skipped.
             for preset in self._config.presets:
                 self._verify_preset(preset)
-            self._last_refresh_monotonic = time.monotonic()
         return self._runners
 
-    async def ensure_fresh(self, *, force: bool = False) -> None:
+    def _fresh_within_ttl(self, instance_id: str) -> bool:
+        mark = self._fresh_marks.get(instance_id)
+        ttl = self._config.api.catalog_refresh_seconds
+        return mark is not None and (time.monotonic() - mark) < ttl
+
+    async def ensure_fresh(
+        self, runner_refs: set[str] | None = None, *, force: bool = False
+    ) -> None:
         """Bounded singleflight TTL refresh for catalog-aware read paths.
 
-        At most one refresh pass runs per ``api.catalog_refresh_seconds``
-        interval; concurrent callers queue on the guard and the first
-        completed refresh satisfies them all, so a burst of reads or dynamic
-        alias resolutions can never spawn a discovery storm.
+        ``runner_refs`` scopes the pass: only those runners are probed, so a
+        narrowly-authorized request can never trigger discovery RPCs on
+        unrelated runners. Per runner, at most one pass runs per
+        ``api.catalog_refresh_seconds`` interval; concurrent callers queue on
+        the guard and re-check their own stale set, so a burst of reads can
+        never spawn a per-request discovery storm.
         """
-        ttl = self._config.api.catalog_refresh_seconds
-        fresh = (
-            self._last_refresh_monotonic is not None
-            and (time.monotonic() - self._last_refresh_monotonic) < ttl
+        refs = (
+            {r.instance_id for r in self._config.runners}
+            if runner_refs is None
+            else set(runner_refs)
         )
-        if fresh and not force:
+        if not force and refs and all(
+            self._fresh_within_ttl(ref) for ref in refs
+        ):
             return
         async with self._refresh_guard:
-            fresh = (
-                self._last_refresh_monotonic is not None
-                and (time.monotonic() - self._last_refresh_monotonic) < ttl
+            targets = (
+                refs
+                if force
+                else {ref for ref in refs if not self._fresh_within_ttl(ref)}
             )
-            if not fresh or force:
-                await self.refresh()
+            if targets:
+                await self.refresh(targets)
 
     async def _verify_runner(self, runner: RunnerConfig, health: RunnerHealth) -> None:
         session = self._session_factory(runner)

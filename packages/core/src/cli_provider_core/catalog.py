@@ -223,7 +223,8 @@ def _resolve_static(
         if _preset_target_authorized(config, principal, preset, model_id):
             return True, None
         if _catalog_target_authorized(
-            config, principal, preset.runner_ref, health, target
+            config, principal, preset.runner_ref, preset.task_policy,
+            health, target
         ):
             return True, None
         return False, (
@@ -280,17 +281,25 @@ def _catalog_target_authorized(
     config: OperatorConfig,
     principal: PrincipalConfig,
     runner_ref: str,
+    task_policy: str,
     health: RunnerHealth | None,
     target: dict[str, Any],
 ) -> bool:
-    """An enabled catalog source on the same runner admits the target and the
-    principal holds an execution grant for it (source model/cost policy still
-    applies)."""
+    """An enabled catalog source on the same runner under the SAME task
+    policy admits the target and the principal holds an execution grant for
+    it (source model/cost policy still applies).
+
+    The task-policy equality matters: the static binding keeps its own
+    policy, so a source authorized under a different policy can never lend
+    its grant to this binding.
+    """
     if health is None:
         return False
     model_id = target["model_id"]
     for source in config.catalogs:
         if not source.enabled or source.runner_ref != runner_ref:
+            continue
+        if source.task_policy != task_policy:
             continue
         if not principal_may_execute(principal, source, source.alias_prefix + model_id):
             continue
@@ -404,6 +413,7 @@ def catalog_view(
     """Authenticated discovery view, scoped to the principal's read grants."""
     entries: list[dict[str, Any]] = []
     runners = config.runner_map()
+    static_aliases = set(config.preset_map())
     for source in config.catalogs:
         if not source.enabled or not principal_may_read(principal, source):
             continue
@@ -414,7 +424,9 @@ def catalog_view(
             continue
         health = registry.runner_health(source.runner_ref)
         entries.append(
-            _source_view(source, runner, health, registry, principal)
+            _source_view(
+                source, runner, health, registry, principal, static_aliases
+            )
         )
     return entries
 
@@ -425,6 +437,7 @@ def _source_view(
     health: RunnerHealth | None,
     registry: RunnerRegistry,
     principal: PrincipalConfig,
+    static_aliases: set[str],
 ) -> dict[str, Any]:
     models: list[dict[str, Any]] = []
     descriptors = health.model_descriptors if health is not None else {}
@@ -432,6 +445,10 @@ def _source_view(
     for model_id in sorted(descriptors):
         descriptor = descriptors[model_id]
         alias = source.alias_prefix + model_id
+        # A static preset of the same alias always wins resolution — a
+        # dynamic row must never advertise itself as executable while the
+        # alias actually binds a different (static) authority.
+        shadowed = alias in static_aliases
         admitted, reason = (
             source_admits(
                 source, descriptor, synthetic_runner=health.synthetic
@@ -442,6 +459,7 @@ def _source_view(
         executable = bool(
             admitted
             and runner_ok
+            and not shadowed
             and principal_may_execute(principal, source, alias)
         )
         entry = dict(descriptor)
@@ -451,7 +469,12 @@ def _source_view(
         entry["alias"] = alias
         entry["admitted"] = admitted
         entry["executable"] = executable
-        if executable:
+        if shadowed:
+            entry["rejection"] = (
+                "alias is shadowed by a static preset; the static binding "
+                "resolves this alias"
+            )
+        elif executable:
             entry["rejection"] = None
         elif not admitted:
             entry["rejection"] = reason
@@ -475,6 +498,109 @@ def _source_view(
         "refresh_seconds": registry.catalog_refresh_seconds,
         "models": models,
     }
+
+
+def catalog_refresh_refs(
+    config: OperatorConfig,
+    principal: PrincipalConfig,
+    driver_scope: str | None = None,
+) -> set[str]:
+    """Runners whose catalogs this principal may read in this scope.
+
+    The catalog endpoint refreshes exactly these runners — a caller that can
+    read nothing causes zero discovery RPCs.
+    """
+    runners = config.runner_map()
+    refs: set[str] = set()
+    for source in config.catalogs:
+        if not source.enabled or not principal_may_read(principal, source):
+            continue
+        runner = runners.get(source.runner_ref)
+        if runner is None:
+            continue
+        if driver_scope is not None and runner.driver_id != driver_scope:
+            continue
+        refs.add(runner.instance_id)
+    return refs
+
+
+def models_refresh_refs(
+    config: OperatorConfig,
+    principal: PrincipalConfig,
+    driver_scope: str | None = None,
+) -> set[str]:
+    """Runners that could contribute ``/v1/models`` entries for this
+    principal: runners of enabled static presets the principal holds, plus
+    runners of catalog sources the principal could execute through (a
+    source-wide grant or an exact alias grant under the prefix)."""
+    runners = config.runner_map()
+    refs: set[str] = set()
+    for preset in config.presets:
+        if not preset.enabled or preset.alias not in principal.allowed_presets:
+            continue
+        runner = runners.get(preset.runner_ref)
+        if runner is None:
+            continue
+        if driver_scope is not None and runner.driver_id != driver_scope:
+            continue
+        refs.add(runner.instance_id)
+    for source in config.catalogs:
+        if not source.enabled:
+            continue
+        runner = runners.get(source.runner_ref)
+        if runner is None:
+            continue
+        if driver_scope is not None and runner.driver_id != driver_scope:
+            continue
+        if source.name in principal.executable_catalogs or any(
+            granted.startswith(source.alias_prefix)
+            for granted in principal.allowed_presets
+        ):
+            refs.add(runner.instance_id)
+    return refs
+
+
+def alias_refresh_refs(
+    config: OperatorConfig,
+    principal: PrincipalConfig,
+    alias: str,
+    driver_scope: str | None = None,
+) -> set[str]:
+    """The runners a single request-alias resolution may consult.
+
+    Mirrors ``resolve_model``: a static preset resolves on its own runner
+    (effort variants re-derive against the same runner's catalog); a dynamic
+    alias resolves on its source's runner — but only when the principal's
+    execution grant would pass, so denied or unknown aliases cause zero
+    discovery RPCs.
+    """
+    runners = config.runner_map()
+    preset = config.preset_map().get(alias)
+    if preset is not None:
+        if preset.alias not in principal.allowed_presets:
+            return set()
+        runner = runners.get(preset.runner_ref)
+        if runner is None or (
+            driver_scope is not None and runner.driver_id != driver_scope
+        ):
+            return set()
+        return {runner.instance_id}
+    refs: set[str] = set()
+    for source in config.catalogs:
+        if not source.enabled or not alias.startswith(source.alias_prefix):
+            continue
+        tail = alias[len(source.alias_prefix) :]
+        if not tail or _ID.match(tail) is None:
+            continue
+        runner = runners.get(source.runner_ref)
+        if runner is None or (
+            driver_scope is not None and runner.driver_id != driver_scope
+        ):
+            continue
+        if not principal_may_execute(principal, source, alias):
+            continue
+        refs.add(runner.instance_id)
+    return refs
 
 
 def dynamic_model_entries(

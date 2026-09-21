@@ -78,12 +78,17 @@ Grant semantics:
   the runner not-ok and authorizes nothing — the last good snapshot remains
   visible with `stale: true`/`ok: false`.
 
-Refresh is bounded and singleflight: at most one discovery pass per
-`catalog_refresh_seconds` window regardless of request rate, and concurrent
-callers share one pass. Each pass performs a genuinely fresh driver read —
-the driver's own TTL is only a bound on the internal execution-admission
-cache, so a registry refresh never re-stamps stale membership as newly
-observed. Additions and removals become visible after the API TTL without a
+Refresh is bounded, scoped, and singleflight: each runner has its own
+`catalog_refresh_seconds` TTL, at most one pass per window regardless of
+request rate, and concurrent callers share the guard. Request paths refresh
+only the runners the caller could actually bind or read — the catalog
+endpoint refreshes readable in-scope sources, `/v1/models` refreshes
+entry-producing runners, and chat refreshes only the runner the resolved
+alias may bind (a denied or unknown alias triggers zero discovery RPCs).
+A scoped pass never marks an untouched runner fresh. Each pass performs a
+genuinely fresh driver read — the driver's own TTL is only a bound on the
+internal execution-admission cache, so a registry refresh never re-stamps
+stale membership as newly observed. Additions and removals become visible after the API TTL without a
 restart; in-flight and durable attempts are never replayed or invalidated
 by a removal (idempotency is durable in the Store).
 
@@ -131,9 +136,11 @@ catalog rows today report `effort: unknown` and reject effort requests:
   alias the target is re-admitted under the catalog source's model/cost
   policy and the same principal grant; for a static preset the target must
   be bound by an enabled preset this principal holds on the same runner
-  under the same task policy, or admitted by an enabled catalog source the
-  principal may execute through. Catalog membership or the driver's
-  `executable` flag alone never authorizes a cross-model hop.
+  under the same task policy, or admitted by an enabled catalog source —
+  under the **same task policy** — that the principal may execute through.
+  Catalog membership or the driver's `executable` flag alone never
+  authorizes a cross-model hop, and a grant never composes across task
+  policies.
 - The resolved binding flows through `RunParams.reasoning_effort` +
   `RunParams.resolved_model` to the driver, which re-derives the target from
   its *own* catalog and refuses a mismatch. `run.model` in the response and
@@ -227,4 +234,11 @@ See its docstring for usage.
 - Catalog visibility requires a verified runner snapshot; a runner that has
   never verified shows an `ok: false` source with no models.
 - Dynamic aliases live only under a configured `alias_prefix`; static preset
-  names win on collision (the dynamic entry is suppressed in `/v1/models`).
+  names win on collision — unconditionally, including when the static preset
+  is disabled or bound to a different runner/model/task policy. `resolve_model`
+  always takes the static path first, `/v1/models` suppresses the dynamic
+  duplicate, and the catalog endpoint reports the row with
+  `executable: false` and a `rejection` explaining the alias is shadowed by
+  a static preset. A shadowed row's `admitted`/`driver_executable` flags
+  still describe the source/driver view, but the alias can never bind the
+  dynamic row — the static preset's own grant decides execution.

@@ -12,6 +12,7 @@ from cli_provider_core import (
     PrincipalConfig,
     RunnerRegistry,
     dynamic_model_entries,
+    models_refresh_refs,
 )
 
 from .auth import authenticate
@@ -73,7 +74,9 @@ async def list_models(request: Request) -> dict[str, Any]:
     config: OperatorConfig = request.app.state.config
     registry: RunnerRegistry = request.app.state.registry
     if config.catalogs:
-        await registry.ensure_fresh()
+        await registry.ensure_fresh(
+            runner_refs=models_refresh_refs(config, principal, None)
+        )
     return {"object": "list", "data": _entries(config, registry, principal, None)}
 
 
@@ -84,7 +87,9 @@ async def list_models_scoped(request: Request, driver_id: str) -> dict[str, Any]
     registry: RunnerRegistry = request.app.state.registry
     _assert_driver_scope_known(config, registry, driver_id)
     if config.catalogs:
-        await registry.ensure_fresh()
+        await registry.ensure_fresh(
+            runner_refs=models_refresh_refs(config, principal, driver_id)
+        )
     return {
         "object": "list",
         "data": _entries(config, registry, principal, driver_id),
