@@ -70,7 +70,13 @@ Grant semantics:
   source's own `models`/`cost_tiers` filters it admits future catalog
   entries without new config — that is the point of the feature. A
   conservative deployment omits it and grants individual aliases via
-  `allowed_presets` (exact strings; there is no wildcard syntax).
+  `allowed_presets` (exact strings; there is no wildcard syntax). An exact
+  `allowed_presets` string is owned by one authority only: when the string
+  names a configured static preset it is a grant for **that preset's
+  binding** and is never reinterpreted as a dynamic-catalog grant for a
+  catalog row that shares the alias. Only an explicit `executable_catalogs`
+  grant — which names the source, not an alias — authorizes a shadowed
+  source row.
 - A dynamic alias additionally requires a verified runner snapshot
   (`health.ok`), a `passed` descriptor verification (or the explicit
   synthetic opt-in), the driver's own `executable` admission, and the
@@ -85,7 +91,12 @@ only the runners the caller could actually bind or read — the catalog
 endpoint refreshes readable in-scope sources, `/v1/models` refreshes
 entry-producing runners, and chat refreshes only the runner the resolved
 alias may bind (a denied or unknown alias triggers zero discovery RPCs).
-A scoped pass never marks an untouched runner fresh. Each pass performs a
+A scoped pass never marks an untouched runner fresh, and a runner's
+freshness is recorded when its verification attempt *finishes* — so a slow
+verify that outlasts the TTL still counts as one shared attempt for
+concurrent callers. Scoped passes leave skipped runners entirely
+untouched: health, freshness mark, and derived preset health are all
+preserved, and an empty scope performs no work at all. Each pass performs a
 genuinely fresh driver read — the driver's own TTL is only a bound on the
 internal execution-admission cache, so a registry refresh never re-stamps
 stale membership as newly observed. Additions and removals become visible after the API TTL without a
@@ -139,8 +150,9 @@ catalog rows today report `effort: unknown` and reject effort requests:
   under the same task policy, or admitted by an enabled catalog source —
   under the **same task policy** — that the principal may execute through.
   Catalog membership or the driver's `executable` flag alone never
-  authorizes a cross-model hop, and a grant never composes across task
-  policies.
+  authorizes a cross-model hop, a grant never composes across task
+  policies, and an exact grant string that a static preset owns lends no
+  authority to the shadowed catalog row — even as a variant target.
 - The resolved binding flows through `RunParams.reasoning_effort` +
   `RunParams.resolved_model` to the driver, which re-derives the target from
   its *own* catalog and refuses a mismatch. `run.model` in the response and
@@ -241,4 +253,10 @@ See its docstring for usage.
   `executable: false` and a `rejection` explaining the alias is shadowed by
   a static preset. A shadowed row's `admitted`/`driver_executable` flags
   still describe the source/driver view, but the alias can never bind the
-  dynamic row — the static preset's own grant decides execution.
+  dynamic row — the static preset's own grant decides execution. The same
+  ownership rule applies to grant interpretation everywhere: an
+  `allowed_presets` string that a static preset owns authorizes that preset
+  only, so it cannot admit the shadowed row directly, cannot admit it as an
+  effort-variant target, and cannot cause a refresh of a catalog runner that
+  could only contribute that shadowed row. `executable_catalogs` remains
+  the explicit, source-bound way to execute such a row.

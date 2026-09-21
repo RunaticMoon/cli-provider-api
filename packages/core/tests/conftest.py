@@ -120,6 +120,8 @@ class FakeControl:
     models: list[dict[str, Any]] | None = None
     discovery_calls: int = 0
     discovery_fail: bool = False
+    # Simulated slow verification for singleflight-under-slow-pass tests.
+    discovery_delay_seconds: float = 0.0
 
 
 class FakeSession:
@@ -167,6 +169,8 @@ class FakeSession:
 
     async def discover_models(self) -> list[dict[str, Any]]:
         self.control.discovery_calls += 1
+        if self.control.discovery_delay_seconds:
+            await asyncio.sleep(self.control.discovery_delay_seconds)
         if self.control.discovery_fail:
             raise RuntimeError("fake catalog read failed")
         if self.control.models is not None:

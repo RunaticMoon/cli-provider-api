@@ -903,3 +903,93 @@ def test_catalog_shadowed_row_is_not_executable(system_factory, tmp_path):
         response = _chat(client, "mock/text", task_id="task-shadow")
     assert response.status_code == 200, response.text
     assert response.json()["run"]["model"]["dynamic"] is False
+
+
+
+def test_shadowed_exact_grant_cannot_authorize_variant(system_factory, tmp_path):
+    """A static-owned exact allowed_presets string must not act as a dynamic
+    grant for the catalog row of the same name — for BOTH a static base and a
+    dynamic base variant hop (r3 HIGH)."""
+    catalog_file = tmp_path / "shadow-catalog.json"
+    _write_catalog(
+        catalog_file,
+        [
+            {
+                "model_id": "mock-model",
+                "display_name": "Mock Model",
+                "effort": "model_variant",
+                "effort_variants": {"high": "ungranted"},
+            },
+            {
+                "model_id": "ungranted",
+                "display_name": "Ungranted",
+            },
+        ],
+    )
+    principals = [
+        {
+            "name": "alpha",
+            "key_hash": hash_api_key("local-alpha-key"),
+            # 'mock/ungranted' is a STATIC preset below — the same string must
+            # not be reinterpreted as a dynamic-catalog grant.
+            "allowed_presets": ["mock/text", "mock/ungranted", "mock/mock-model"],
+            "allowed_workspaces": ["ws-alpha"],
+            "allowed_catalogs": ["mock-catalog"],
+            "executable_catalogs": [],
+            "max_concurrency": 2,
+        }
+    ]
+    presets = [
+        {
+            "alias": "mock/text",
+            "runner_ref": "runner-1",
+            "model_id": "mock-model",
+            "allow_synthetic_unverified": True,
+        },
+        {
+            # Static preset owns the 'mock/ungranted' alias but binds a
+            # DIFFERENT physical model — the grant means this preset, not
+            # the catalog's 'ungranted' row.
+            "alias": "mock/ungranted",
+            "runner_ref": "runner-1",
+            "model_id": "mock-model",
+            "allow_synthetic_unverified": True,
+        },
+    ]
+    system = system_factory(
+        config_overrides={
+            "catalogs": [
+                {
+                    "name": "mock-catalog",
+                    "runner_ref": "runner-1",
+                    "alias_prefix": "mock/",
+                    "allow_synthetic_unverified": True,
+                }
+            ],
+            "principals": principals,
+            "presets": presets,
+        },
+        runner_env={"CLI_DRIVER_MOCK_CATALOG_FILE": str(catalog_file)},
+    )
+    with system.client() as client:
+        # Positive control: the static preset still authorizes and runs its
+        # own physical model.
+        resp = _chat(client, "mock/ungranted", task_id="task-sh-1")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["run"]["model"]["resolved_model"] == "mock-model"
+        # Static-base variant hop must NOT be admitted by the shadowed grant.
+        resp = _chat(
+            client, "mock/text", reasoning_effort="high", task_id="task-sh-2"
+        )
+        assert resp.status_code == 422, resp.text
+        # Dynamic-base variant hop (mock/mock-model is a legitimate
+        # non-shadowed exact grant) must NOT be admitted either.
+        resp = _chat(client, "mock/mock-model", task_id="task-sh-3")
+        assert resp.status_code == 200, resp.text
+        resp = _chat(
+            client,
+            "mock/mock-model",
+            reasoning_effort="high",
+            task_id="task-sh-4",
+        )
+        assert resp.status_code == 422, resp.text

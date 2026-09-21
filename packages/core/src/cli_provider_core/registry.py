@@ -226,7 +226,6 @@ class RunnerRegistry:
         a runner it did not contact.
         """
         async with self._lock:
-            now = time.monotonic()
             for runner in self._config.runners:
                 if runner_refs is not None and runner.instance_id not in runner_refs:
                     continue
@@ -236,10 +235,17 @@ class RunnerRegistry:
                     health.detail = "disabled by operator config"
                 else:
                     await self._verify_runner(runner, health)
-                self._fresh_marks[runner.instance_id] = now
-            # Preset health is derived state; re-deriving it from the current
-            # runner snapshots is idempotent for runners this pass skipped.
+                # The mark records when this runner's attempt FINISHED. A
+                # slow verify that outlasts the TTL must still count as one
+                # completed attempt for concurrent waiters — marking before
+                # the attempt would look stale the moment the guard opens.
+                self._fresh_marks[runner.instance_id] = time.monotonic()
+            # Preset health is derived runner state: re-derive it only for
+            # presets bound to runners this pass touched, so a scoped
+            # refresh never mutates a skipped runner's derived presets.
             for preset in self._config.presets:
+                if runner_refs is not None and preset.runner_ref not in runner_refs:
+                    continue
                 self._verify_preset(preset)
         return self._runners
 

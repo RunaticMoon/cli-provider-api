@@ -82,13 +82,23 @@ def principal_may_read(principal: PrincipalConfig, source: CatalogSourceConfig) 
 
 
 def principal_may_execute(
-    principal: PrincipalConfig, source: CatalogSourceConfig, alias: str
+    principal: PrincipalConfig,
+    source: CatalogSourceConfig,
+    alias: str,
+    static_aliases: set[str],
 ) -> bool:
-    """Run gate: a source-wide execution grant or an exact approved alias."""
-    return (
-        source.name in principal.executable_catalogs
-        or alias in principal.allowed_presets
-    )
+    """Run gate: a source-wide execution grant or an exact approved alias.
+
+    An exact ``allowed_presets`` match counts only when the alias is NOT
+    owned by a configured static preset. A static-owned string names that
+    preset's own binding — it can never double as a dynamic-catalog grant
+    for the catalog row that happens to share the alias. Explicit
+    source-wide ``executable_catalogs`` grants are unambiguous: they bind
+    the source itself, so alias shadowing does not weaken them.
+    """
+    if source.name in principal.executable_catalogs:
+        return True
+    return alias in principal.allowed_presets and alias not in static_aliases
 
 
 def source_admits(
@@ -296,12 +306,15 @@ def _catalog_target_authorized(
     if health is None:
         return False
     model_id = target["model_id"]
+    static_aliases = set(config.preset_map())
     for source in config.catalogs:
         if not source.enabled or source.runner_ref != runner_ref:
             continue
         if source.task_policy != task_policy:
             continue
-        if not principal_may_execute(principal, source, source.alias_prefix + model_id):
+        if not principal_may_execute(
+            principal, source, source.alias_prefix + model_id, static_aliases
+        ):
             continue
         admitted, _reason = source_admits(
             source, target, synthetic_runner=health.synthetic
@@ -320,6 +333,7 @@ def _resolve_dynamic(
     driver_scope: str | None,
     effort: str | None,
 ) -> ModelBinding:
+    static_aliases = set(config.preset_map())
     for source in config.catalogs:
         if not source.enabled or not alias.startswith(source.alias_prefix):
             continue
@@ -335,7 +349,9 @@ def _resolve_dynamic(
             continue
         # The principal run gate is checked before any catalog detail is
         # consulted, so an unauthorized caller cannot probe model existence.
-        if not principal_may_execute(principal, source, alias):
+        if not principal_may_execute(
+            principal, source, alias, static_aliases
+        ):
             raise AuthorizationError(
                 "principal is not allowed to use this model"
             )
@@ -361,9 +377,10 @@ def _resolve_dynamic(
             if target is None:
                 return False, "variant is not present in the runner catalog"
             # The target alias needs the same principal run gate as the
-            # requested alias — a source-admitted row is not a grant.
+            # requested alias — a source-admitted row is not a grant, and a
+            # static-owned grant string is not dynamic authority.
             if not principal_may_execute(
-                principal, source, source.alias_prefix + model_id
+                principal, source, source.alias_prefix + model_id, static_aliases
             ):
                 return False, (
                     "effort variant target is not independently authorized "
@@ -460,7 +477,7 @@ def _source_view(
             admitted
             and runner_ok
             and not shadowed
-            and principal_may_execute(principal, source, alias)
+            and principal_may_execute(principal, source, alias, static_aliases)
         )
         entry = dict(descriptor)
         # The driver-reported admission is kept distinct from the endpoint's
@@ -534,6 +551,7 @@ def models_refresh_refs(
     runners of catalog sources the principal could execute through (a
     source-wide grant or an exact alias grant under the prefix)."""
     runners = config.runner_map()
+    static_aliases = set(config.preset_map())
     refs: set[str] = set()
     for preset in config.presets:
         if not preset.enabled or preset.alias not in principal.allowed_presets:
@@ -552,8 +570,11 @@ def models_refresh_refs(
             continue
         if driver_scope is not None and runner.driver_id != driver_scope:
             continue
+        # A static-owned grant string can never contribute a dynamic row for
+        # this source — do not refresh a runner on its behalf.
         if source.name in principal.executable_catalogs or any(
             granted.startswith(source.alias_prefix)
+            and granted not in static_aliases
             for granted in principal.allowed_presets
         ):
             refs.add(runner.instance_id)
@@ -575,6 +596,7 @@ def alias_refresh_refs(
     discovery RPCs.
     """
     runners = config.runner_map()
+    static_aliases = set(config.preset_map())
     preset = config.preset_map().get(alias)
     if preset is not None:
         if preset.alias not in principal.allowed_presets:
@@ -597,7 +619,7 @@ def alias_refresh_refs(
             driver_scope is not None and runner.driver_id != driver_scope
         ):
             continue
-        if not principal_may_execute(principal, source, alias):
+        if not principal_may_execute(principal, source, alias, static_aliases):
             continue
         refs.add(runner.instance_id)
     return refs
@@ -634,7 +656,7 @@ def dynamic_model_entries(
             if alias in static_aliases:
                 # A static preset with the same alias wins; never duplicate.
                 continue
-            if not principal_may_execute(principal, source, alias):
+            if not principal_may_execute(principal, source, alias, static_aliases):
                 continue
             descriptor = health.model_descriptors[model_id]
             admitted, _reason = source_admits(

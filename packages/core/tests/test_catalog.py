@@ -703,8 +703,8 @@ async def test_disabled_static_preset_still_shadows(tmp_path):
 
 # -------------------------------------- r2: scoped per-runner refresh (3)
 
-from cli_provider_core import RunnerRegistry
-from conftest import FakeControl, FakeSession
+from cli_provider_core import RunnerRegistry, Store
+from conftest import FakeControl, FakeSession, base_config
 
 
 def _two_runner_system(tmp_path, *, principals=None, catalogs=None):
@@ -877,3 +877,306 @@ def test_catalog_and_models_refresh_refs_scope(tmp_path):
     assert catalog_refresh_refs(config2, alpha2) == set()
     assert models_refresh_refs(config2, alpha2) == {"runner-1"}
     store2.close()
+
+
+# ----------------------- r3: shadowed exact-grant is not dynamic authority
+
+
+# Static owners of the shadowed alias: different model on the same runner,
+# an owner on ANOTHER runner, an owner under ANOTHER task policy, and a
+# DISABLED owner — none may lend dynamic authority to the catalog row.
+_SHADOW_OWNERS = {
+    "different-model": {
+        "alias": "mock/mock-ungranted",
+        "runner_ref": "runner-1",
+        "model_id": "mock-model",
+        "allow_synthetic_unverified": True,
+    },
+    "other-runner": {
+        "alias": "mock/mock-ungranted",
+        "runner_ref": "runner-1",  # replaced below in the two-runner case
+        "model_id": "mock-model",
+        "allow_synthetic_unverified": True,
+    },
+    "other-policy": {
+        "alias": "mock/mock-ungranted",
+        "runner_ref": "runner-1",
+        "model_id": "mock-ungranted",
+        "task_policy": "review",
+        "allow_synthetic_unverified": True,
+    },
+    "disabled": {
+        "alias": "mock/mock-ungranted",
+        "runner_ref": "runner-1",
+        "model_id": "mock-ungranted",
+        "enabled": False,
+        "allow_synthetic_unverified": True,
+    },
+}
+
+
+def _shadowed_grant_system(tmp_path, owner: str = "different-model"):
+    """Probe replica: 'mock/mock-ungranted' is a configured static preset
+    while the catalog source reports a real mock-ungranted row. The
+    principal holds only exact allowed_presets — no executable_catalogs."""
+    owner_preset = dict(_SHADOW_OWNERS[owner])
+    overrides = _overrides()
+    if owner == "other-runner":
+        overrides["runners"] = [
+            {
+                "instance_id": "runner-1",
+                "driver_id": "mock",
+                "driver_version": "0.1.0",
+                "distribution": "cli-driver-mock",
+                "socket_path": str(tmp_path / "r1.sock"),
+            },
+            {
+                "instance_id": "runner-2",
+                "driver_id": "mock",
+                "driver_version": "0.1.0",
+                "distribution": "cli-driver-mock",
+                "socket_path": str(tmp_path / "r2.sock"),
+            },
+        ]
+        owner_preset["runner_ref"] = "runner-2"
+    overrides["catalogs"] = [dict(CATALOGS[0], task_policy="text")]
+    overrides["presets"] = [
+        {
+            "alias": "mock/text",
+            "runner_ref": "runner-1",
+            "model_id": "mock-model",
+            "allow_synthetic_unverified": True,
+        },
+        owner_preset,
+    ]
+    overrides["principals"][0].update(
+        {
+            "executable_catalogs": [],
+            "allowed_presets": [
+                "mock/text",
+                "mock/mock-model",
+                "mock/mock-ungranted",
+            ],
+        }
+    )
+    control = FakeControl()
+    shared = FakeControl()
+    controls = {"runner-1": control, "runner-2": shared}
+    config = base_config(tmp_path, **overrides)
+    store = Store(config.db_path())
+    store.initialize()
+    registry = RunnerRegistry(
+        config,
+        session_factory=lambda cfg: FakeSession(
+            cfg, controls[cfg.instance_id]
+        ),
+    )
+    control.models = VARIANT_ROWS
+    shared.models = VARIANT_ROWS
+    return config, store, registry
+
+
+@pytest.mark.parametrize(
+    "owner", ["different-model", "other-runner", "other-policy", "disabled"]
+)
+async def test_shadowed_grant_never_authorizes_static_variant(
+    tmp_path, owner: str
+):
+    """The static-base variant must not treat the shadowed exact grant as
+    catalog authority: 'mock/mock-ungranted' names a static preset, not the
+    catalog row — regardless of the preset's runner/model/policy/enabled."""
+    config, store, registry = _shadowed_grant_system(tmp_path, owner)
+    await registry.refresh()
+    with pytest.raises(UnsupportedCapability):
+        _resolve(config, registry, "mock/text", effort="high")
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "owner", ["different-model", "other-runner", "other-policy", "disabled"]
+)
+async def test_shadowed_grant_never_authorizes_dynamic_variant(
+    tmp_path, owner: str
+):
+    """Same invariant on a dynamic base: 'mock/mock-model' is a legitimate
+    non-shadowed exact grant, but its variant target 'mock/mock-ungranted'
+    is owned by a static preset and must not be authorized by it."""
+    config, store, registry = _shadowed_grant_system(tmp_path, owner)
+    await registry.refresh()
+    base = _resolve(config, registry, "mock/mock-model")
+    assert base.dynamic is True
+    with pytest.raises(UnsupportedCapability):
+        _resolve(config, registry, "mock/mock-model", effort="high")
+    store.close()
+
+
+async def test_non_shadowed_exact_dynamic_grant_still_authorizes(tmp_path):
+    """Positive control: an exact grant that is NOT a static preset remains
+    a valid dynamic grant for the variant target."""
+    overrides = _overrides()
+    overrides["catalogs"] = [dict(CATALOGS[0], task_policy="text")]
+    overrides["presets"] = [
+        {
+            "alias": "mock/text",
+            "runner_ref": "runner-1",
+            "model_id": "mock-model",
+            "allow_synthetic_unverified": True,
+        }
+    ]
+    overrides["principals"][0].update(
+        {
+            "executable_catalogs": [],
+            "allowed_presets": ["mock/text", "mock/mock-ungranted"],
+        }
+    )
+    config, store, registry, _c, control = make_system(tmp_path, **overrides)
+    control.models = VARIANT_ROWS
+    await registry.refresh()
+    binding = _resolve(config, registry, "mock/text", effort="high")
+    assert binding.resolved_model_id == "mock-ungranted"
+    store.close()
+
+
+async def test_shadowed_grant_does_not_list_or_refresh_dynamic(tmp_path):
+    """A static-owned exact grant must not make /v1/models refresh a catalog
+    runner that cannot contribute a row for it."""
+    overrides = _overrides()
+    overrides["runners"] = [
+        {
+            "instance_id": "runner-1",
+            "driver_id": "mock",
+            "driver_version": "0.1.0",
+            "distribution": "cli-driver-mock",
+            "socket_path": str(tmp_path / "r1.sock"),
+        },
+        {
+            "instance_id": "runner-2",
+            "driver_id": "mock",
+            "driver_version": "0.1.0",
+            "distribution": "cli-driver-mock",
+            "socket_path": str(tmp_path / "r2.sock"),
+        },
+    ]
+    overrides["catalogs"] = [
+        {
+            "name": "src-b",
+            "runner_ref": "runner-2",
+            "alias_prefix": "aux/",
+            "allow_synthetic_unverified": True,
+        }
+    ]
+    # 'aux/text' is a STATIC preset on runner-1 — never a src-b grant.
+    overrides["presets"] = [
+        {
+            "alias": "mock/text",
+            "runner_ref": "runner-1",
+            "model_id": "mock-model",
+            "allow_synthetic_unverified": True,
+        },
+        {
+            "alias": "aux/text",
+            "runner_ref": "runner-1",
+            "model_id": "mock-model",
+            "allow_synthetic_unverified": True,
+        },
+    ]
+    overrides["principals"] = [
+        {
+            "name": "alpha",
+            "key_hash": hash_api_key("secret-alpha"),
+            "allowed_presets": ["mock/text", "aux/text"],
+            "allowed_workspaces": ["ws-alpha"],
+            "max_concurrency": 2,
+        }
+    ]
+    config, store, _registry, _c, _shared = make_system(tmp_path, **overrides)
+    alpha = _principal(config)
+    refs = models_refresh_refs(config, alpha)
+    # Only the static runners: the aux/ source runner cannot contribute a row
+    # for a shadowed alias, so it must not be refreshed for this listing.
+    assert refs == {"runner-1"}
+    store.close()
+
+
+# ------------------------------ r3: freshness-mark timing + preservation
+
+
+async def test_slow_verify_shares_one_completed_attempt(tmp_path):
+    """Concurrent callers must share one completed pass: a freshness mark
+    written BEFORE a slow verify would already look stale when the guard is
+    released, forcing a second discovery pass."""
+    overrides = _overrides()
+    overrides["api"] = {"catalog_refresh_seconds": 0.05}
+    control = FakeControl()
+    control.discovery_delay_seconds = 0.4  # verify exceeds the TTL
+    config, store, registry, _c, _shared = make_system(
+        tmp_path, control=control, **overrides
+    )
+    control.models = MODEL_ROWS
+    await asyncio.gather(
+        registry.ensure_fresh(runner_refs={"runner-1"}),
+        registry.ensure_fresh(runner_refs={"runner-1"}),
+    )
+    assert control.discovery_calls == 1
+    store.close()
+
+
+async def test_partial_refresh_preserves_skipped_preset_health(tmp_path):
+    """A scoped pass must not re-derive PresetHealth for skipped runners:
+    an unrefreshed runner's preset keeps its untouched 'not checked' state."""
+    config, store, registry, controls = _two_runner_system(
+        tmp_path,
+        principals=None,
+    )
+    # Attach a preset to runner-2; runner-1 presets come from the base config.
+    overrides = _overrides()
+    overrides["runners"] = [
+        r.model_dump(mode="json") for r in config.runners
+    ]
+    overrides["catalogs"] = [
+        c.model_dump(mode="json") for c in config.catalogs
+    ]
+    overrides["principals"] = [
+        p.model_dump(mode="json") for p in config.principals
+    ]
+    overrides["presets"] = [
+        {
+            "alias": "mock/text",
+            "runner_ref": "runner-1",
+            "model_id": "mock-model",
+            "allow_synthetic_unverified": True,
+        },
+        {
+            "alias": "mock/aux",
+            "runner_ref": "runner-2",
+            "model_id": "mock-model",
+            "allow_synthetic_unverified": True,
+        },
+    ]
+    config, store, registry, _c, _shared = make_system(tmp_path / "y", **overrides)
+    controls = {"runner-1": FakeControl(), "runner-2": FakeControl()}
+    registry = RunnerRegistry(
+        config,
+        session_factory=lambda cfg: FakeSession(cfg, controls[cfg.instance_id]),
+    )
+    assert registry.preset_health("mock/aux").detail == "not checked"
+    await registry.ensure_fresh(runner_refs={"runner-1"})
+    assert controls["runner-1"].discovery_calls == 1
+    assert controls["runner-2"].discovery_calls == 0
+    # Runner-2 state fully preserved: health, mark, and its derived preset.
+    assert registry.runner_health("runner-2").observed_monotonic is None
+    assert registry.preset_health("mock/aux").detail == "not checked"
+    assert registry.runner_health("runner-1").ok
+    store.close()
+
+
+async def test_empty_scope_refreshes_nothing(tmp_path):
+    config, store, registry, controls = _two_runner_system(tmp_path)
+    await registry.ensure_fresh(runner_refs=set())
+    assert controls["runner-1"].discovery_calls == 0
+    assert controls["runner-2"].discovery_calls == 0
+    # No runner health, freshness mark, or derived preset state is touched.
+    assert registry.runner_health("runner-1").observed_monotonic is None
+    assert registry.runner_health("runner-2").observed_monotonic is None
+    assert registry.preset_health("mock/text").detail == "not checked"
+    store.close()
