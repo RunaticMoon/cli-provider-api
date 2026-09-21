@@ -302,13 +302,14 @@ def test_gateway_execution_metadata_reaches_worker(gateway):
 
 
 def test_gateway_metadata_reasoning_effort_reaches_worker(gateway):
-    """``metadata.reasoning_effort`` is the gateway-safe effort carrier.
+    """``metadata.reasoning_effort`` is the verified gateway effort carrier.
 
-    Measured 9Router 0.5.81 behaviour: the provider-model route forwards the
-    request ``metadata`` object verbatim but strips the top-level
-    ``reasoning_effort`` field, so consumers behind the gateway MUST send the
-    effort inside ``metadata`` (duplicating it at the top level is the
-    recommended belt-and-braces form; the API rejects disagreement).
+    Measured 9Router 0.5.81 for an unrecognized custom model routed
+    generically: the provider-model route forwards the request ``metadata``
+    object verbatim while the top-level field did not survive that path.
+    Other model families may normalize differently — the proven contract is
+    that ``metadata`` carries the effort end-to-end and any carrier that does
+    arrive must agree with it exactly (the API rejects disagreement).
     """
     client, system = gateway
     body = gateway_request("gw-effort", model="cpa.safety")

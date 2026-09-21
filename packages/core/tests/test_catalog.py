@@ -275,3 +275,216 @@ def test_request_hash_differentiates_effort(tmp_path):
     assert a != b != c != a
     # Absent effort keeps the legacy hash (cross-provider replay unchanged).
     assert a == request_hash(**base)
+
+
+# ------------------------------------------- static variant authority (P1)
+
+
+VARIANT_ROWS = [
+    _row(
+        "mock-model",
+        effort="model_variant",
+        effort_variants={"high": "mock-ungranted"},
+    ),
+    _row("mock-ungranted"),
+]
+
+
+def _resolve(config, registry, alias, effort=None, principal_name="alpha"):
+    return resolve_model(
+        config=config,
+        registry=registry,
+        principal=_principal(config, principal_name),
+        alias=alias,
+        effort=effort,
+    )
+
+
+async def test_static_variant_requires_independent_authorization(tmp_path):
+    """Catalog membership + driver executable are not the principal's grant:
+    a variant to an ungranted model id is refused before any run."""
+    config, store, registry, _c, control = make_system(tmp_path)
+    control.models = VARIANT_ROWS
+    await registry.refresh()
+    with pytest.raises(UnsupportedCapability):
+        _resolve(config, registry, "mock/text", effort="high")
+    store.close()
+
+
+async def test_static_variant_authorized_via_held_preset(tmp_path):
+    """The same variant is admitted when the principal holds an enabled
+    preset binding the target id on the same runner and task policy."""
+    config, store, registry, _c, control = make_system(
+        tmp_path,
+        presets=[
+            {
+                "alias": "mock/text",
+                "runner_ref": "runner-1",
+                "model_id": "mock-model",
+                "allow_synthetic_unverified": True,
+            },
+            {
+                "alias": "mock/hi",
+                "runner_ref": "runner-1",
+                "model_id": "mock-ungranted",
+                "task_policy": "text",
+                "allow_synthetic_unverified": True,
+            },
+        ],
+        principals=[
+            {
+                "name": "alpha",
+                "key_hash": hash_api_key("secret-alpha"),
+                "allowed_presets": ["mock/text", "mock/hi"],
+                "allowed_workspaces": ["ws-alpha"],
+                "max_concurrency": 2,
+            }
+        ],
+    )
+    control.models = VARIANT_ROWS
+    await registry.refresh()
+    binding = _resolve(config, registry, "mock/text", effort="high")
+    assert binding.resolved_model_id == "mock-ungranted"
+    store.close()
+
+
+async def test_static_variant_denied_by_policy_or_grant_gaps(tmp_path):
+    """Target presets on a different task policy, or not granted to the
+    principal, or disabled, never authorize the variant."""
+    presets = [
+        {
+            "alias": "mock/text",
+            "runner_ref": "runner-1",
+            "model_id": "mock-model",
+            "allow_synthetic_unverified": True,
+        },
+        {
+            "alias": "mock/hi-review",  # different task policy
+            "runner_ref": "runner-1",
+            "model_id": "mock-ungranted",
+            "task_policy": "review",
+            "allow_synthetic_unverified": True,
+        },
+    ]
+    config, store, registry, _c, control = make_system(
+        tmp_path,
+        presets=presets,
+        principals=[
+            {
+                "name": "alpha",
+                "key_hash": hash_api_key("secret-alpha"),
+                "allowed_presets": ["mock/text", "mock/hi-review"],
+                "allowed_workspaces": ["ws-alpha"],
+                "max_concurrency": 2,
+            }
+        ],
+    )
+    control.models = VARIANT_ROWS
+    await registry.refresh()
+    # Held target preset, but policy differs from the source preset.
+    with pytest.raises(UnsupportedCapability):
+        _resolve(config, registry, "mock/text", effort="high")
+    store.close()
+
+    config, store, registry, _c, control = make_system(
+        tmp_path,
+        presets=presets + [
+            {
+                "alias": "mock/hi",
+                "runner_ref": "runner-1",
+                "model_id": "mock-ungranted",
+                "task_policy": "text",
+                "allow_synthetic_unverified": True,
+            }
+        ],
+        principals=[
+            {
+                "name": "alpha",
+                # mock/hi matches policy+runner but is not granted.
+                "key_hash": hash_api_key("secret-alpha"),
+                "allowed_presets": ["mock/text"],
+                "allowed_workspaces": ["ws-alpha"],
+                "max_concurrency": 2,
+            }
+        ],
+    )
+    control.models = VARIANT_ROWS
+    await registry.refresh()
+    with pytest.raises(UnsupportedCapability):
+        _resolve(config, registry, "mock/text", effort="high")
+    store.close()
+
+
+async def test_static_variant_authorized_via_catalog_exec_grant(tmp_path):
+    """An executable-catalog grant on the same runner whose source policy
+    admits the target is an equivalent authority for the variant."""
+    config, store, registry, _c, control = make_system(
+        tmp_path,
+        **_overrides(),
+    )
+    control.models = VARIANT_ROWS
+    await registry.refresh()
+    binding = _resolve(config, registry, "mock/text", effort="high")
+    assert binding.resolved_model_id == "mock-ungranted"
+
+    # ...but a source cost/model filter on that grant still applies.
+    config2, store2, registry2, _c2, control2 = make_system(
+        tmp_path / "b",
+        catalogs=[dict(CATALOGS[0], cost_tiers=["free"])],
+        principals=_overrides()["principals"],
+        api={"catalog_refresh_seconds": 0.05},
+    )
+    control2.models = [
+        _row(
+            "mock-model",
+            effort="model_variant",
+            effort_variants={"high": "mock-ungranted"},
+            cost_tier="free",
+        ),
+        _row("mock-ungranted", cost_tier="paid"),  # source filter denies it
+    ]
+    await registry2.refresh()
+    with pytest.raises(UnsupportedCapability):
+        _resolve(config2, registry2, "mock/text", effort="high")
+    store.close()
+    store2.close()
+
+
+async def test_dynamic_variant_requires_the_same_run_gate(tmp_path):
+    """An exact allowed_presets alias grant (no source-wide exec grant) must
+    not effort-hop to another source-admitted model id."""
+    config, store, registry, _c, control = make_system(
+        tmp_path,
+        catalogs=CATALOGS,
+        principals=[
+            {
+                "name": "alpha",
+                "key_hash": hash_api_key("secret-alpha"),
+                # Only the base alias is granted; no executable_catalogs.
+                "allowed_presets": ["mock/text", "mock/mock-variant"],
+                "allowed_workspaces": ["ws-alpha"],
+                "max_concurrency": 2,
+            }
+        ],
+        api={"catalog_refresh_seconds": 0.05},
+    )
+    control.models = MODEL_ROWS
+    await registry.refresh()
+    # The base alias itself resolves fine.
+    base = _resolve(config, registry, "mock/mock-variant")
+    assert base.resolved_model_id == "mock-variant"
+    # The variant target alias is not granted → refused, not admitted by the
+    # source policy alone.
+    with pytest.raises(UnsupportedCapability):
+        _resolve(config, registry, "mock/mock-variant", effort="high")
+
+    # With the source-wide grant the same request resolves.
+    config2, store2, registry2, _c2, control2 = make_system(
+        tmp_path / "c", **_overrides()
+    )
+    control2.models = MODEL_ROWS
+    await registry2.refresh()
+    ok = _resolve(config2, registry2, "mock/mock-variant", effort="high")
+    assert ok.resolved_model_id == "mock-effort"
+    store.close()
+    store2.close()

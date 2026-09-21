@@ -215,7 +215,21 @@ def _resolve_static(
             return False, f"variant verification status {status!r} is not 'passed'"
         if target.get("executable") is False:
             return False, "driver does not admit the variant for execution"
-        return True, None
+        # Catalog membership and the driver's own executable flag are
+        # admission hints, not this principal's model grant. A non-identity
+        # variant must be independently authorized: an enabled preset this
+        # principal holds for the same runner under the same task policy, or
+        # an explicit catalog execution grant whose source policy admits it.
+        if _preset_target_authorized(config, principal, preset, model_id):
+            return True, None
+        if _catalog_target_authorized(
+            config, principal, preset.runner_ref, health, target
+        ):
+            return True, None
+        return False, (
+            "effort variant target is not independently authorized for this "
+            "principal"
+        )
 
     resolved, rejection = _resolve_effort_target(
         descriptor=descriptor,
@@ -238,6 +252,54 @@ def _resolve_static(
         dynamic=False,
         source=None,
     )
+
+
+def _preset_target_authorized(
+    config: OperatorConfig,
+    principal: PrincipalConfig,
+    preset: PresetConfig,
+    model_id: str,
+) -> bool:
+    """An enabled preset this principal already holds binds the exact target
+    id on the same runner under the same (compatible) task policy."""
+    for target in config.presets:
+        if not target.enabled:
+            continue
+        if target.runner_ref != preset.runner_ref:
+            continue
+        if target.model_id != model_id:
+            continue
+        if target.task_policy != preset.task_policy:
+            continue
+        if target.alias in principal.allowed_presets:
+            return True
+    return False
+
+
+def _catalog_target_authorized(
+    config: OperatorConfig,
+    principal: PrincipalConfig,
+    runner_ref: str,
+    health: RunnerHealth | None,
+    target: dict[str, Any],
+) -> bool:
+    """An enabled catalog source on the same runner admits the target and the
+    principal holds an execution grant for it (source model/cost policy still
+    applies)."""
+    if health is None:
+        return False
+    model_id = target["model_id"]
+    for source in config.catalogs:
+        if not source.enabled or source.runner_ref != runner_ref:
+            continue
+        if not principal_may_execute(principal, source, source.alias_prefix + model_id):
+            continue
+        admitted, _reason = source_admits(
+            source, target, synthetic_runner=health.synthetic
+        )
+        if admitted:
+            return True
+    return False
 
 
 def _resolve_dynamic(
@@ -289,6 +351,15 @@ def _resolve_dynamic(
             target = health.model_descriptors.get(model_id)
             if target is None:
                 return False, "variant is not present in the runner catalog"
+            # The target alias needs the same principal run gate as the
+            # requested alias — a source-admitted row is not a grant.
+            if not principal_may_execute(
+                principal, source, source.alias_prefix + model_id
+            ):
+                return False, (
+                    "effort variant target is not independently authorized "
+                    "for this principal"
+                )
             return source_admits(
                 source, target, synthetic_runner=health.synthetic
             )

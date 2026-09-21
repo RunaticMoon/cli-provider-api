@@ -513,3 +513,122 @@ def test_different_effort_same_task_is_not_cached(system_factory, tmp_path):
         )
         assert third.status_code == 200
         assert third.headers.get("X-Run-Cached") == "true"
+
+
+# ------------------------------------------------- static variant authority
+
+
+def test_static_effort_variant_cannot_bypass_the_model_grant(
+    system_factory, tmp_path
+):
+    """P1 regression: a static preset's model_variant target that this
+    principal never authorized must not execute merely because the driver
+    marks the row executable — catalog membership and driver_executable are
+    admission hints, not the principal's model grant.
+
+    Mirrors the parent probe: no catalog source is configured at all; the
+    principal holds only allowed_presets=[mock/text]; the driver reports
+    mock-model with variant high -> mock-ungranted (a catalog-only model the
+    operator never granted).
+    """
+    catalog_file = tmp_path / "catalog.json"
+    _write_catalog(
+        catalog_file,
+        [
+            {
+                "model_id": "mock-model",
+                "effort": "model_variant",
+                "effort_variants": {"high": "mock-ungranted"},
+                "cost_tier": "Free",
+            },
+            {
+                "model_id": "mock-ungranted",
+                "cost_tier": "High cost",
+                "executable": True,
+            },
+        ],
+    )
+    system = system_factory(
+        "success",
+        runner_env={"CLI_DRIVER_MOCK_CATALOG_FILE": str(catalog_file)},
+    )
+    with system.client() as client:
+        control = _chat(client, "mock/text", task_id="p1-control")
+        assert control.status_code == 200, control.text[:400]
+        assert control.json()["run"]["status"] == "completed"
+
+        denied = _chat(
+            client,
+            "mock/text",
+            reasoning_effort="high",
+            task_id="p1-variant",
+        )
+        # Refused before model reservation: no run, no attempt, no driver
+        # contact for the ungranted target.
+        assert denied.status_code == 422, denied.text[:400]
+        assert denied.json()["error"]["code"] == "unsupported_capability"
+        assert "run" not in denied.json()
+
+
+def test_static_effort_variant_runs_when_target_is_granted(
+    system_factory, tmp_path
+):
+    """Positive control: the same variant is admitted when the principal
+    holds an enabled preset binding the target id on the same runner with a
+    compatible task policy."""
+    catalog_file = tmp_path / "catalog.json"
+    _write_catalog(
+        catalog_file,
+        [
+            {
+                "model_id": "mock-model",
+                "effort": "model_variant",
+                "effort_variants": {"high": "mock-hi"},
+                "cost_tier": "Free",
+            },
+            {"model_id": "mock-hi", "cost_tier": "Free", "executable": True},
+        ],
+    )
+    overrides = {
+        "presets": [
+            {
+                "alias": "mock/text",
+                "runner_ref": "runner-1",
+                "model_id": "mock-model",
+                "allow_synthetic_unverified": True,
+            },
+            {
+                "alias": "mock/high",
+                "runner_ref": "runner-1",
+                "model_id": "mock-hi",
+                "task_policy": "text",
+                "allow_synthetic_unverified": True,
+            },
+        ],
+        "principals": [
+            {
+                "name": "alpha",
+                "key_hash": hash_api_key("local-alpha-key"),
+                "allowed_presets": ["mock/text", "mock/high"],
+                "allowed_workspaces": ["ws-alpha"],
+                "max_concurrency": 2,
+            }
+        ],
+    }
+    system = system_factory(
+        "success",
+        config_overrides=overrides,
+        runner_env={"CLI_DRIVER_MOCK_CATALOG_FILE": str(catalog_file)},
+    )
+    with system.client() as client:
+        response = _chat(
+            client,
+            "mock/text",
+            reasoning_effort="high",
+            task_id="p1-positive",
+        )
+        assert response.status_code == 200, response.text[:400]
+        run = response.json()["run"]
+        assert run["status"] == "completed"
+        assert run["model"]["resolved_model"] == "mock-hi"
+        assert run["model"]["reasoning_effort"] == "high"

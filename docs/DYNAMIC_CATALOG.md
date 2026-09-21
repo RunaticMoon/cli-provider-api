@@ -26,17 +26,31 @@ operator's source/principal policy decides what is visible and what may run.
 
 ## Operator configuration
 
+Config fragment — a complete file still needs `runners`, `workspaces`,
+`data_dir`, principal `key_hash` values and the rest of the static contract
+(see `config.example.yaml`):
+
 ```yaml
 api:
   catalog_refresh_seconds: 60        # bounded TTL; default 60
 
 catalogs:
+  # Antigravity: `agy models` rows carry no cost_tier, so a cost_tiers filter
+  # would deny every native row — omit it here.
   - name: agy-main                   # operator-owned source name
     runner_ref: runner-agy-1         # one allowlisted Runner instance
     alias_prefix: "agy/"             # dynamic aliases are agy/<exact id>
-    models: ["gemini-3-pro-high"]    # optional exact-id allowlist (omitted = all)
-    cost_tiers: ["free"]             # optional cost-tier filter
+    models: ["gemini-3.8-flash-high"]  # optional exact-id allowlist (omit = all)
     task_policy: default             # operator-owned task policy for runs
+    allow_synthetic_unverified: false
+    enabled: true
+
+  # Devin: catalog rows carry an observed cost_tier; this source admits only
+  # the Free lane even if the runner catalog lists paid variants.
+  - name: devin-free
+    runner_ref: runner-devin-1
+    alias_prefix: "devin/"
+    cost_tiers: ["Free"]             # exact Devin catalog label
     allow_synthetic_unverified: false
     enabled: true
 
@@ -81,11 +95,13 @@ Each descriptor reports a truthful effort mode:
 | `selectable`      | `effort_options` lists the exact accepted tokens               |
 | `model_variant`   | `effort_variants` maps tokens to exact catalog ids             |
 
-Request shape (`reasoning_effort` is a bounded token, `^[a-z][a-z0-9_]{0,31}$`):
+Request shape (`reasoning_effort` is a bounded token, `^[a-z][a-z0-9_]{0,31}$`).
+This example uses the tested synthetic fixture alias — real `agy`/`devin`
+catalog rows today report `effort: unknown` and reject effort requests:
 
 ```json
 {
-  "model": "agy/gemini-3-pro-preview",
+  "model": "mock/mock-effort",
   "messages": [{"role": "user", "content": "..."}],
   "reasoning_effort": "low",
   "metadata": {"task_id": "t-1", "workspace_id": "ws-alpha",
@@ -97,15 +113,24 @@ Request shape (`reasoning_effort` is a bounded token, `^[a-z][a-z0-9_]{0,31}$`):
   the same value. Both are strictly type-checked; if both are present they
   must be exactly equal — disagreement is a 400 before any model lookup or
   Runner reservation.
-- **`metadata.reasoning_effort` is the gateway-safe carrier.** Measured
-  9Router 0.5.81 behaviour: the provider-model route forwards the request
-  `metadata` object verbatim but strips top-level `reasoning_effort`.
-  Consumers behind 9Router should send effort in `metadata` (duplicating at
-  top level is fine — they must agree). The API itself honours either.
+- **`metadata.reasoning_effort` is the verified gateway carrier.** Measured
+  on 9Router 0.5.81 for an unrecognized custom model routed generically: the
+  provider-model route forwards the request `metadata` object verbatim while
+  the top-level field did not survive that path. Other model families may be
+  normalized differently by the gateway — the contract here is that
+  `metadata` is the carrier proven end-to-end, and any carrier the API does
+  receive must agree with `metadata` exactly or the request fails rather
+  than silently changing meaning. Duplicating the same value in both places
+  is the recommended form; the API itself honours either alone.
 - Resolution is by exact descriptor metadata only — never suffix inference.
   `selectable` keeps the same catalog id; `model_variant` resolves to the
-  mapped exact id, which is independently re-admitted under the same
-  authorization surface (a variant cannot hop to an unapproved model).
+  mapped exact id, which must be **independently authorized**: for a dynamic
+  alias the target is re-admitted under the catalog source's model/cost
+  policy and the same principal grant; for a static preset the target must
+  be bound by an enabled preset this principal holds on the same runner
+  under the same task policy, or admitted by an enabled catalog source the
+  principal may execute through. Catalog membership or the driver's
+  `executable` flag alone never authorizes a cross-model hop.
 - The resolved binding flows through `RunParams.reasoning_effort` +
   `RunParams.resolved_model` to the driver, which re-derives the target from
   its *own* catalog and refuses a mismatch. `run.model` in the response and
@@ -154,22 +179,33 @@ Discovery enumerating the whole catalog does not mean any model may run:
 
 ## Minimal consumer
 
-`examples/catalog_client.py` is a stdlib-only client: it reads
-`/api/v1/catalog`, picks an `executable` entry (optionally requiring an
-advertised `selectable` effort option), duplicates the effort into
-`metadata` for gateway safety, and submits the chat request. See its
-docstring for usage.
+`examples/catalog_client.py` is a stdlib-only client for the **wrapper API
+directly**: discovery is read-only by default; a run requires `--run` plus
+explicit `--model`/`--workspace`/`--task-id`, and effort is sent only when
+the descriptor advertises `selectable` support (duplicated into `metadata`
+for gateway safety). Redirects are refused so the bearer key can never
+cross origins; error bodies are never echoed. When the wrapper sits behind
+9Router the same endpoints apply through the gateway's
+`<prefix>/<model>` alias form with `metadata.reasoning_effort` as the
+verified carrier — the example does not implement any gateway proxy itself.
+See its docstring for usage.
 
 ## Verification evidence
 
-- `apps/api/tests/test_dynamic_catalog.py` — 20 tests: discovery visibility,
+- `apps/api/tests/test_dynamic_catalog.py` — discovery visibility,
   read-vs-execute grants, dynamic alias execution end-to-end
   (API→UDS Runner→fake CLI), unknown/invented ids, source model/cost
   filters, TTL add/remove without restart, effort carriers
-  (top-level/metadata/agree/conflict/type), idempotency-hash separation.
+  (top-level/metadata/agree/conflict/type), idempotency-hash separation,
+  and the static-variant authority regression (an ungranted variant target
+  is refused; a granted one runs).
+- `apps/api/tests/test_catalog_client.py` — the stdlib consumer example
+  against the real fixture stack: read-only discovery, explicit run opt-in,
+  non-executable refusal, redirect/credential-leak and error-body controls.
 - `packages/core/tests/test_catalog.py` — resolution matrix, variant
-  re-admission, singleflight TTL refresh, failed-refresh fails-closed with
-  stale reporting, hash differentiation.
+  re-admission (preset-held / catalog-grant / policy-gap cases),
+  singleflight TTL refresh, failed-refresh fails-closed with stale
+  reporting, hash differentiation.
 - `drivers/devin/tests/test_devin_driver.py` — full-catalog discovery,
   allowlist/tier/cost admission, catalog-selected model execution via the
   fake ACP CLI, zero-effects negatives, session-model ack pinning.
