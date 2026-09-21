@@ -140,6 +140,10 @@ def run_catalog():
     sys.stdout.write("Fetching available models...\n")
     if CATALOG == "missing":
         rows = [row for row in DEFAULT_CATALOG if row[0] != "gemini-3.8-flash-high"]
+    elif CATALOG == "duplicate":
+        # Conflicting duplicate: same id, different label. The driver must
+        # fail closed rather than pick a row by ordering.
+        rows = DEFAULT_CATALOG + [("gemini-3.8-flash-high", "Conflicting Label")]
     else:
         rows = DEFAULT_CATALOG
     for model_id, label in rows:

@@ -80,9 +80,12 @@ Grant semantics:
 
 Refresh is bounded and singleflight: at most one discovery pass per
 `catalog_refresh_seconds` window regardless of request rate, and concurrent
-callers share one pass. Additions and removals become visible after the TTL
-without a restart; in-flight and durable attempts are never replayed or
-invalidated by a removal (idempotency is durable in the Store).
+callers share one pass. Each pass performs a genuinely fresh driver read —
+the driver's own TTL is only a bound on the internal execution-admission
+cache, so a registry refresh never re-stamps stale membership as newly
+observed. Additions and removals become visible after the API TTL without a
+restart; in-flight and durable attempts are never replayed or invalidated
+by a removal (idempotency is durable in the Store).
 
 ## Per-model reasoning effort
 

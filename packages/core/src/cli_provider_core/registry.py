@@ -297,6 +297,13 @@ class RunnerRegistry:
                 )
                 if descriptor is None:
                     return
+                if descriptor.model_id in descriptors:
+                    health.ok = False
+                    health.detail = (
+                        f"catalog reports duplicate model_id "
+                        f"{descriptor.model_id!r}; refusing to pick a row"
+                    )
+                    return
                 descriptors[descriptor.model_id] = descriptor.model_dump(mode="json")
 
             runtime = await self._runtime_capacity(session, health)

@@ -113,6 +113,19 @@ def catalog_document() -> dict:
         return doc
     if CATALOG == "empty":
         return {"families": []}
+    if CATALOG == "duplicate":
+        # Conflicting duplicate: the same model_uid reported twice with
+        # different cost tiers. Discovery/execution must fail closed rather
+        # than pick a cost row by ordering.
+        doc = json.loads(json.dumps(GOOD_CATALOG))
+        doc["families"][0]["variants"].append(
+            {
+                "model_uid": "swe-2-max",
+                "label": "SWE-2 Max (conflict)",
+                "cost_tier": "High cost",
+            }
+        )
+        return doc
     return GOOD_CATALOG
 
 

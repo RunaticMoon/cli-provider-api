@@ -35,7 +35,6 @@ import json
 import os
 import re
 import time
-from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
@@ -91,11 +90,6 @@ MODELS_ENV = "AGY_MODELS"
 EXPECTED_VERSION_ENV = "AGY_EXPECTED_VERSION"
 ALLOW_SKIP_ENV = "AGY_ALLOW_SKIP_PERMISSIONS"
 CATALOG_TTL_ENV = "AGY_CATALOG_TTL_SECONDS"
-# Fixture-only hook (tests): a JSON file mapping exact model_id -> declared
-# effort metadata, e.g. {"m1": {"effort": "selectable", "effort_options":
-# ["low","high"]}}. The native `agy models` output carries no per-model effort
-# evidence, so without this file every descriptor honestly reports `unknown`.
-EFFORT_FIXTURE_ENV = "AGY_EFFORT_FIXTURE"
 
 # Runner execution-config action that authorizes ``--dangerously-skip-permissions``
 # for a run. It is a named operator action (not a request field): the flag is
@@ -126,7 +120,6 @@ SANITIZED_ENV = (
     EXPECTED_VERSION_ENV,
     ALLOW_SKIP_ENV,
     CATALOG_TTL_ENV,
-    EFFORT_FIXTURE_ENV,
 )
 
 
@@ -198,23 +191,12 @@ class AntigravityDriver(BaseDriver):
         self._active: dict[str, NdjsonProcessTransport] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
         self._catalog_cache: tuple[float, list[ModelDescriptor]] | None = None
-        self._effort_fixture = (
-            effort_fixture
-            if effort_fixture is not None
-            else self._load_effort_fixture()
-        )
-
-    @staticmethod
-    def _load_effort_fixture() -> dict[str, dict[str, Any]]:
-        """Test-only declared effort metadata; absent -> every model unknown."""
-        path = os.environ.get(EFFORT_FIXTURE_ENV)
-        if not path:
-            return {}
-        try:
-            data = json.loads(Path(path).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
-        return data if isinstance(data, dict) else {}
+        # Test-only declared effort metadata, injected by the constructor —
+        # deliberately NOT an env/file hook: a production deployment must
+        # never be able to relabel a real catalog row as effort-selectable
+        # without official CLI evidence. Absent injection every descriptor
+        # honestly reports ``unknown``.
+        self._effort_fixture = dict(effort_fixture or {})
 
     def _model_allowed(self, model_id: str) -> bool:
         """Execution allowlist — strictly separate from catalog discovery."""
@@ -435,6 +417,11 @@ class AntigravityDriver(BaseDriver):
             model_id, _, label = line.partition("\t")
             model_id = model_id.strip()
             if model_id and _ID_RE.match(model_id):
+                if model_id in rows:
+                    return None, (
+                        f"catalog output repeats model id {model_id!r}; "
+                        "refusing to pick a row by ordering"
+                    )
                 rows[model_id] = label.strip()
         if not rows:
             return None, "catalog output parsed to zero model rows"
@@ -535,17 +522,33 @@ class AntigravityDriver(BaseDriver):
         exact id was observed in the authenticated ``agy models`` output. The
         descriptor ``executable`` flag is the operator allowlist decision —
         discovery alone never authorizes a run. Anything unreadable is UNKNOWN
-        for the configured ids and authorizes nothing. Results are cached for
-        the operator-configured TTL.
+        for the configured ids and authorizes nothing.
+
+        This public discovery read is always genuinely fresh: it never serves
+        the internal execution cache, so a caller's refresh timestamp is
+        truthful. The fresh result still repopulates the bounded internal
+        cache used by ``execute``.
+        """
+        descriptors = await self._catalog_descriptors(ctx)
+        self._catalog_cache = (time.monotonic(), descriptors)
+        return descriptors
+
+    async def _cached_descriptors(
+        self, ctx: RuntimeContext
+    ) -> list[ModelDescriptor]:
+        """Bounded internal catalog cache for the execution admission path.
+
+        Kept strictly separate from the public ``discover_models`` freshness:
+        a run may reuse catalog membership for up to ``catalog_ttl`` seconds
+        (the verified-membership bound advertised on each descriptor), while
+        an operator/registry refresh always sees the live official catalog.
         """
         if (
             self._catalog_cache is not None
             and time.monotonic() - self._catalog_cache[0] < self._catalog_ttl
         ):
             return self._catalog_cache[1]
-        descriptors = await self._catalog_descriptors(ctx)
-        self._catalog_cache = (time.monotonic(), descriptors)
-        return descriptors
+        return await self.discover_models(ctx)
 
     # -------------------------------------------------------------- execute
 
@@ -584,10 +587,10 @@ class AntigravityDriver(BaseDriver):
         return resolved, None
 
     def _catalog_allows(self, model: str, seen: list[ModelDescriptor]) -> bool:
-        for descriptor in seen:
-            if descriptor.model_id == model:
-                return descriptor.verification.status == VerificationStatus.PASSED
-        return False
+        matches = [d for d in seen if d.model_id == model]
+        return len(matches) == 1 and matches[0].verification.status == (
+            VerificationStatus.PASSED
+        )
 
     async def execute(
         self, request: NormalizedRequest, ctx: RuntimeContext
@@ -621,7 +624,7 @@ class AntigravityDriver(BaseDriver):
 
         # Reuse the (TTL-cached) catalog verification so a run never launches a
         # model that is not a PASSED catalog member.
-        descriptors = await self.discover_models(ctx)
+        descriptors = await self._cached_descriptors(ctx)
         if not self._catalog_allows(model, descriptors):
             yield failed(
                 "catalog_not_verified",

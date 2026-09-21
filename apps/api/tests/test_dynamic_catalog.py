@@ -632,3 +632,63 @@ def test_static_effort_variant_runs_when_target_is_granted(
         assert run["status"] == "completed"
         assert run["model"]["resolved_model"] == "mock-hi"
         assert run["model"]["reasoning_effort"] == "high"
+
+
+# ------------------------------------------------- refresh-before-auth (r1)
+
+
+def test_catalog_refresh_never_runs_for_unauthenticated_or_ungranted(
+    system_factory, tmp_path
+):
+    """Discovery RPCs are a side effect: only an authenticated principal with
+    a readable catalog source may trigger a refresh. An invalid key or an
+    authenticated principal with no catalog grant must cause zero runner
+    discovery work — proven by breaking the catalog file past the TTL and
+    observing the runner health stay ok until an authorized read refreshes
+    it."""
+    catalog_file = tmp_path / "catalog.json"
+    _write_catalog(catalog_file, [{"model_id": "mock-model"}])
+    overrides = _catalog_config(refresh_seconds=0.3)
+    overrides["principals"].append(
+        {
+            "name": "beta",
+            "key_hash": hash_api_key("local-beta-key"),
+            "allowed_presets": ["mock/text"],
+            "allowed_workspaces": ["ws-alpha"],
+            "max_concurrency": 2,
+        }
+    )
+    system = system_factory(
+        "success",
+        config_overrides=overrides,
+        runner_env={"CLI_DRIVER_MOCK_CATALOG_FILE": str(catalog_file)},
+    )
+    with system.client() as alpha, system.client("local-beta-key") as beta:
+        warm = alpha.get("/api/v1/catalog")
+        assert warm.status_code == 200
+        assert warm.json()["data"][0]["ok"] is True
+
+        # Corrupt the catalog *after* the TTL: the next refresh must mark the
+        # runner failed. If an unauthorized request triggers it, the failure
+        # is observable through health/ready before any authorized read.
+        catalog_file.write_text("{ not json", encoding="utf-8")
+        time.sleep(0.5)
+
+        unauth = system.client("invalid-key").get("/api/v1/catalog")
+        assert unauth.status_code == 401
+        granted = beta.get("/api/v1/catalog")
+        assert granted.status_code == 200 and granted.json()["data"] == []
+
+        scoped_unknown = alpha.get("/providers/nope/api/v1/catalog")
+        assert scoped_unknown.status_code == 404
+
+        # Zero side effects so far: the last verified snapshot is still ok.
+        ready = alpha.get("/health/ready")
+        assert ready.status_code == 200, ready.text[:300]
+        assert ready.json()["detail"]["runners"]["runner-1"]["ok"] is True
+
+        # The authorized reader's own read does trigger the bounded refresh —
+        # the malformed catalog now fails closed, visibly.
+        fresh = alpha.get("/api/v1/catalog")
+        assert fresh.status_code == 200
+        assert fresh.json()["data"][0]["ok"] is False

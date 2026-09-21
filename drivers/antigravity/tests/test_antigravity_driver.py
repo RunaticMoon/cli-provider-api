@@ -1254,3 +1254,83 @@ async def test_effort_option_not_declared_is_rejected(tmp_path):
     assert result.kind == EventKind.RUN_FAILED
     assert result.payload.code == "unsupported_effort"
     assert session_spawns(logfile) == []
+
+
+async def test_effort_fixture_env_is_not_a_production_hook(tmp_path):
+    """AGY_EFFORT_FIXTURE in the environment must not relabel a real catalog
+    row: effort metadata is ctor-injected for tests only, so a stray env var
+    can never mint selectable support or an --effort flag on a descriptor the
+    CLI never declared."""
+    logfile = tmp_path / "agy.log"
+    fixture = tmp_path / "effort.json"
+    fixture.write_text(
+        json.dumps({MODEL: {"effort": "selectable", "effort_options": ["low"]}}),
+        encoding="utf-8",
+    )
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setenv("AGY_EFFORT_FIXTURE", str(fixture))
+    try:
+        driver = driver_for(tmp_path)
+        descriptors = await driver.discover_models(
+            make_ctx(tmp_path, logfile=logfile)
+        )
+        by_id = {d.model_id: d for d in descriptors}
+        assert by_id[MODEL].effort.value == "unknown"
+        request = make_request().model_copy(update={"reasoning_effort": "low"})
+        events = await collect(driver, request, make_ctx(tmp_path, logfile=logfile))
+        result = terminal(events)
+        assert result.kind == EventKind.RUN_FAILED
+        assert result.payload.code == "unsupported_effort"
+        assert session_spawns(logfile) == []
+    finally:
+        monkeypatch.undo()
+
+
+async def test_duplicate_catalog_id_fails_closed(tmp_path):
+    """A catalog repeating a model id with a conflicting label is malformed:
+    discovery reports the source untrusted and execution never reaches a
+    session spawn — no row may be picked by ordering."""
+    logfile = tmp_path / "agy.log"
+    driver = driver_for(tmp_path)
+    ctx = make_ctx(tmp_path, catalog="duplicate", logfile=logfile)
+    descriptors = await driver.discover_models(ctx)
+    assert all(d.verification.status.value != "passed" for d in descriptors)
+    events = await collect(
+        driver, make_request(), make_ctx(tmp_path, catalog="duplicate", logfile=logfile)
+    )
+    result = terminal(events)
+    assert result.kind == EventKind.RUN_FAILED
+    assert result.payload.code == "catalog_not_verified"
+    assert session_spawns(logfile) == []
+
+
+async def test_unique_catalog_rows_positive_control(tmp_path):
+    """The ordinary unique-id catalog still verifies and executes."""
+    logfile = tmp_path / "agy.log"
+    driver = driver_for(tmp_path)
+    descriptors = await driver.discover_models(
+        make_ctx(tmp_path, logfile=logfile)
+    )
+    assert any(
+        d.model_id == MODEL and d.verification.status.value == "passed"
+        for d in descriptors
+    )
+
+
+async def test_public_discovery_is_genuinely_fresh(tmp_path):
+    """Driver TTL (300s) must not re-stamp stale membership as fresh: a public
+    ``discover_models`` inside the TTL window observes the live catalog, not
+    the internally cached rows."""
+    driver = driver_for(tmp_path, catalog_ttl_seconds=300)
+    seen = await driver.discover_models(make_ctx(tmp_path, catalog="ok"))
+    assert any(
+        d.model_id == MODEL and d.verification.status.value == "passed"
+        for d in seen
+    )
+    # Provider drops the model; a public read inside the TTL sees the live
+    # catalog rather than the execution cache.
+    seen = await driver.discover_models(make_ctx(tmp_path, catalog="missing"))
+    assert not any(
+        d.model_id == MODEL and d.verification.status.value == "passed"
+        for d in seen
+    )

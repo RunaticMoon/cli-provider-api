@@ -564,18 +564,31 @@ class DevinDriver(BaseDriver):
         or fuzzy selector. Every observed variant becomes a descriptor; the
         descriptor's ``executable`` flag is the operator policy decision
         (allowlist + cost tier), kept strictly separate from verification.
-        Results are cached for a bounded, operator-configured TTL so a stale
-        ``Free`` tier is not replayed as a pricing claim forever.
+        This public discovery read is always genuinely fresh: it never serves
+        the internal execution cache, so a caller's refresh timestamp is
+        truthful. The fresh result still repopulates the bounded internal
+        cache used by ``execute``.
+        """
+        descriptors = await self._catalog_descriptors(ctx)
+        self._catalog_cache = (time.monotonic(), descriptors)
+        return descriptors
+
+    async def _cached_descriptors(
+        self, ctx: RuntimeContext
+    ) -> list[ModelDescriptor]:
+        """Bounded internal catalog cache for the execution admission path.
+
+        Kept strictly separate from the public ``discover_models`` freshness:
+        a run may reuse catalog membership for up to ``catalog_ttl`` seconds
+        (the verified-membership bound advertised on each descriptor), while
+        an operator/registry refresh always sees the live official catalog.
         """
         if (
             self._catalog_cache is not None
             and time.monotonic() - self._catalog_cache[0] < self._catalog_ttl
         ):
             return self._catalog_cache[1]
-
-        descriptors = await self._catalog_descriptors(ctx)
-        self._catalog_cache = (time.monotonic(), descriptors)
-        return descriptors
+        return await self.discover_models(ctx)
 
     async def _catalog_descriptors(self, ctx: RuntimeContext) -> list[ModelDescriptor]:
         source = "devin models list --format json"
@@ -594,12 +607,6 @@ class DevinDriver(BaseDriver):
                 )
             ]
 
-        if not self._model_allowed(self._model):
-            return fallback(
-                VerificationStatus.FAILED,
-                f"operator-pinned model {self._model!r} is not in the "
-                "execution allowlist",
-            )
         if ctx.executor is None:
             return fallback(
                 VerificationStatus.UNKNOWN,
@@ -792,14 +799,10 @@ class DevinDriver(BaseDriver):
         # `models list` spawn — never an agent prompt — and an absent,
         # non-admitted, expired, or unreadable catalog fails the run before the
         # agent subprocess exists.
-        descriptor = next(
-            (
-                d
-                for d in await self.discover_models(ctx)
-                if d.model_id == model
-            ),
-            None,
-        )
+        matches = [
+            d for d in await self._cached_descriptors(ctx) if d.model_id == model
+        ]
+        descriptor = matches[0] if len(matches) == 1 else None
         if (
             descriptor is None
             or descriptor.verification.status is not VerificationStatus.PASSED

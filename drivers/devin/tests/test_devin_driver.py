@@ -29,6 +29,7 @@ from cli_provider_sdk import (
     StreamingMode,
     StructuredOutputMode,
     UsageProvenance,
+    VerificationStatus,
     WorkspaceRef,
 )
 from cli_provider_transports import LocalProcessExecutor
@@ -355,14 +356,24 @@ async def test_discovery_revalidates_after_the_configured_expiry(tmp_path):
     catalog_calls = [c for c in executor.calls if "models" in c["argv"]]
     assert len(catalog_calls) >= 2, "an expired verification must not be replayed"
 
+    # The public discovery read is always fresh, whatever the TTL — the TTL
+    # bounds only the internal execution-admission cache.
     cached_executor = RecordingExecutor(dict(os.environ, FAKE_DEVIN_MODE="ok"))
     cached_ctx = RuntimeContext(executor=cached_executor)
-    cached = driver_for(
-        tmp_path, catalog_ttl_seconds=3600.0
-    )
+    cached = driver_for(tmp_path, catalog_ttl_seconds=3600.0)
     await cached.discover_models(cached_ctx)
     await cached.discover_models(cached_ctx)
     catalog_calls = [c for c in cached_executor.calls if "models" in c["argv"]]
+    assert len(catalog_calls) == 2
+
+    # The execution path stays separately bounded: a second run within the
+    # TTL reuses the internal admission cache rather than re-spawning the
+    # catalog read.
+    run_ctx, run_executor = recording_ctx(tmp_path, "ok")
+    exec_driver = driver_for(tmp_path, catalog_ttl_seconds=3600.0)
+    await collect(exec_driver, make_request(), run_ctx)
+    await collect(exec_driver, make_request(), run_ctx)
+    catalog_calls = [c for c in run_executor.calls if "models" in c["argv"]]
     assert len(catalog_calls) == 1
 
 
@@ -978,3 +989,112 @@ async def test_repeated_runs_do_not_leak_descriptors_or_processes(tmp_path):
     finally:
         gc.enable()
     assert after - before <= 1, f"descriptor growth across runs: {before} -> {after}"
+
+
+# ------------------------------------- allowlist excludes the legacy default
+
+
+async def test_discovery_independent_of_legacy_default_when_unlisted(tmp_path):
+    """DEVIN_MODELS naming a catalog model but omitting DEVIN_MODEL must not
+    fail discovery — the legacy default is an execution default, not a
+    discovery precondition."""
+    driver = driver_for(tmp_path, models=["swe-2-high"])
+    models = await driver.discover_models(make_ctx(tmp_path, "ok"))
+    by_id = {model.model_id: model for model in models}
+    # The real catalog still enumerates; the explicit grant executes.
+    assert "swe-2-high" in by_id and by_id["swe-2-high"].executable is True
+    # The legacy default stays visible as a catalog member but is not
+    # executable under this operator policy.
+    assert "swe-2-max" in by_id and by_id["swe-2-max"].executable is False
+
+
+async def test_explicit_allowlist_model_runs_and_legacy_default_denied(tmp_path):
+    """The explicitly allowed catalog id actually executes (argv + ACP ack
+    pin it); the unlisted legacy default fails before any prompt."""
+    ctx, executor = recording_ctx(tmp_path, "ok")
+    driver = driver_for(tmp_path, models=["swe-2-high"])
+    events = await collect(
+        driver, make_request(model_alias="swe-2-high"), ctx
+    )
+    assert terminal(events).kind == EventKind.RUN_COMPLETED
+    acp_calls = [c["argv"] for c in executor.calls if "acp" in c["argv"]]
+    assert acp_calls
+    argv = acp_calls[-1]
+    assert argv[argv.index("--model") + 1] == "swe-2-high"
+
+    denied = await collect(
+        driver, make_request(model_alias="swe-2-max", run_id="run_deny"), ctx
+    )
+    assert terminal(denied).kind == EventKind.RUN_FAILED
+    # No second ACP agent spawn for the unlisted default.
+    assert len([c for c in executor.calls if "acp" in c["argv"]]) == 1
+
+
+async def test_duplicate_catalog_id_refuses_execution(tmp_path):
+    """A catalog reporting the same model_uid twice with conflicting cost
+    tiers must fail closed — never pick the Free (or any) row by ordering."""
+    logfile = tmp_path / "fixture.log"
+    driver = driver_for(tmp_path)
+    ctx = make_ctx(tmp_path, "ok", logfile=logfile, catalog="duplicate")
+    events = await collect(driver, make_request(), ctx)
+    result = next(e for e in events if e.kind == EventKind.RUN_FAILED)
+    assert result.payload.code == "catalog_not_verified"
+    # No agent session was ever spawned.
+    assert not any(r.get("event") == "acp_start" for r in read_log(logfile))
+
+
+async def test_duplicate_catalog_id_positive_control(tmp_path):
+    """The unique-row catalog still executes the admitted model normally."""
+    logfile = tmp_path / "fixture.log"
+    driver = driver_for(tmp_path)
+    ctx = make_ctx(tmp_path, "ok", logfile=logfile, catalog="ok")
+    events = await collect(driver, make_request(), ctx)
+    assert any(e.kind == "run.completed" for e in events)
+
+
+async def test_public_discovery_is_genuinely_fresh(tmp_path):
+    """Driver TTL (300s) must not re-stamp stale membership as fresh: a public
+    ``discover_models`` after the provider drops the model sees the removal
+    immediately, even though the internal execution cache is still in-TTL."""
+    logfile = tmp_path / "fixture.log"
+    driver = driver_for(tmp_path, catalog_ttl_seconds=300)
+    env = dict(os.environ, FAKE_DEVIN_MODE="ok", FAKE_DEVIN_LOG=str(logfile))
+    executor = LocalProcessExecutor(env=env)
+    ctx = RuntimeContext(executor=executor)
+
+    seen = await driver.discover_models(ctx)
+    by_id = {d.model_id: d for d in seen}
+    assert by_id["swe-2-max"].verification.status == VerificationStatus.PASSED
+    assert by_id["swe-2-max"].executable is True
+
+    # Provider drops the model; a second public read inside the driver TTL
+    # must observe the live catalog, not the cached rows.
+    executor._env["FAKE_DEVIN_CATALOG"] = "missing"
+    seen = await driver.discover_models(ctx)
+    by_id = {d.model_id: d for d in seen}
+    assert by_id["swe-2-max"].verification.status != VerificationStatus.PASSED
+    assert not any(
+        d.model_id == "swe-2-max" and d.executable for d in seen
+    )
+
+
+async def test_fresh_discovery_evicts_stale_execution_admission(tmp_path):
+    """Once a public refresh observes a removal, the refreshed cache can no
+    longer admit the removed model — stale admission does not outlive the
+    advertised freshness contract."""
+    logfile = tmp_path / "fixture.log"
+    driver = driver_for(tmp_path, catalog_ttl_seconds=300)
+    env = dict(os.environ, FAKE_DEVIN_MODE="ok", FAKE_DEVIN_LOG=str(logfile))
+    executor = LocalProcessExecutor(env=env)
+    ctx = RuntimeContext(executor=executor)
+
+    await driver.discover_models(ctx)  # populate the internal cache
+    executor._env["FAKE_DEVIN_CATALOG"] = "missing"
+    await driver.discover_models(ctx)  # fresh public read refreshes the cache
+
+    events = await collect(
+        driver, make_request(), RuntimeContext(executor=executor)
+    )
+    result = next(e for e in events if e.kind == EventKind.RUN_FAILED)
+    assert result.payload.code == "catalog_not_verified"
+    assert not any(r.get("event") == "acp_start" for r in read_log(logfile))

@@ -245,9 +245,8 @@ class MockDriver(BaseDriver):
                 "catalog_unavailable",
                 "the mock catalog could not be read; refusing effort resolution",
             )
-        descriptor = next(
-            (d for d in descriptors if d.model_id == request.model_alias), None
-        )
+        matches = [d for d in descriptors if d.model_id == request.model_alias]
+        descriptor = matches[0] if len(matches) == 1 else None
         resolved, rejection = resolve_effort(descriptor, effort)
         if rejection is not None or resolved is None:
             return None, ("unsupported_effort", rejection or "effort rejected")

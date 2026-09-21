@@ -488,3 +488,75 @@ async def test_dynamic_variant_requires_the_same_run_gate(tmp_path):
     assert ok.resolved_model_id == "mock-effort"
     store.close()
     store2.close()
+
+
+# --------------------------------------------------- duplicate model IDs
+
+
+async def test_conflicting_duplicate_model_id_fails_closed(tmp_path):
+    """A catalog reporting the same id twice with conflicting rows must not
+    be resolved by ordering: the runner fails verification entirely, so no
+    cost/executable/effort row can be picked by position."""
+    config, store, registry, _c, control = make_system(tmp_path, **_overrides())
+    control.models = [
+        _row("mock-model"),
+        _row("mock-effort", cost_tier="free", executable=True),
+        _row("mock-effort", cost_tier="paid", executable=False),  # conflict
+    ]
+    await registry.refresh()
+    health = registry.runner_health("runner-1")
+    assert health.ok is False
+    assert "duplicate" in health.detail.lower()
+    with pytest.raises(RunnerUnavailable):
+        resolve_model(
+            config=config,
+            registry=registry,
+            principal=_principal(config),
+            alias="mock/mock-effort",
+        )
+    # The catalog view marks the source failed rather than advertising a
+    # freshly-picked row.
+    view = catalog_view(config, registry, _principal(config))
+    assert view[0]["ok"] is False
+    store.close()
+
+
+async def test_duplicate_refresh_preserves_prior_safe_state(tmp_path):
+    """A malformed (duplicate) refresh after a healthy one must not silently
+    replace admission with an ordering pick: the source goes stale/unavailable
+    and execution fails closed."""
+    config, store, registry, _c, control = make_system(tmp_path, **_overrides())
+    control.models = MODEL_ROWS
+    await registry.refresh()
+    assert registry.runner_health("runner-1").ok
+
+    control.models = MODEL_ROWS + [
+        _row("mock-effort", cost_tier="paid", executable=True)  # conflict
+    ]
+    await registry.refresh()
+    assert registry.runner_health("runner-1").ok is False
+    with pytest.raises(RunnerUnavailable):
+        resolve_model(
+            config=config,
+            registry=registry,
+            principal=_principal(config),
+            alias="mock/mock-effort",
+        )
+    store.close()
+
+
+async def test_empty_catalog_remains_legitimate(tmp_path):
+    """An empty catalog is not malformed: the runner stays verified and lists
+    zero models."""
+    config, store, registry, _c, control = make_system(tmp_path, **_overrides())
+    control.models = []
+    await registry.refresh()
+    assert registry.runner_health("runner-1").ok
+    with pytest.raises(NotFound):
+        resolve_model(
+            config=config,
+            registry=registry,
+            principal=_principal(config),
+            alias="mock/mock-effort",
+        )
+    store.close()
